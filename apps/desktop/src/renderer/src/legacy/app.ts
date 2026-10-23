@@ -2,10 +2,15 @@ import { IMAGE_SEQUENCE_ACCEPT, sequenceCandidate } from '../../../shared/image-
 import { MEDIA_ACCEPT } from '../../../shared/media-formats';
 import { chooseSequence, convertImageSequence } from './core/image-sequence';
 import { createImportProgress } from './core/import-progress';
+import { createFolder, validFolder } from './core/asset-folders';
+import { droppedFolders, pickedFolders, readDroppedFolder, type ImportFolderNode } from './core/folder-import';
+import { pasteMedia } from './core/media-paste';
+import { isFieldTarget, selectableTextRoot } from '../kernel/keychord';
 import { canAnimateContent, isProperty } from './core/content-properties';
 /* Ported from js/app.js — behavior-preserving. */
 import { normalizeExportDefaults, type ExportDefaults } from '../core/export-defaults';
 import { compactEditLog } from '../core/edit-log';
+import { normalizeCaptionsContent } from '../captions/model';
 import type { PMRegistry } from './registry';
 import { packProjectFileBlob, saveIncrementalProject, restoreProjectFileMedia, restoreProjectFileStream, unpackProjectFileBlob, unpackProjectFile } from './core/project-file';
 import { projectFingerprint } from './core/project-fingerprint';
@@ -21,6 +26,22 @@ const document = window.document;
 type FileState = { path?: string; savedHash?: string; baselineHash?: string; baselineReady?: Promise<void>; dirty: boolean; handle?: any };
 const fileStates = new Map<string, FileState>();
 const comparisonVersions = new Map<string, number>();
+const pendingDiscards = new Set<string>();
+const discardedProjects = new Set<string>();
+function discardUnsavedProject(id: string) {
+  if (!pendingDiscards.delete(id)) return;
+  discardedProjects.add(id);
+  if (PM.proj.id === id) {
+    window.clearTimeout(APP.saveTimer);
+    window.clearTimeout(thumbRetry);
+    ++saveGeneration;
+  }
+  PM.Projects.remove(id);
+  PM.Projects.destroy(id);
+  if (PM.Projects.unwrap(PM.store.get('autosave', null))?.id === id) PM.store.del('autosave');
+  PM.store.del(`agentThreads.${id}`);
+  PM.bus.emit('projects:open');
+}
 let activeSave: Promise<boolean> | null = null;
 function fileState(id = PM.proj.id): FileState {
   let state = fileStates.get(id);
@@ -67,6 +88,7 @@ async function refreshFileDirty(project = PM.proj): Promise<boolean> {
   return state.dirty;
 }
 function rememberFile(id: string, state: FileState) {
+  if (discardedProjects.has(id)) return;
   PM.Projects.putState(id, { ...PM.Projects.getState(id, { history: false }), file: { path: state.path, savedHash: state.savedHash, baselineHash: state.baselineHash } });
 }
 // Chrome and library cards only need file metadata. Reading a label must not
@@ -329,6 +351,7 @@ function hydrate(p: any) {
         L.d.params = sanitizeLooseParams(L.d.params, -L.from);
         L.d.data = sanitizeJson(L.d.data) || {};
       }
+      if (L.type === 'captions') L.d = normalizeCaptionsContent(L.d);
     });
   };
   base.comps = p.comps && typeof p.comps === 'object' ? p.comps : {};
@@ -378,6 +401,15 @@ PM.hydrateProject = hydrate;
      duplicate). Project files exported by the user are unaffected. */
   PM.Projects.list().forEach((m: any) => { if (!PM.Projects.get(m.id)) PM.Projects.remove(m.id); });
 })();
+
+/* Agent workspaces for projects that no longer exist (deleted before cleanup
+   followed the project, or interrupted by a crash) are removed once idle. */
+window.setTimeout(() => {
+  const live = [...PM.Projects.list(), ...PM.Projects.trashList()].map((m: any) => m?.id);
+  if (PM.proj?.id) live.push(PM.proj.id);
+  void hostBridge()?.artifacts?.sweep?.([...new Set(live.filter((id: any) => typeof id === 'string'))])
+    ?.catch?.((error: any) => console.warn('Agent workspace sweep failed', error));
+}, 30_000);
 
 /* Exposed for the remote host sync: a document that arrives with assets this
    tab has not loaded needs the same restore pass a project open gets. */
@@ -526,7 +558,7 @@ function retryThumbnail(project: any) {
   }, 500);
 }
 function canFinishThumbnail(project: any) {
-  if (PM.proj !== project) return false;
+  if (PM.proj !== project || discardedProjects.has(project.id)) return false;
   if (!thumbnailBlocked()) return true;
   lastThumbAt = 0;
   retryThumbnail(project);
@@ -561,7 +593,7 @@ function projectThumb() {
   return undefined;
 }
 function persistCurrent(withThumb: any) {
-  if (PM.proj.id === homeProjectId) return true;
+  if (PM.proj.id === homeProjectId || discardedProjects.has(PM.proj.id)) return true;
   try {
     const thumb = withThumb ? projectThumb() : undefined;
     if (withThumb && PM.Projects.recover) PM.Projects.recover(PM.proj, thumb);
@@ -571,7 +603,7 @@ function persistCurrent(withThumb: any) {
 }
 
 function captureProjectSession() {
-  if (!PM.proj?.id || PM.proj.id === homeProjectId) return true;
+  if (!PM.proj?.id || PM.proj.id === homeProjectId || discardedProjects.has(PM.proj.id)) return true;
   PM.bus.emit('project:flush-edits');
   const saved = persistCurrent(false);
   const timeline = timelineService(PM);
@@ -592,7 +624,7 @@ function captureProjectSession() {
 // still alive. beforeunload alone runs after the main process's quit flush.
 PM.flushProject = async () => {
   await APP.importQueue;
-  PM.AgentUI?.flushThreads?.();
+  if (!discardedProjects.has(PM.proj.id)) PM.AgentUI?.flushThreads?.();
   window.clearTimeout(APP.saveTimer);
   if (!captureProjectSession()) throw new Error('Project storage is unavailable or full');
   await PM.store.flush?.();
@@ -605,7 +637,7 @@ function closeProjectTransients() {
   if (PM.WS.editing) PM.WS.cancelEdit();
 }
 PM.autosave = () => {
-  if (PM.proj.id === homeProjectId) return;
+  if (PM.proj.id === homeProjectId || discardedProjects.has(PM.proj.id)) return;
   APP.dirty = true;
   fileState().dirty = true;
   comparisonVersions.set(PM.proj.id, (comparisonVersions.get(PM.proj.id) || 0) + 1);
@@ -613,6 +645,7 @@ PM.autosave = () => {
   const generation = ++saveGeneration, projectId = PM.proj.id;
   window.clearTimeout(APP.saveTimer);
   APP.saveTimer = window.setTimeout(async () => {
+    if (discardedProjects.has(projectId)) return;
     try {
       if (!persistCurrent(true)) throw new Error('Project storage is unavailable or full');
       PM.Projects.putState(PM.proj.id, { ...PM.Projects.getState(PM.proj.id, { history: false }), history: PM.hist.export?.({ copy: false }) });
@@ -835,8 +868,8 @@ async function openProjectFile(file: any, association?: { path: string; projectI
 }
 const PROJECT_FILE = /\.(pmv|json)$/i;
 /* Home's Open takes a project or media. A project opens as itself, with any
-   media alongside imported into it; media alone starts a blank project in the
-   current format, named after the first file. */
+   media alongside imported into it; media alone starts a project matching the
+   first successfully decoded source, named after the first file. */
 PM.openFiles = () => {
   const inp = h('input', {
     type: 'file', multiple: true, accept: MEDIA_ACCEPT + ',.json',
@@ -865,7 +898,7 @@ async function openFiles(files: File[]) {
     }));
     PM.ProjectsScreen?.hide?.();
   }
-  if (media.length) await PM.importFiles(media);
+  if (media.length) await PM.importFiles(media, projectFile ? {} : { matchSource: true, placement: { at: 0 } });
 }
 async function openPickedProject(file: File) {
   const result = await hostBridge()?.openProjectFromFile?.(file);
@@ -894,6 +927,12 @@ PM.newProject = () => {
     } },
   ] });
   window.setTimeout(() => form.focus(), 30);
+};
+/** A default-format project without the New project dialog. Onboarding opens
+ * one so an imported workspace is arranged around a real composition. */
+PM.newBlankProject = (options: any = {}) => {
+  switchProject(PM.mkProject(options));
+  PM.ProjectsScreen?.hide?.();
 };
 /**
  * Tells main which document this window is showing; null while it shows only
@@ -982,7 +1021,10 @@ function switchProject(p: any, history?: any, live?: ParkedTab) {
   // Rebuilding the docks remounts every panel; tabs that share a layout skip it.
   if (projectWorkspace) {
     if (JSON.stringify(projectWorkspace) !== JSON.stringify(PM.WS.snapshot())) PM.WS.restoreSnapshot(projectWorkspace);
-  } else PM.WS.activate('design', true);
+  } else {
+    const preferred = PM.store.get('defaultWorkspace', 'design');
+    PM.WS.activate(PM.WS.get(preferred) ? preferred : 'design', true);
+  }
   if (live) PM.hist.resume(live.history);
   else PM.hist.import?.(history ?? session?.history);
   if (!live) persistCurrent(false);
@@ -1026,6 +1068,7 @@ function switchProject(p: any, history?: any, live?: ParkedTab) {
 }
 
 PM.confirmCloseProject = async (id: string) => {
+  pendingDiscards.delete(id);
   if (id === homeProjectId) return true;
   PM.bus.emit('project:flush-edits');
   await APP.importQueue;
@@ -1035,20 +1078,30 @@ PM.confirmCloseProject = async (id: string) => {
   if (activeSave) await activeSave;
   const project = id === PM.proj.id ? PM.proj : PM.Projects.get(id);
   if (!project || !await refreshFileDirty(project)) return true;
-  if (!hostBridge()?.confirmProjectClose) return window.confirm?.('Close without saving a project file?') ?? false;
-  const decision = await hostBridge()!.confirmProjectClose(project.name || 'Untitled');
+  const decision = hostBridge()?.confirmProjectClose
+    ? await hostBridge()!.confirmProjectClose(project.name || 'Untitled')
+    : window.confirm?.('Close without saving a project file?') ? 'discard' : 'cancel';
   if (decision === 'cancel') return false;
   if (decision === 'save') {
     if (!await PM.saveProject({ projectId: id })) return false;
     return !await refreshFileDirty(id === PM.proj.id ? PM.proj : PM.Projects.get(id) || project);
   }
+  const state = fileState(id);
+  if (!state.path && !state.handle && !state.savedHash) pendingDiscards.add(id);
   return true;
 };
 /* Closing the window closes every tab, so each one with unsaved file changes
    gets its own chance to be saved. */
 PM.prepareToClose = async () => {
   const ids = [...new Set([PM.proj.id, ...tabIds])];
-  for (const id of ids) if (!await PM.confirmCloseProject(id)) return false;
+  for (const id of ids) {
+    if (!await PM.confirmCloseProject(id)) {
+      // A cancelled window close leaves all of its projects intact.
+      for (const pending of ids) pendingDiscards.delete(pending);
+      return false;
+    }
+  }
+  for (const id of ids) discardUnsavedProject(id);
   return true;
 };
 
@@ -1075,6 +1128,7 @@ async function dropTab(id: string) {
   if (index < 0 && !tabIds.includes(id)) return false;
   const active = id === PM.proj?.id;
   tabIds = tabIds.filter(tab => tab !== id);
+  discardUnsavedProject(id);
   discardParked(id);
   if (active) showNeighbourOf(index);
   await PM.windows?.releaseProject?.(id);
@@ -1215,7 +1269,8 @@ PM.pickFiles = (sequence = false, { replaceAssetId }: { replaceAssetId?: string 
    - undefined → layers at the playhead (pickers, window-level drops)
    - null      → assets only, no layers (drop on the Media panel)
    - {at,index}→ layers at a time and layer-stack position (drop on the timeline) */
-async function importFiles(files: any, placement?: { at: number; index?: number } | null, sequence?: boolean, replaceAssetId?: string) {
+async function importFiles(files: any, placement?: { at: number; index?: number } | null, sequence?: boolean, replaceAssetId?: string,
+  { folder, sequenceNote, matchSource }: { folder?: string | null; sequenceNote?: string; matchSource?: boolean } = {}) {
   let progress: ReturnType<typeof createImportProgress> | undefined;
   try {
     const targetProject = PM.proj;
@@ -1227,7 +1282,7 @@ async function importFiles(files: any, placement?: { at: number; index?: number 
       if (replacement && targetProject.assets?.[replaceAssetId!] !== replacement) throw new Error('The media item changed · choose the replacement again');
     };
     if (sequence === true || (sequence !== false && sequenceCandidate(files))) {
-      const choice = await chooseSequence(PM, files, sequence === true);
+      const choice = await chooseSequence(PM, files, sequence === true, sequenceNote);
       if (choice === null) return;
       try {
         assertCurrent();
@@ -1242,6 +1297,12 @@ async function importFiles(files: any, placement?: { at: number; index?: number 
     if (replaceAssetId != null && files.length !== 1) throw new Error('Choose one file or one image sequence to replace this media');
     const mediaFiles: any = [];
     for (const f of files) {
+      // Subtitles become a captions layer, placed where the file was dropped.
+      if (PM.Captions?.isCaptionFile?.(f) && replaceAssetId == null) {
+        await PM.Captions.importFile(f, { at: placement ? placement.at : 0 });
+        continue;
+      }
+      if(/\.blend$/i.test(f.name)){if(replaceAssetId!=null)throw new Error('Import Blender files as model groups; use OBJ or GLB to replace a single model asset');const result=await PM.Kernel.api('media-import').scene3d.model({operation:'import_blend',file:f,name:f.name.replace(/\.blend$/i,'')});if(!result.ok)throw new Error(result.message);assertCurrent();continue;}
       if (/\.pmv$/i.test(f.name)) {
         if (replaceAssetId != null) throw new Error('Choose a media file to replace this media');
         await openProjectFile(f);
@@ -1264,9 +1325,34 @@ async function importFiles(files: any, placement?: { at: number; index?: number 
         PM.bus.emit('import:progress', update);
       },
     });
+    const target = validFolder(targetProject, folder);
+    if (target) for (const result of results) {
+      const meta = result.status !== 'failed' ? targetProject.assets?.[result.asset?.id] : null;
+      // Media already in the project stays where the user filed it.
+      if (meta && (result.status === 'created' || !validFolder(targetProject, meta.folder))) meta.folder = target;
+    }
     const failures = results.filter((result: any) => result.status === 'failed');
     failures.forEach((result: any) => PM.toast(result.error?.message || ('Could not import ' + result.file?.name), 5000, { error: true }));
     const layerResults = results.filter((result: any) => result.status === 'created' || result.status === 'reused');
+    assertCurrent();
+    if (matchSource) {
+      const source = layerResults[0]?.asset;
+      if (source) {
+        if (Number.isFinite(source.w) && source.w > 0) targetProject.w = source.w;
+        if (Number.isFinite(source.h) && source.h > 0) targetProject.h = source.h;
+        if (Number.isFinite(source.fps) && source.fps > 0) {
+          targetProject.fps = source.fps;
+          targetProject.exportDefaults = { ...readExportDefaults(), fps: source.fps };
+        }
+        if (Number.isFinite(source.dur) && source.dur > 0) {
+          targetProject.dur = source.dur;
+          targetProject.work = [0, source.dur];
+        }
+        PM.bus.emit('project');
+        viewerService(PM)?.layout();
+        PM.invalidate('all');
+      }
+    }
     const commands = placement === null ? [] : layerResults.map((result: any, n: number) => {
       const command = PM.commandForAsset(result.asset.id, importAt);
       if (command && placement?.index != null) command.index = placement.index + n;
@@ -1283,7 +1369,7 @@ async function importFiles(files: any, placement?: { at: number; index?: number 
     const volatile = results.filter((result: any) => result.status !== 'failed' && !result.persisted);
     if (layerResults.length || relinked.length || replaced.length) {
       PM.autosave();
-      if (placement === null) PM.bus.emit('assets');
+      if (placement === null || target) PM.bus.emit('assets');
       const parts: any = [];
       if (layerResults.length) {
         const editableSvg = layerResults.length === 1 && layerResults[0].asset.format === 'svg' && layerResults[0].asset.svg?.paths?.length;
@@ -1305,21 +1391,88 @@ async function importFiles(files: any, placement?: { at: number; index?: number 
 /* File pickers and drag/drop can fire while an earlier batch is still decoding.
    Preserve user order and project identity by serializing batches; each batch
    still performs its expensive work through the bounded parallel pool. */
-PM.importFiles = (files: any, { project = PM.proj, placement, sequence, replaceAssetId }: any = {}) => {
-  const run = () => {
+/* `files` may also be a drop's DataTransfer, which is the only way to reach
+   the contents of a dropped folder. `asFolder` (Option held during the drop,
+   as in After Effects) files a folder's media into a matching media folder;
+   otherwise a folder of numbered frames becomes one image sequence. */
+PM.importFiles = (files: any, { project = PM.proj, placement, sequence, replaceAssetId, folder, asFolder, matchSource }: any = {}) => {
+  const drop = typeof DataTransfer !== 'undefined' && files instanceof DataTransfer;
+  const dropped = drop ? droppedFolders(files) : null;
+  const loose: File[] = dropped ? dropped.files : Array.from((drop ? files.files : files) || []);
+  const run = async () => {
     if (PM.proj !== project) {
       PM.toast('Import stopped because you switched projects · import again in the intended project', 5000, { error: true });
       return [];
     }
-    return importFiles(Array.from(files || []), placement, sequence, replaceAssetId);
+    if (dropped) {
+      try {
+        const trees = await Promise.all(dropped.folders.map(({ entry, path }) => readDroppedFolder(entry, path)));
+        if (loose.length) await importFiles(loose, placement, sequence, undefined, { folder });
+        await importFolders(project, trees, { asFolder: !!asFolder, parent: folder ?? null, placement });
+      } catch (error: any) { PM.toast(error?.message || 'Could not read the dropped folder', 6000, { error: true }); }
+      return [];
+    }
+    return importFiles(loose, placement, sequence, replaceAssetId, { folder, matchSource });
   };
   APP.importQueue = APP.importQueue.then(run, run);
   return APP.importQueue;
 };
+
+/** Import folders read from disk. A folder of numbered frames becomes a single
+    image sequence unless `asFolder` is set; any other folder becomes a media
+    folder holding its files, with subfolders handled the same way. Only an
+    image sequence lands on the timeline: a folder of loose media would
+    otherwise stack every file at the playhead. */
+async function importFolders(project: any, nodes: ImportFolderNode[], { asFolder, parent, placement }: {
+  asFolder: boolean; parent: string | null; placement?: { at: number; index?: number } | null;
+}) {
+  for (const node of nodes) {
+    if (PM.proj !== project) return;
+    const files = node.files.filter(file => PM.assetKind(file));
+    if (!asFolder && sequenceCandidate(files)) {
+      await importFiles(files, placement, true, undefined, {
+        folder: parent, sequenceNote: 'Hold ⌥ Option while dropping a folder to import its files individually.',
+      });
+      await importFolders(project, node.folders, { asFolder, parent, placement });
+      continue;
+    }
+    if (!files.length && !node.folders.length) continue;
+    const id = createFolder(project, node.name, parent);
+    PM.bus.emit('assets');
+    if (files.length) await importFiles(files, null, false, undefined, { folder: id });
+    await importFolders(project, node.folders, { asFolder, parent: id, placement });
+  }
+}
+
+/** File ▸ Import Folder…: the chosen folder keeps its structure as media folders. */
+PM.pickFolder = ({ folder }: { folder?: string | null } = {}) => {
+  const project = PM.proj;
+  const inp = h('input', {
+    type: 'file', webkitdirectory: true, multiple: true,
+    style: { position: 'fixed', width: '1px', height: '1px', opacity: '0', pointerEvents: 'none' },
+  });
+  const cleanup = () => { inp.onchange = null; inp.remove(); };
+  inp.onchange = () => {
+    const trees = pickedFolders([...inp.files]);
+    cleanup();
+    if (!trees.length) return;
+    const run = () => PM.proj === project ? importFolders(project, trees, { asFolder: true, parent: folder ?? null, placement: null }) : undefined;
+    APP.importQueue = APP.importQueue.then(run, run);
+  };
+  inp.addEventListener('cancel', cleanup, { once: true });
+  window.document.body.appendChild(inp);
+  inp.click();
+};
 window.addEventListener('dragover', (e: any) => { if ([...e.dataTransfer.types].includes('Files')) e.preventDefault(); });
+window.addEventListener('paste', (event: ClipboardEvent) => {
+  if (pasteMedia(PM, event)) return;
+  // Browser shortcuts deliver the native paste event directly.
+  if (!event.defaultPrevented && !event.composedPath().some(target => isFieldTarget(target)
+    || selectableTextRoot(target as EventTarget))) PM.cmd('pasteLayers');
+});
 window.addEventListener('drop', (e: any) => {
   if (![...e.dataTransfer.types].includes('Files')) return;
-  e.preventDefault(); PM.importFiles([...e.dataTransfer.files]);
+  e.preventDefault(); PM.importFiles(e.dataTransfer, { asFolder: e.altKey });
 });
 
 function safeName(s: any) { return String(s || 'powermove').replace(/[\\/:*?"<>|]+/g, '-').trim() || 'powermove'; }

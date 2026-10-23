@@ -127,6 +127,49 @@ describe('timeline extension', () => {
     expect(value.state.project.layers[0].d.trim).toBe(7);
   });
 
+  it('keeps caption cues in place on both halves of a split', () => {
+    const value = harness();
+    const left = { id: 'cc', type: 'captions', name: 'Captions', from: 2, dur: 6, d: { cues: [] }, p: {} } as any;
+    value.state.project.layers = [left];
+    value.state.selection.layers = [left.id];
+    value.state.time = 5;
+    vi.mocked(value.api.media.timing.startPatch).mockReturnValue({ cues: ['tail'] });
+    vi.mocked(value.api.media.timing.endPatch).mockReturnValue({ cues: ['head'] });
+
+    splitSelectedLayersAtPlayhead(value.api);
+
+    expect(value.api.media.timing.startPatch).toHaveBeenCalledWith(left, 5);
+    expect(value.state.project.layers.map((layer: any) => layer.d.cues)).toEqual([['tail'], ['head']]);
+  });
+
+  it('re-bases caption cues from the gesture start while the In edge is dragged', () => {
+    const value = harness();
+    const cues = [{ id: 'a', start: 1, end: 2, text: 'A' }];
+    const layer = { id: 'cc', type: 'captions', name: 'Captions', from: 2, dur: 3, d: { cues }, p: {} } as any;
+    value.state.project.layers = [layer];
+    value.state.selection.layers = [layer.id];
+    vi.mocked(value.api.media.timing.startPatch).mockImplementation((source: any, nextFrom: number) => ({ cues: { from: source.from, cues: source.d.cues, nextFrom } }));
+    vi.mocked(value.api.edit.dispatch).mockImplementation((command: any) => {
+      if (command.type === 'set_layer') { layer.from = command.patch.from; layer.dur = command.patch.duration; }
+      if (command.type === 'set_content') Object.assign(layer.d, command.patch);
+      return { ok: true } as any;
+    });
+    activate(value);
+    const canvas = build(value).querySelector<HTMLCanvasElement>('#tl-canvas')!;
+    const timeline = value.state.timeline as any;
+    timeline.pps = 100;
+    timeline.scrollT = 0;
+    timeline.rows = [{ kind: 'layer', L: layer }];
+    pointer(canvas, timeline.gut + 2 * timeline.pps, timeline.ruler + timeline.row / 2);
+    const drag = vi.mocked(value.api.ui.drag).mock.calls.at(-1)![1];
+    drag.move!(50, 0, { shiftKey: false } as any);
+    drag.move!(100, 0, { shiftKey: false } as any);
+    const content = vi.mocked(value.api.edit.dispatch).mock.calls.map(([command]) => command as any).filter(command => command.type === 'set_content');
+    // Each move re-bases the cues the gesture started with, never the live ones.
+    expect(content.map(command => command.patch.cues)).toEqual([{ from: 2, cues, nextFrom: 2.5 }, { from: 2, cues, nextFrom: 3 }]);
+    drag.up!({} as any);
+  });
+
   it('registers the M timeline keybinding outside text fields', () => {
     const value = activate();
     expect(value.api.commands.register).toHaveBeenCalledWith(expect.objectContaining({ id: 'toggleLayerStrips', kb: 'M' }));
@@ -209,7 +252,7 @@ describe('timeline extension', () => {
   it('builds the exact canvas skeleton and rebinds the runtime to replacement hosts', () => {
     const value = activate();
     const first = build(value);
-    expect([...first.children].filter((element) => element.tagName !== 'STYLE').map((element) => element.id)).toEqual(['tl-comp-tabs', 'tl-head', 'tl-canvas-wrap']);
+    expect([...first.children].filter((element) => element.tagName !== 'STYLE').map((element) => element.id)).toEqual(['tl-comp-tabs', 'tl-mode', 'tl-head', 'tl-canvas-wrap']);
     expect(first.querySelector('#tl-canvas-wrap > #tl-canvas')).not.toBeNull();
     expect(value.state.timeline?.cv).toBe(first.querySelector('#tl-canvas'));
 
@@ -258,7 +301,10 @@ describe('timeline extension', () => {
     const body = build(value);
     const graph = body.querySelector<HTMLButtonElement>('button[title="Graph editor (Shift+F3)"]')!;
     const slot = graph.closest('.tl-graph-slot')!;
-    expect(slot.lastElementChild).toBe(graph);
+    // The track timeline's snap magnet shares the slot, hidden in layer mode.
+    expect(slot.lastElementChild?.previousElementSibling).toBe(graph);
+    expect((slot.lastElementChild as HTMLElement).classList.contains('tl-snap')).toBe(true);
+    expect((slot.lastElementChild as HTMLElement).hidden).toBe(true);
     expect(slot.firstElementChild).toBe(body.querySelector('button[title="Graph options"]'));
     expect(slot.previousElementSibling?.classList.contains('tl-transport')).toBe(true);
     expect(graph.closest('.tl-transport')).toBeNull();
@@ -269,6 +315,30 @@ describe('timeline extension', () => {
     expect(body.querySelector('#tl-time')).not.toBeNull();
     expect(body.querySelector<HTMLElement>('#tl-head')?.style.getPropertyValue('--tl-gutter')).toBe('224px');
     expect(body.querySelector<HTMLElement>('#tl-head')?.style.getPropertyValue('--tl-ruler')).toBe('28px');
+  });
+
+  it('switches between the layer and track timelines from the panel and the command palette', () => {
+    const value = activate();
+    const body = build(value);
+    const modes = body.querySelectorAll<HTMLButtonElement>('#tl-mode [role="radio"]');
+    expect([...modes].map(button => button.dataset.mode)).toEqual(['layers', 'tracks']);
+    expect(modes[0]!.getAttribute('aria-checked')).toBe('true');
+    const graph = body.querySelector<HTMLButtonElement>('button[title="Graph editor (Shift+F3)"]')!;
+    const snap = body.querySelector<HTMLButtonElement>('.tl-snap')!;
+
+    modes[1]!.click();
+    expect(modes[1]!.getAttribute('aria-checked')).toBe('true');
+    expect(value.api.storage.get('mode')).toBe('tracks');
+    // Keyframes unfold inside the tracks, so the dope sheet / graph switch stays.
+    expect(graph.hidden).toBe(false);
+    expect(snap.hidden).toBe(false);
+    expect(snap.getAttribute('aria-pressed')).toBe('true');
+
+    const registered = vi.mocked(value.api.commands.register).mock.calls.map(([command]) => command);
+    registered.find(command => command.id === 'timeline.toggleMode')!.run();
+    expect(modes[0]!.getAttribute('aria-checked')).toBe('true');
+    expect(graph.hidden).toBe(false);
+    expect(snap.hidden).toBe(true);
   });
 
   it('preserves the live panel move handle when the extension rebuilds in place', () => {

@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
 import type { OnboardingBridge, OnboardingLogoTarget } from '../shared/ipc';
+import type { TranscriptionStatus } from '../shared/transcription';
 
 // Keep this preload self-contained. Electron's sandboxed preload loader cannot
 // require a Rollup shared chunk, so these mirror the frozen shared IPC names.
@@ -10,7 +11,14 @@ const CHANNEL = {
   animationFailed: 'onboarding:animation-failed',
   logoTarget: 'onboarding:logo-target',
   logoTargetReport: 'onboarding:logo-target-report',
-  begin: 'onboarding:begin'
+  begin: 'onboarding:begin',
+  appearance: 'onboarding:appearance',
+  /* Mirrors TRANSCRIPTION_IPC (shared/transcription.ts). */
+  transcriptionStatus: 'transcription:status',
+  transcriptionDownload: 'transcription:download',
+  transcriptionCancelDownload: 'transcription:cancel-download',
+  transcriptionRemove: 'transcription:remove',
+  transcriptionStatusChanged: 'transcription:status-changed'
 } as const;
 
 const bridge: OnboardingBridge = {
@@ -25,8 +33,20 @@ const bridge: OnboardingBridge = {
     ipcRenderer.on(CHANNEL.logoTarget, listener);
     return () => ipcRenderer.removeListener(CHANNEL.logoTarget, listener);
   },
-  begin: async () => {
-    await ipcRenderer.invoke(CHANNEL.begin);
+  begin: async (choice) => {
+    await ipcRenderer.invoke(CHANNEL.begin, choice);
+  },
+  appearance: () => ipcRenderer.invoke(CHANNEL.appearance),
+  transcription: {
+    status: () => ipcRenderer.invoke(CHANNEL.transcriptionStatus) as Promise<TranscriptionStatus>,
+    download: (modelId) => ipcRenderer.invoke(CHANNEL.transcriptionDownload, String(modelId)) as Promise<TranscriptionStatus>,
+    cancelDownload: (modelId) => ipcRenderer.invoke(CHANNEL.transcriptionCancelDownload, String(modelId)) as Promise<TranscriptionStatus>,
+    remove: (modelId) => ipcRenderer.invoke(CHANNEL.transcriptionRemove, String(modelId)) as Promise<TranscriptionStatus>,
+    onStatus: (callback) => {
+      const listener = (_event: Electron.IpcRendererEvent, status: TranscriptionStatus) => callback(status);
+      ipcRenderer.on(CHANNEL.transcriptionStatusChanged, listener);
+      return () => ipcRenderer.removeListener(CHANNEL.transcriptionStatusChanged, listener);
+    }
   }
 };
 

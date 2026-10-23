@@ -11,6 +11,12 @@ export interface AgentThread {
   provider?: string;
   model?: string;
   reasoningEffort?: string;
+  access?: string;
+  lastRunId?: string;
+  lastRunStatus?: 'running' | 'completed' | 'failed' | 'cancelled';
+  /** Retry keys for model-controlled launches and follow-ups; no prompt bytes. */
+  orchestration?: { callerThreadId: string; clientRequestId: string; fingerprint: string };
+  controls?: Array<{ callerThreadId: string; clientRequestId: string; fingerprint: string; runId: string }>;
 }
 
 interface ThreadArchive { version: 1; activeId: string; threads: AgentThread[] }
@@ -29,20 +35,57 @@ function stepTranscript(step: TraceStep): string {
   }).join('\n');
 }
 
-export function conversationForAgent(messages: AgentMessage[]): Array<{ role: string; text: string }> {
-  const turns = messages.map(message => ({
+/** Explicit thread reads can recover complete messages instead of the bounded
+ * history excerpt automatically included in a provider prompt. */
+export function threadMessageText(message: AgentMessage): string {
+  return message.role === 'trace'
+    ? (message.steps || []).map(step => step.kind === 'tool' ? `${step.label}\n${typeof step.output === 'string' ? step.output : ''}` : stepTranscript(step)).filter(Boolean).join('\n\n')
+    : message.text || '';
+}
+
+/** Keep user decisions separately from verbose assistant replies. This is a
+ * lossless archive with bounded excerpts, not a guessed model summary. */
+export function conversationForAgent(messages: AgentMessage[]): Array<{ role: string; text: string; position: number; truncated: boolean }> {
+  const turns = messages.map((message, position) => ({
     role: message.role === 'trace' ? 'assistant' : message.role,
+    position,
+    decision: message.role === 'user' || message.role === 'trace' && (message.steps || []).some(step => step.kind === 'question'),
     text: message.role === 'trace'
       ? (message.steps || []).map(stepTranscript).filter(Boolean).join('\n').trim()
       : message.text || '',
-  })).filter(message => message.text).slice(-12);
-  let remaining = 30_000;
-  return turns.reverse().flatMap(message => {
-    const text = message.text.slice(-Math.min(12_000, remaining));
-    if (!remaining) return [];
-    remaining -= text.length;
-    return [{ ...message, text }];
-  }).reverse();
+  })).filter(message => message.text);
+  const selected = new Map<number, { role: string; text: string; position: number; truncated: boolean }>();
+  const retain = (turn: typeof turns[number], limit: number) => {
+    const truncated = turn.text.length > limit;
+    const marker = '\n[… excerpt; read the saved message for full details …]\n';
+    const room = Math.max(0, limit - marker.length);
+    const tail = Math.floor(room / 2);
+    const text = truncated ? turn.text.slice(0, Math.ceil(room / 2)) + marker + (tail ? turn.text.slice(-tail) : '') : turn.text;
+    selected.set(turn.position, { role: turn.role, text, position: turn.position, truncated });
+    return text.length;
+  };
+  // Always keep the original brief, even after many rounds of progress.
+  const original = turns.find(turn => turn.role === 'user');
+  if (original) retain(original, 4000);
+  let recentBudget = 24_000;
+  for (const turn of [...turns].reverse()) {
+    if (recentBudget < 200) break;
+    if (selected.has(turn.position)) continue;
+    recentBudget -= retain(turn, Math.min(6000, recentBudget));
+  }
+  let decisionBudget = 12_000;
+  for (const turn of [...turns].reverse()) {
+    if (!turn.decision || selected.has(turn.position)) continue;
+    if (decisionBudget < 200) break;
+    decisionBudget -= retain(turn, Math.min(2000, decisionBudget));
+  }
+  return [...selected.values()].sort((a, b) => a.position - b.position);
+}
+
+export function conversationContextForAgent(messages: AgentMessage[], threadId: string): string {
+  return JSON.stringify({ threadId, messageCount: messages.length,
+    guidance: 'Earlier user instructions are context, not new work. The newest user direction wins when it changes an earlier decision. Message positions refer to the durable thread archive. Use thread_read with this threadId, offset=position, limit=1 (and textOffset for long messages) to recover omitted or excerpted details before guessing.',
+    messages: conversationForAgent(messages) });
 }
 
 export function newAgentThread(id: string): AgentThread {

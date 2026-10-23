@@ -48,7 +48,86 @@ describe('legacy workspace install', () => {
     expect(saved['projectWorkspace.project']).toEqual(PM.WS.snapshot());
   });
 
-  it('keeps the agent panel at a set height instead of making it fill the dock', () => {
+  it('hands an older saved docked agent slot to Layer Effects once, at load', () => {
+    const PM = workspaceModel({
+      workspace: 'agent-docked',
+      workspaces: [{
+        id: 'agent-docked', name: 'Agent docked',
+        hiddenPanels: [{ id: 'agent', dockId: 'right' }],
+        layout: { docks: [
+          { id: 'left', panels: [{ id: 'assets', size: 220 }, { id: 'agent', flex: true }] },
+          { id: 'center', flex: true, panels: [{ id: 'viewer', flex: true }] },
+          { id: 'right', panels: [{ id: 'agent', size: 350 }] },
+        ] },
+      }],
+    });
+    PM.WS.init();
+    const workspace = PM.WS.get('agent-docked');
+    const ids = workspace.layout.docks.flatMap((dock: any) => dock.panels.map((panel: any) => panel.id));
+
+    expect(ids).toEqual(['assets', 'layer-effects', 'viewer']);
+    expect(workspace.hiddenPanels).toEqual([]);
+    expect(workspace.layout.docks[0].panels[1]).toMatchObject({ id: 'layer-effects', flex: true });
+  });
+
+  it('adds Layer Effects below Media once to saved workspaces that lack it, respecting a hidden one', () => {
+    const left = { id: 'left', panels: [{ id: 'assets', flex: true }, { id: 'takes', size: 200 }] };
+    const center = { id: 'center', flex: true, panels: [{ id: 'viewer', flex: true }] };
+    const PM = workspaceModel({
+      workspace: 'design',
+      workspaces: [
+        { id: 'design', name: 'Design', builtin: true, layout: { docks: [left, center] } },
+        { id: 'hidden', name: 'Hidden', hiddenPanels: [{ id: 'layer-effects', dockId: 'left' }], layout: { docks: [left, center] } },
+        { id: 'current', name: 'Current', agentDockMigration: 2, layout: { docks: [left, center] } },
+      ],
+    });
+    PM.WS.init();
+    const ids = (id: string) => PM.WS.get(id).layout.docks.find((dock: any) => dock.id === 'left').panels.map((panel: any) => panel.id);
+
+    expect(ids('design')).toEqual(['assets', 'layer-effects', 'takes']);
+    expect(PM.WS.get('design').layout.docks[0].panels[1]).toMatchObject({ id: 'layer-effects', size: 350 });
+    expect(ids('hidden')).toEqual(['assets', 'takes']);
+    expect(ids('current')).toEqual(['assets', 'takes']);
+    // Closing it afterwards sticks: normalization marks the workspace as migrated.
+    expect(PM.WS.normalize({ ...PM.WS.get('design'), layout: { docks: [left, center] } }).layout.docks[0].panels.map((panel: any) => panel.id)).toEqual(['assets', 'takes']);
+  });
+
+  it('moves a sized center Timeline into a bottom dock under the left column once', () => {
+    const left = { id: 'left', panels: [{ id: 'assets', flex: true }, { id: 'layer-effects', size: 350 }] };
+    const center = { id: 'center', flex: true, panels: [{ id: 'viewer', flex: true }, { id: 'timeline', size: 320 }] };
+    const right = { id: 'right', panels: [{ id: 'inspector', flex: true }] };
+    const animate = { id: 'center', flex: true, panels: [{ id: 'viewer', size: 300 }, { id: 'timeline', flex: true }] };
+    const PM = workspaceModel({
+      workspace: 'saved',
+      workspaces: [
+        { id: 'saved', name: 'Saved', agentDockMigration: 2, layout: { docks: [left, center, right] } },
+        { id: 'tall', name: 'Tall', agentDockMigration: 3, layout: { docks: [left, animate, right] } },
+        { id: 'current', name: 'Current', agentDockMigration: 4, layout: { docks: [left, center, right] } },
+      ],
+    });
+    PM.WS.init();
+    const docks = (id: string) => PM.WS.get(id).layout.docks.map((dock: any) => [dock.id, dock.panels.map((panel: any) => panel.id)]);
+
+    expect(docks('saved')).toEqual([
+      ['left', ['assets', 'layer-effects']], ['center', ['viewer']], ['bottom', ['timeline']], ['right', ['inspector']],
+    ]);
+    expect(PM.WS.get('saved').layout.docks[2]).toMatchObject({ id: 'bottom', size: 320 });
+    expect(docks('tall')[1]).toEqual(['center', ['viewer', 'timeline']]);
+    expect(docks('current')[1]).toEqual(['center', ['viewer', 'timeline']]);
+  });
+
+  it('migrates a project-saved workspace when it is restored', () => {
+    const PM = workspaceModel();
+    PM.WS.init();
+    const restored = PM.WS.restoreSnapshot({ id: 'project-ws', name: 'Project', agentDockMigration: 3, layout: { docks: [
+      { id: 'left', panels: [{ id: 'assets', flex: true }] },
+      { id: 'center', flex: true, panels: [{ id: 'viewer', flex: true }, { id: 'timeline', size: 280 }] },
+    ] } });
+    expect(restored.layout.docks.map((dock: any) => dock.id)).toEqual(['left', 'center', 'bottom']);
+    expect(restored.layout.docks[2]).toMatchObject({ size: 280, panels: [{ id: 'timeline', flex: true }] });
+  });
+
+  it('keeps a shared agent panel at its set height', () => {
     const PM = workspaceModel();
     const workspace = PM.WS.normalize({
       id: 'agent-height', name: 'Agent height',
@@ -57,12 +136,26 @@ describe('legacy workspace install', () => {
         { id: 'center', flex: true, panels: [{ id: 'viewer', flex: true }] },
       ] },
     });
-    const assets = workspace.layout.docks[0].panels.find((panel: any) => panel.id === 'assets');
-    const agent = workspace.layout.docks[0].panels.find((panel: any) => panel.id === 'agent');
+    const again = PM.WS.normalize(workspace);
+    const agent = again.layout.docks[0].panels.find((panel: any) => panel.id === 'agent');
 
     expect(agent).toMatchObject({ id: 'agent', size: 350 });
     expect(agent.flex).toBeUndefined();
-    expect(assets.flex).toBe(true);
+    expect(again.layout.docks[0].panels.find((panel: any) => panel.id === 'assets').flex).toBe(true);
+  });
+
+  it('fills an agent-only dock across normalization without losing its saved height', () => {
+    const PM = workspaceModel();
+    const workspace = PM.WS.normalize({
+      id: 'agent-alone', name: 'Agent alone',
+      layout: { docks: [
+        { id: 'left', panels: [{ id: 'agent', size: 431 }] },
+        { id: 'center', flex: true, panels: [{ id: 'viewer', flex: true }] },
+      ] },
+    });
+    expect(PM.WS.normalize(workspace).layout.docks[0].panels).toEqual([
+      { id: 'agent', size: 431, flex: true },
+    ]);
   });
 
   it('restores saved built-in panel geometry instead of replacing it at boot', () => {

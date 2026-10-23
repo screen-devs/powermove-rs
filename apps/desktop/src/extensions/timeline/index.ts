@@ -49,7 +49,14 @@ const TIMELINE_STYLES = `
 #tl-time.edit{color:var(--accent)}
 #tl-canvas-wrap{flex:1;position:relative;min-height:0;overflow:hidden}
 #tl-canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
-${COMP_TABS_STYLES}`;
+#tl-canvas-wrap .tl-caption-editor{position:absolute;z-index:9;margin:0;padding:3px 7px;border:0;border-radius:var(--r-sm);background:var(--bg-float);color:var(--tx);font-family:inherit;font-size:11.5px;line-height:16px;resize:none;overflow:hidden;outline:0;box-shadow:var(--shadow-float,0 4px 14px rgb(0 0 0 / .18)),inset 0 0 0 1px var(--line);cursor:text}
+${COMP_TABS_STYLES}
+#tl-comp-tabs{padding-right:168px}
+#tl-mode{position:absolute;z-index:4;top:4px;right:8px;height:20px;display:flex;align-items:stretch;padding:1px;gap:1px;border-radius:var(--r-sm);background:color-mix(in srgb,var(--tx) 6%,var(--bg-panel))}
+#tl-mode .tl-mode-button{display:flex;align-items:center;gap:5px;padding:0 9px;border:0;border-radius:calc(var(--r-sm) - 1px);background:none;color:var(--tx-3);font:inherit;font-size:var(--fs-xs);line-height:1;cursor:default}
+#tl-mode .tl-mode-button svg{width:12px;height:12px;flex:none}
+#tl-mode .tl-mode-button:hover{color:var(--tx)}
+#tl-mode .tl-mode-button.on{color:var(--tx);background:var(--bg-panel);box-shadow:0 0 0 1px var(--line)}`;
 
 export function toggleLayerStrips(api: PowermoveAPI): void {
   const layers = selectedLayers(api);
@@ -77,12 +84,16 @@ export function splitSelectedLayersAtPlayhead(api: PowermoveAPI): string[] {
       for (const { prop } of api.anim.allProps(right)) {
         for (const key of prop.kf ?? []) key.t -= offset;
       }
-      right.from = api.transport.time();
-      right.dur = layer.from + layer.dur - api.transport.time();
-      if (api.media.timing.isTimed(layer)) {
-        (right.d as LayerWithTrim['d']).trim = trimAtStart(api, layer, api.transport.time());
-      }
-      layer.dur = api.transport.time() - layer.from;
+      const cut = api.transport.time();
+      const tailContent = api.media.timing.isTimed(layer)
+        ? { trim: trimAtStart(api, layer, cut) }
+        : api.media.timing.startPatch(layer, cut);
+      const headContent = api.media.timing.endPatch(layer, cut);
+      right.from = cut;
+      right.dur = layer.from + layer.dur - cut;
+      if (tailContent) Object.assign(right.d as Record<string, unknown>, tailContent);
+      if (headContent) Object.assign(layer.d as Record<string, unknown>, headContent);
+      layer.dur = cut - layer.from;
       api.project.get().layers.splice(api.project.get().layers.indexOf(layer), 0, right);
       rightIds.push(right.id);
     }
@@ -94,7 +105,6 @@ export function splitSelectedLayersAtPlayhead(api: PowermoveAPI): string[] {
   return rightIds;
 }
 
-type LayerWithTrim = { d: { trim?: number } };
 export default function activate(api: PowermoveAPI): void {
   activeApi = api;
   const timeline = createTimelineRuntime(api);
@@ -132,6 +142,24 @@ export default function activate(api: PowermoveAPI): void {
     run: () => revealProperty('m')
   });
   api.keybindings?.bind({ key: 'm', command: 'toggleLayerStrips', priority: 90 });
+  api.commands.register({
+    id: 'timeline.mode:layers',
+    label: 'Use layer timeline (After Effects)',
+    category: 'Timeline',
+    run: () => timeline.setMode('layers'),
+  });
+  api.commands.register({
+    id: 'timeline.mode:tracks',
+    label: 'Use track timeline (Premiere)',
+    category: 'Timeline',
+    run: () => timeline.setMode('tracks'),
+  });
+  api.commands.register({
+    id: 'timeline.toggleMode',
+    label: 'Toggle layer / track timeline',
+    category: 'Timeline',
+    run: () => timeline.setMode(timeline.mode === 'tracks' ? 'layers' : 'tracks'),
+  });
   /* Kernel deactivation runs before replacement activation. Capture this
      module instance's disposer so disabling/reloading the extension cannot
      leave its bus, window, observer, or DOM listeners alive. */
@@ -177,13 +205,15 @@ export default function activate(api: PowermoveAPI): void {
       wrap.appendChild(canvas);
 
       const tabs = document.createElement('div');
-      body.replaceChildren(styles, tabs, head, wrap);
+      const modes = document.createElement('div');
+      body.replaceChildren(styles, tabs, modes, head, wrap);
       if (moveHandle) head.prepend(moveHandle);
       disposeTabs?.();
       disposeTabs = mountCompTabs(api, tabs);
 
       timeline.attachHead(head);
       timeline.attachCanvas(wrap);
+      timeline.attachModeSwitch(modes);
     }
   });
 }

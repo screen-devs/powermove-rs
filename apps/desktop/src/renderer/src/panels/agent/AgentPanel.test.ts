@@ -7,6 +7,7 @@ import ThreadPicker from './ThreadPicker.svelte';
 import { BLINK_MS } from '../../controls/menu-blink';
 import { install as installSpatial } from '../../legacy/assistant/spatial';
 import { registerAgentPanel } from '../register-agent';
+import { installBridgeForTests, resetBridgeForTests } from '../../kernel/bridge';
 import {
   agentState,
   resetAgentState,
@@ -75,6 +76,7 @@ function snapshot(overrides: Partial<AgentSnapshot> = {}): AgentSnapshot {
     model: 'gpt-5.6-sol',
     reasoningEffort: 'high',
     accessMode: 'editor',
+    permission: 'editor',
     composerDraft: '',
     pendingEntering: false,
     models: [
@@ -279,8 +281,14 @@ describe('AgentPanel', () => {
     expect(rows[0]!.textContent).toContain('Current');
     expect(rows[1]!.textContent).toContain('Opened 5 days ago');
 
-    flushSync(() => rows[0]!.querySelector<HTMLButtonElement>('[aria-label="Delete thread: Animate the title"]')!.click());
-    expect(PM.AgentUI.deleteThread).toHaveBeenCalledWith('first');
+    const deleteFirst = rows[0]!.querySelector<HTMLButtonElement>('[aria-label="Delete thread: Animate the title"]')!;
+    PM.confirm = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    flushSync(() => deleteFirst.click());
+    await Promise.resolve();
+    expect(PM.confirm).toHaveBeenCalledWith(expect.objectContaining({ message: 'Delete “Animate the title”?', destructive: true }));
+    expect(PM.AgentUI.deleteThread).not.toHaveBeenCalled();
+    flushSync(() => deleteFirst.click());
+    await vi.waitFor(() => expect(PM.AgentUI.deleteThread).toHaveBeenCalledWith('first'));
     expect(PM.AgentUI.switchThread).not.toHaveBeenCalled();
 
     flushSync(() => rows[1]!.click());
@@ -307,9 +315,10 @@ describe('AgentPanel', () => {
     flushSync(() => picker.click());
     await tick(); flushSync();
     flushSync(() => target.querySelector<HTMLElement>('.thread-row')!.click());
-    await new Promise((resolve) => setTimeout(resolve, BLINK_MS * 2 + 10));
-    flushSync();
-    expect(picker.getAttribute('aria-expanded')).toBe('false');
+    await vi.waitFor(() => {
+      flushSync();
+      expect(picker.getAttribute('aria-expanded')).toBe('false');
+    });
     flushSync(() => picker.click());
     await tick(); flushSync();
     const popup = target.querySelector<HTMLElement>('.thread-popup')!;
@@ -438,7 +447,8 @@ describe('AgentPanel', () => {
     expect(document.activeElement).toBe(textarea);
   });
 
-  it('leaves the composer on Escape after dismissing slash commands', () => {
+  it('closes the popover on Escape after dismissing slash commands, keeping the draft', () => {
+    PM.AgentShell = { close: vi.fn(), collapse: vi.fn(), isOpen: () => true };
     renderPanel(snapshot({ composerDraft: '/' }));
     const textarea = target.querySelector<HTMLDivElement>('.agent-inline-prompt')!;
     flushSync(() => textarea.focus());
@@ -448,10 +458,34 @@ describe('AgentPanel', () => {
     escape();
     expect(target.querySelector('.agent-slash-menu')).toBeNull();
     expect(document.activeElement).toBe(textarea);
+    expect(PM.AgentShell.close).not.toHaveBeenCalled();
     escape();
-    expect(document.activeElement).not.toBe(textarea);
+    expect(PM.AgentShell.close).toHaveBeenCalledOnce();
     expect(textarea.textContent).toBe('/');
     expect(PM.AgentUI.submit).not.toHaveBeenCalled();
+  });
+
+  it('blurs on Escape and keeps focus after sending when the agent is docked', () => {
+    PM.AgentShell = { close: vi.fn(), collapse: vi.fn(), isOpen: () => false };
+    renderPanel(snapshot({ composerDraft: 'Make the title bigger' }));
+    const textarea = target.querySelector<HTMLDivElement>('.agent-inline-prompt')!;
+    flushSync(() => textarea.focus());
+    flushSync(() => textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })));
+    expect(PM.AgentUI.submit).toHaveBeenCalledOnce();
+    expect(document.activeElement).toBe(textarea);
+    flushSync(() => textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })));
+    expect(PM.AgentShell.close).not.toHaveBeenCalled();
+    expect(document.activeElement).not.toBe(textarea);
+  });
+
+  it('folds the popover into the launcher when a message is sent', () => {
+    PM.AgentShell = { close: vi.fn(), collapse: vi.fn(), isOpen: () => true };
+    renderPanel(snapshot({ composerDraft: 'Make the title bigger' }));
+    const textarea = target.querySelector<HTMLDivElement>('.agent-inline-prompt')!;
+    flushSync(() => textarea.focus());
+    flushSync(() => textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })));
+    expect(PM.AgentUI.submit).toHaveBeenCalledOnce();
+    expect(PM.AgentShell.collapse).toHaveBeenCalledOnce();
   });
 
   it('renders steering as a compact continuation of the active user request', () => {
@@ -668,7 +702,7 @@ describe('AgentPanel', () => {
     expect(log.querySelector('details img')?.getAttribute('alt')).toBe('Rendered composition at 0 seconds');
   });
 
-  it('omits files and external activity after completion while keeping review notes', () => {
+  it('lists the run\'s files but omits external activity after completion', () => {
     PM.assetKind.mockReturnValue('video');
     renderPanel(snapshot({
       legacyPhase: 'result',
@@ -686,12 +720,15 @@ describe('AgentPanel', () => {
     expect(log.textContent).toContain('Review the license before publishing.');
     expect(log.textContent).toContain('The clip could not be imported.');
     expect(log.textContent).not.toContain('Downloaded reference footage');
-    expect(log.querySelector('.agent-artifacts')).toBeNull();
+    const files = log.querySelector('.agent-run-files')!;
+    expect(files.querySelector('summary')!.textContent).toBe('1 file');
+    expect(files.textContent).toContain('clip.mp4');
+    (files.querySelector('[aria-label="Reveal clip.mp4 in Finder"]') as HTMLButtonElement).click();
+    expect(PM.AgentUI.revealArtifact).toHaveBeenCalledOnce();
     expect(log.querySelector('.agent-external-actions')).toBeNull();
     expect(target.textContent).not.toContain('Undo change');
     expect(target.textContent).not.toContain('Done');
     expect(log.querySelector('[aria-label="Add clip.mp4 to timeline"]')).toBeNull();
-    expect(log.querySelector('[aria-label="Reveal clip.mp4 in Finder"]')).toBeNull();
     expect(target.querySelector('.agent-inline-prompt')?.getAttribute('aria-disabled')).toBe('false');
 
     flushSync(() => setAgentSnapshot(snapshot({
@@ -835,7 +872,7 @@ describe('agent bridge', () => {
     expect(store.set).not.toHaveBeenCalledWith('agentAccessMode', 'computer');
   });
 
-  it('labels the two persistent agent authorities by what they change', () => {
+  it('offers the access levels as approval modes, most restricted first', () => {
     const registry: Record<string, any> = {
       store: { get: vi.fn((_key: string, fallback: unknown) => fallback), set: vi.fn() },
       uid: PM.uid,
@@ -843,9 +880,42 @@ describe('agent bridge', () => {
     };
     installSpatial(registry);
 
-    expect(agentState.accessModes.slice(0, 2).map(({ id, label }) => ({ id, label }))).toEqual([
-      { id: 'editor', label: 'Edit project' },
-      { id: 'project', label: 'Change Powermove (project)' }
+    expect(agentState.accessModes.map(({ id, label }) => ({ id, label }))).toEqual([
+      { id: 'editor', label: 'Composition only' },
+      { id: 'supervised', label: 'Supervised' },
+      { id: 'auto', label: 'Auto' },
+      { id: 'full', label: 'Full access' }
     ]);
   });
+
+  it('keeps the approval mode with Project access and asks main once for Full access', async () => {
+    const store = { get: vi.fn((_key: string, fallback: unknown) => fallback), set: vi.fn() };
+    const consent = vi.fn(async (request: { standing?: boolean; revoke?: boolean }) =>
+      request.standing ? { granted: true, token: 't', expiresAt: 1 } : { granted: false });
+    installBridgeForTests({ codex: { requestComputerConsent: consent } } as any);
+    try {
+      const registry: Record<string, any> = { store, registerPanel: vi.fn(), uid: PM.uid };
+      installSpatial(registry);
+
+      registry.AgentUI.setAccess('supervised');
+      expect(agentState.accessMode).toBe('project');
+      expect(agentState.permission).toBe('supervised');
+      expect(store.set).toHaveBeenCalledWith('agentApprovalMode', 'supervised');
+      // Older callers asking for Project keep the chosen approval mode.
+      registry.AgentUI.setAccess('project');
+      expect(agentState.permission).toBe('supervised');
+
+      registry.AgentUI.setAccess('full');
+      await vi.waitFor(() => expect(agentState.permission).toBe('full'));
+      expect(consent).toHaveBeenCalledWith(expect.objectContaining({ standing: true }));
+      expect(store.set).toHaveBeenCalledWith('agentAccessMode', 'computer');
+
+      registry.AgentUI.setAccess('auto');
+      expect(agentState.permission).toBe('auto');
+      expect(consent).toHaveBeenLastCalledWith(expect.objectContaining({ revoke: true }));
+    } finally {
+      resetBridgeForTests();
+    }
+  });
+
 });

@@ -33,7 +33,10 @@ await build({
   target: 'node22',
   format: 'esm',
   outfile: path.join(outDir, 'server.mjs'),
-  packages: 'external',
+  // Bundle the shared TypeScript packages and their JS dependencies. The
+  // standalone npm package must not depend on unpublished workspace modules.
+  // Keep native/process-backed dependencies in node_modules.
+  external: ['@anthropic-ai/claude-agent-sdk', 'esbuild', 'ws', 'playwright', '@powermove/macos-haptics', 'transcribe-cpp', 'koffi'],
   alias: { electron: path.join(desktop, 'src/server/electron-stub.ts') },
   define: { 'process.env.NODE_ENV': '"production"' },
   sourcemap: true,
@@ -54,6 +57,13 @@ const resources = path.join(outDir, 'resources');
 const copies = [
   ['src/extensions', 'builtin-extensions'],
   ['docs/EXTENSIONS.md', 'api-pack/EXTENSIONS.md'],
+  ['src/shared/blender.ts', 'api-pack/blender-schema.ts'],
+  ['src/renderer/src/core/scene3d/materials.ts', 'api-pack/scene3d-materials.ts'],
+  ['src/renderer/src/core/scene3d/modeling.ts', 'api-pack/scene3d-modeling.ts'],
+  ['docs/SCENE3D.md', 'api-pack/SCENE3D.md'],
+  ['src/renderer/src/core/scene3d/schema.ts', 'api-pack/scene3d-schema.ts'],
+  ['src/renderer/src/core/scene3d/layers.ts', 'api-pack/scene3d-layers.ts'],
+  ['src/renderer/src/core/scene3d/operations.ts', 'api-pack/scene3d-operations.ts'],
   ['docs/background-testing.md', 'api-pack/BACKGROUND_TESTING.md'],
   ['src/renderer/src/kernel/api.ts', 'api-pack/api.ts'],
   ['../../packages/registry/src/manifest.ts', 'api-pack/extensions.ts'],
@@ -61,7 +71,8 @@ const copies = [
   ['src/renderer/src/core/types/commands.ts', 'api-pack/commands.ts'],
   ['docs/samples/media-browser', 'api-pack/samples/media-browser'],
   ['docs/samples/gradient-tint', 'api-pack/samples/gradient-tint'],
-  ['src/main/agent-tools/mcp-server.mjs', 'agent-tools/mcp-server.mjs']
+  ['src/main/agent-tools/mcp-server.mjs', 'agent-tools/mcp-server.mjs'],
+  ['src/main/agent-tools/mcp-stdio.mjs', 'agent-tools/mcp-stdio.mjs']
 ];
 for (const [from, to] of copies) {
   const target = path.join(resources, to);

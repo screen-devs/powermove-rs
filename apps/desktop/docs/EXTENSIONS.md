@@ -390,6 +390,8 @@ Transitions, motion and `prefersReducedMotion` behave the same in both.
 
 ## The API (apiVersion 1–3)
 
+For built-in editable 3D model, light and camera layers, use `edit_3d`/`get_3d_scene` and `api.scene3d`; see `SCENE3D.md` for geometry, materials, lighting and animation examples.
+
 Full types: `api.ts` (next to this file in the agent API pack). Summary:
 
 ### Sandbox API (apiVersion 3)
@@ -638,26 +640,90 @@ The bundled **3D Layers** extension provides this as **Import OBJ Model…**. Po
 
 **Replace a built-in** — call `await api.extensions.fork('timeline')`, then edit the created user extension. Turning your fork off brings the built-in back.
 
-**Updating a fork** — when Powermove ships a newer version of the built-in, call `api.extensions.rebase(id)` (or use the update notice). The agent stages the old pristine base, your fork, and the newly shipped source together, then performs a three-way merge that preserves your behavior and records the new `forkedFrom` version.
+**Updating a fork** — when Powermove ships a newer version of the built-in, call `api.extensions.rebase(id)` (or use the update notice). Powermove compares the old pristine base, your fork, and the newly shipped source locally. It applies untouched upstream changes and merges non-overlapping edits while preserving your custom identity and edits. The result is compiled and validated before installation, and the update offers Undo. Conflicts or validation failures keep the current version and offer **Update with agent**. The agent receives a working copy with straightforward changes already merged and resolves the remaining conflicts. A completed update records the new `forkedFrom` version; a loading or sandbox-check failure restores the previous copy when possible.
 
 **Override just a piece** — don't fork; register the same panel/command/effect `id`. The latest registration wins; disabling yours restores the original.
 
+## Native panel design
+
+Unless the user's prompt explicitly asks for a different style, every new or
+modified panel must look like a built-in Powermove panel: same layout, controls,
+spacing, type and states. A generated panel that looks hand-made is a defect,
+just like a build error. An explicit user style request overrides this default
+only for the surface it names.
+
+**Visual editing first.** A panel is an editor, not a list of every parameter.
+Use a gradient ramp for colors and midpoint, a point pad for X/Y, a dial for
+angles, sliders for bounded values, and visual curves for easing. Keep roughly
+five primary controls visible. Put secondary settings under a quiet **More**
+disclosure; indicate changed or animated values even while it is closed. Use
+`advanced: true` on secondary effect/layer params or generated panel controls;
+`advanced: false` explicitly keeps a control visible. Older definitions receive
+an automatic compact layout. All underlying keys, commands and animation paths
+remain unchanged; preserve independent keyframing and precise number entry.
+
+Effects and extension layers accept optional visual hints:
+```ts
+ui: [
+  { kind: 'ramp', start: 'startColor', end: 'endColor', midpoint: 'midpoint', mode: 'radial' },
+  { kind: 'point', x: 'centerX', y: 'centerY', label: 'Center', advanced: true }
+]
+```
+Ramp endpoints must reference color params, midpoint a bounded number, and mode
+an existing boolean toggle (`false` = Linear, `true` = Radial). They do not add
+movable color-stop positions to a shader that has no position parameters. Point
+widgets bind two bounded numeric params. Invalid or overlapping hints fall back
+to the ordinary controls without losing parameters. Start/end color pairs and
+numeric X/Y pairs are recognized automatically in older definitions. A param's
+optional `options: [{v: false, label: 'Linear'}, {v: true, label: 'Radial'}]`
+(or numeric `v` values) renders a select without changing its stored type.
+
+Trusted panels can reuse `api.ui.controls.RampField`, `PointField`, `SliderField`
+and `Disclosure`. All visual fields accept `api`, live `get`, and `edit`, using
+the same undoable binding as `NumField`. SliderField accepts `min`, `max`, `step`,
+`unit`, and `angle: true` for a dial. PointField reads `[x,y]`, uses a composite
+`edit` writing both keys in one transaction, and separate `xEdit`/`yEdit` bindings
+for exact numbers. RampField reads `{id,color,position}[]`; omit `edit` for fixed
+endpoints and use `onSelect(id)` to open the existing color editor. Optional
+`midpoint()`/`midpointEdit` edit the midpoint. FillField already uses draggable
+stops in its shared color picker. Disclosure accepts `label`, `count`, `changed`,
+`remember` and a children snippet. Keep controls connected to real source values.
+
+**Reuse before you build.** Open the built-in panel closest to the job with
+`get_panel_state`/`capture_panel` and copy its structure. Let
+`api.panels.register` supply the frame, header, docking and scrolling. Wherever
+an existing component covers the need, use it: `api.ui.controls` (`Row`,
+`Section`, `TextField`, `NumField`, `SelectField`, `ToggleField`, `ColorField`,
+`FillField`, `FontField`), `api.ui.menu`, `api.ui.modal`, `api.ui.icon` and
+`api.ui.toast`. Hand-write a control only when no existing component fits or the
+user asks for it. Sandboxed Store panels cannot use the trusted-only components.
+They must still reproduce the native control's look and behavior with theme
+tokens, not invent a new one.
+
+**Match the native look.**
+- Use the theme tokens for color, radius, type, row and control height
+  (`--row-h`, `--ctl-h`, `--fs-md`, `--r-base`, `--f-ui`). Do not hardcode
+  colors or sizes, and do not add a palette of your own.
+- Lay out label and control rows like Properties. Labels sit in `--tx-2`;
+  values and controls align to the same column.
+- Buttons are flat tonal fills or transparent. Do not add outlines, bevels,
+  gradients or raised shadows. A choice among a few options is a segmented
+  control on a sunken track, with the selected segment shown as a tonal fill.
+  Never use separate outlined pills or an accent-colored ring for it.
+- Group content with spacing and `--bg-panel-2`/`--bg-sunken` fills, not
+  hairline dividers, nested cards or a second title bar.
+- Leave out helper captions, attribution footers, status sentences and
+  implementation details. Report results in the content itself or with
+  `api.ui.toast`. Put recovery actions inside the error surface they act on.
+- Inherit light and dark themes, and keep hover, selected, disabled and keyboard
+  focus states visible.
+- Keep controls source-connected and undoable.
+
+Before you finish, capture the panel next to a built-in panel at a normal and a
+narrow width and fix every visible difference. See
+[the interface language](design-language.md).
+
 ## Theme tokens (subset; the full set is `@powermove/tokens/tokens.css`)
-
-### Native panels by default
-
-Unless the user's prompt explicitly requests a different style, new and modified
-panels must match regular Powermove panels one to one. Let `api.panels.register`
-supply the existing frame, header, docking, and scrolling. Reuse `api.ui.controls`
-and the closest built-in panel's rows, fields, sections, buttons, and icons.
-Match the same spacing, type sizes, label alignment, control heights, radii,
-borders, and surfaces using the app's tokens. Inherit light/dark mode; do not
-introduce a nested card, duplicate title bar, custom palette, or decorative UI.
-Use flat tonal fills or transparent buttons without bevels, decorative gradients,
-or raised shadows. Put recovery actions inside their borderless error surface.
-Keep keyboard focus and selection indicators visible. See [the interface language](design-language.md).
-Keep controls source-connected and undoable. An explicit user style request
-overrides this default only for the requested surface.
 
 `--accent --bg-window --bg-panel --bg-panel-2 --bg-sunken --bg-field --tx --tx-2 --line --r-base --f-ui --f-mono --row-h --ctl-h --fs-md --dur-2 --ease`
 
@@ -736,3 +802,16 @@ Do not use broad categories such as `panels`, extension names, or `forkedFrom` a
 proof of equivalence. A fork may retain custom behavior that the app does not have.
 Feature declarations are additive metadata and do not alter loading or replacement
 rules. Maintainers must include accurate declarations in releases that adopt features.
+
+### Agent media management
+
+Project agents can manage media directly, without generating a recovery extension:
+
+- `list_media` returns paged media IDs, source paths, fingerprints, storage and loading status, folders, and referencing layers. Use `missingOnly` to find unavailable media.
+- `replace_media { assetId, path }` replaces or relinks a local file while retaining the asset ID, timeline references, timing, animation and folder. `missingOnly: true` skips assets already available; `expectedFingerprint` checks the selected bytes. The source must be the same media kind. Locked referencing layers block replacement, including nested compositions and locked groups.
+- `import_media { path, folderId? }` imports into durable project storage without adding timeline layers. It returns an asset ID for later placement through the normal editing tools and reuses already imported matching bytes.
+- `manage_media` renames, moves and deletes media, and creates, renames, moves or deletes folders. Folder deletion keeps its contents. Referenced media deletion requires `removeReferenced: true`; locked or unsupported structured references block deletion. Source files on disk are never deleted.
+
+Paths must be absolute local paths. Imports read native file chunks, accept files up to 512 MiB and do not silently download cloud placeholders. Both import tools verify durable storage and live availability before returning success. Failed replacements leave the original intact. Retry only failed assets; media bytes never belong in extension source.
+
+Replacement and management use normal editor Undo. They are preserved if the agent run stops and cannot be restored with `rollback_changes`, because snapshot rollback cannot restore retained media runtime versions. Importing media follows normal import behavior: media survives timeline Undo. Planning runs can list media but cannot mutate it; app runs without an attached project receive none of these tools.

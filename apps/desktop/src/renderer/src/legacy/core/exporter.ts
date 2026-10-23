@@ -24,6 +24,7 @@ import { createSettingsSection } from '../ui/settings-section';
 import { mountSquircles, SQUIRCLE_SELECTOR } from '../../settings/squircle';
 import { row as settingsRow, select as settingsSelect, numberInput as settingsNumberInput, type SettingsRow } from '../ui/project-settings';
 import { bridge as hostBridge } from '../../kernel/bridge';
+import { captionSidecars } from '../../captions/sidecar';
 
 export function install(PM: PMRegistry): void {
 const h: any = PM.h;
@@ -265,6 +266,21 @@ X.dialog = () => {
     toggle(() => opts.audio !== false, (v: any) => { opts.audio = v; sync(); }, 'Include audio'));
   mk(rendering, 'alpha', 'Transparent background', 'Keep the background see-through, with straight alpha.',
     toggle(() => !!opts.alpha, (v: any) => { opts.alpha = v; sync(); }, 'Transparent background'));
+  /* Captions: burned in by default, optionally also delivered as a sidecar. */
+  const captionLayers = (p.layers || []).filter((layer: any) => layer.type === 'captions');
+  const captionsSection = createSettingsSection('Captions');
+  if (captionLayers.length) {
+    body.insertBefore(captionsSection.element, presetSection.element);
+    opts.captionsBurn ??= true;
+    opts.captionsSidecar ??= 'none';
+    mk(captionsSection, 'captionsBurn', 'Burn in captions', 'Draw captions into the picture.',
+      toggle(() => opts.captionsBurn !== false, (v: any) => { opts.captionsBurn = v; sync(); }, 'Burn in captions'));
+    mk(captionsSection, 'captionsSidecar', 'Caption file', captionLayers.length > 1
+      ? 'Also write one subtitle file per captions layer beside the video.'
+      : 'Also write a subtitle file beside the video.',
+      select('Caption file', () => opts.captionsSidecar, (v: any) => { opts.captionsSidecar = v; sync(); },
+        [{ v: 'none', label: 'None' }, { v: 'srt', label: 'SubRip (.srt)' }, { v: 'vtt', label: 'WebVTT (.vtt)' }]));
+  }
 
   let presets=PM.store.get('renderPresets',[]);
   let chosenPreset='';const presetOptions=[{v:'',label:'Choose preset'},...presets.map((preset:any)=>({v:preset.id,label:preset.name}))];
@@ -298,12 +314,13 @@ X.dialog = () => {
     const support: any = exportFieldSupport(opts.format);
     for (const key of Object.keys(rows)) {
       if (key === 'format' || key === 'size' || key === 'preset' || key === 'presetSave') continue;
+      if (key === 'captionsBurn' || key === 'captionsSidecar') { rows[key]!.element.hidden = kind !== 'video' && !(key === 'captionsBurn' && kind === 'images'); continue; }
       rows[key]!.element.hidden = !support[key];
     }
     rows.format!.element.hidden = settingsFree;
     sizeRow.element.hidden = !support.scale || !customOpen;
     presetRow.element.hidden = saveRow.element.hidden = settingsFree;
-    for (const section of [output, rendering, presetSection]) {
+    for (const section of [output, rendering, captionsSection, presetSection]) {
       section.element.hidden = settingsFree || ![...section.body.children].some((child) => !(child as HTMLElement).hidden);
     }
     const est: any = plan();
@@ -367,7 +384,7 @@ function progressUI(total: any) {
     dismissible: false,
     onClose: () => { if (X.busy) X.cancel = true; stopPreview(); },
     actions: [{ label: 'Cancel', run: () => {
-      X.cancel = true;
+      X.cancel = true;void hostBridge()?.blender?.cancel();
       label.textContent = 'Cancelling…'; eta.textContent = '';
       const button = mod.el.querySelector('.mf button');
       if (button) { button.disabled = true; button.textContent = 'Cancelling…'; }
@@ -397,6 +414,8 @@ function progressUI(total: any) {
 }
 
 let destinationToken: string | null = null;
+/** The file the last export wrote, for caption sidecars beside it. */
+let lastOutputPath: string | null = null;
 let nativeToken: string | null = null;
 let sequenceDirectory: any = null;
 
@@ -427,6 +446,8 @@ async function run(opts: any) {
       try { sequenceDirectory = await (window as any).showDirectoryPicker({ mode: 'readwrite' }); }
       catch (error: any) { if (error?.name === 'AbortError') return { cancelled: true }; throw error; }
     }
+    // A clean picture for a separate caption file: the compositor skips captions.
+    PM.captionsHidden = opts.captionsBurn === false;
     return await runPrepared(opts);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -440,6 +461,7 @@ async function run(opts: any) {
       nativeToken = null;
       destinationToken = null;
       sequenceDirectory = null;
+      PM.captionsHidden = false;
       X.busy = false;
     }
   }
@@ -463,6 +485,7 @@ async function deliver(blob: Blob, name: string): Promise<boolean> {
   }
   if (result?.cancelled) return false;
   if (result?.ok === false) throw new Error(result.error || 'Save failed');
+  lastOutputPath = typeof result?.path === 'string' ? result.path : null;
   return true;
 }
 
@@ -498,13 +521,13 @@ async function runPrepared(opts: any) {
       await PM.app?.importQueue;
       const data = await packProjectFileBlob({ ...JSON.parse(PM.serialize()), history: PM.hist.export?.() }, PM.MediaStore);
       if (!await deliver(data, (p.name || 'powermove') + '.pmv')) return { cancelled: true };
-      PM.toast('Project exported');return {cancelled:false};
+      PM.toast('Project exported');return {cancelled:false, ...(opts.reportPath && lastOutputPath ? { path: lastOutputPath } : {})};
     } catch (error) { const message=error instanceof Error?error.message:String(error);PM.toast('Could not export project: '+message,6000);return {error:message}; }
   }
   if (opts.format === 'still') {
     const wasPlaying=PM.playing,at=PM.time;PM.pause();
-    try{await prepareFrame(PM,at);
-      const cv: any = opts.alpha ? alphaFrame(at, W, H, opts.mblur) : PM.renderFrameTo(at, W, H);
+    try{await prepareFrame(PM,at,PM.proj,{width:W,height:H,mblur:opts.mblur,mbSamples:opts.alpha?20:16});
+      const cv: any = opts.alpha ? alphaFrame(at, W, H, opts.mblur) : PM.renderFrameTo(at, W, H,{mblur:opts.mblur});
       const blob=await new Promise<Blob>((resolve,reject)=>cv.toBlob((b:Blob|null)=>b?resolve(b):reject(new Error('Could not encode frame'))));
       if (!await deliver(blob, `${p.name}_${PM.tc(at, p.fps).replace(/:/g, '-')}.png`)) return { cancelled: true };
       PM.toast('Frame exported');return {cancelled:false};
@@ -518,6 +541,7 @@ async function runPrepared(opts: any) {
   let ui: any;
   const bitrate: any = exportBitrateMbps(opts.quality) * 1e6;
   const t: any = window.performance.now();
+  lastOutputPath = null;
 
   try {
     PM.pause();
@@ -537,8 +561,11 @@ async function runPrepared(opts: any) {
       await exportWebCodecs({ opts, W, H, t0, t1, total, ui, pctx, bitrate });
     }
     if (X.cancel) PM.toast('Export cancelled');
-    else PM.toast(`Export finished in ${((window.performance.now() - t) / 1000).toFixed(1)}s`, 3400);
-    return {cancelled:X.cancel};
+    else {
+      const sidecars = await writeCaptionSidecars(opts, t0, t1);
+      PM.toast(`Export finished in ${((window.performance.now() - t) / 1000).toFixed(1)}s${sidecars ? ` · ${sidecars} caption ${sidecars === 1 ? 'file' : 'files'}` : ''}`, 3400);
+    }
+    return {cancelled:X.cancel, ...(opts.reportPath && !X.cancel && lastOutputPath ? { path: lastOutputPath } : {})};
   } catch (e: any) {
     window.console.error(e);
     PM.toast('Export failed: ' + e.message, 5000);
@@ -556,10 +583,33 @@ async function runPrepared(opts: any) {
   }
 }
 
+const isVideoExport = (format: string) => !['web', 'json', 'png', 'still'].includes(format);
+
+/** Subtitle files beside the exported video, one per captions layer. */
+async function writeCaptionSidecars(opts: any, t0: number, t1: number): Promise<number> {
+  const format = opts.captionsSidecar;
+  // Only beside a video: the choice survives switching to a still, an image
+  // sequence or a code/project export, where a subtitle file means nothing.
+  if ((format !== 'srt' && format !== 'vtt') || !lastOutputPath || !isVideoExport(opts.format)) return 0;
+  const bridge = (hostBridge() as any);
+  const files = captionSidecars(PM.proj, format, { from: t0, to: t1 });
+  if (!bridge?.exportSidecar) {
+    for (const file of files) await PM.download(new Blob([file.text], { type: 'text/plain' }), `${PM.proj.name || 'Captions'}${file.suffix ? `.${file.suffix}` : ''}.${format}`);
+    return files.length;
+  }
+  let written = 0;
+  for (const file of files) {
+    const result = await bridge.exportSidecar({ path: lastOutputPath, extension: format, ...(file.suffix ? { suffix: file.suffix } : {}), text: file.text });
+    if (result?.ok) written++;
+    else PM.toast(`Could not write the caption file: ${result?.error || 'unknown error'}`, 5000, { error: true });
+  }
+  return written;
+}
+
 function renderInto(T: any, W: any, H: any, mblur: any) {
   PM.quality = 1;
   PM.GL.resize(W, H);
-  PM.GL.render(T, { mblur, mbSamples: 20, shutter: PM.proj.shutter || .5 });
+  PM.GL.render(T, { exporting:true, mblur, mbSamples: 20, shutter: PM.proj.shutter || .5 });
   return PM.GL.canvas;
 }
 
@@ -618,7 +668,7 @@ async function exportNative({opts,W,H,t0,t1,total,ui,pctx}:any) {
     for (let i = 0; i < total; i++) {
       if (X.cancel) break;
       const T = t0 + i / opts.fps;
-      await prepareFrame(PM, T);
+      await prepareFrame(PM,T,PM.proj,{width:W,height:H,mblur:opts.mblur,mbSamples:opts.alpha?20:16});
       if (X.cancel) break;
       // Preserve Canvas2D's established premultiply/unpremultiply rounding for
       // alpha delivery. Opaque frames have no such round trip to preserve.
@@ -640,6 +690,7 @@ async function exportNative({opts,W,H,t0,t1,total,ui,pctx}:any) {
     nativeToken = null;
     if (result.cancelled) X.cancel = true;
     else if (!result.path) throw new Error('Could not save video');
+    lastOutputPath = result.path || null;
   } finally {
     if (preview) { preview.width = 0; preview.height = 0; }
   }
@@ -673,7 +724,7 @@ async function exportWebCodecs({ opts, W, H, t0, t1, total, ui, pctx, bitrate }:
   for (let i: any = 0; i < total; i++) {
     if (X.cancel) break;
     const T: any = t0 + i / opts.fps;
-    await prepareFrame(PM,T);
+    await prepareFrame(PM,T,PM.proj,{width:W,height:H,mblur:opts.mblur,mbSamples:20});
     const cv: any = renderInto(T, W, H, opts.mblur);
     const frame: any = new window.VideoFrame(cv, { timestamp: Math.round(i / opts.fps * 1e6), duration: Math.round(1e6 / opts.fps) });
     try { if (encoderError) throw encoderError; enc.encode(frame, { keyFrame: i % Math.round(opts.fps * 2) === 0 }); } finally { frame.close(); }
@@ -742,7 +793,7 @@ async function exportRecorder({ opts, W, H, t0, t1, total, ui, pctx, bitrate }: 
     for (let i: any = 0; i < total; i++) {
       if (X.cancel) break;
       const T: any = t0 + i / opts.fps;
-    await prepareFrame(PM,T);
+    await prepareFrame(PM,T,PM.proj,{width:W,height:H,mblur:opts.mblur,mbSamples:20});
       const cv: any = renderInto(T, W, H, opts.mblur);
       if (track.requestFrame) track.requestFrame();
       const target: any = start + i * frameDur;
@@ -772,7 +823,7 @@ async function exportPNGs({ opts, W, H, t0, total, ui, pctx }: any) {
   for (let i: any = 0; i < total; i++) {
     if (X.cancel) break;
     const T: any = t0 + i / opts.fps;
-    await prepareFrame(PM,T);
+    await prepareFrame(PM,T,PM.proj,{width:W,height:H,mblur:opts.mblur,mbSamples:opts.alpha?20:16});
     let cv: any;
     if (opts.alpha) cv = alphaFrame(T, W, H, opts.mblur);
     if (!cv) cv = PM.renderFrameTo(T, W, H, { mblur: opts.mblur });
@@ -808,7 +859,7 @@ X.snapshotAsync = async (T: number, maxW = 480) => {
   PM.pause();
   PM.agentFrameCapture = true;
   try {
-    await prepareFrame(PM, T);
+    const scale=Math.min(1,maxW/PM.proj.w);await prepareFrame(PM,T,PM.proj,{width:Math.max(2,Math.round(PM.proj.w*scale)),height:Math.max(2,Math.round(PM.proj.h*scale)),mblur:false});
     return X.snapshot(T, maxW);
   } finally {
     PM.agentFrameCapture = false;

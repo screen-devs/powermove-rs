@@ -35,8 +35,10 @@ import {
   type ExtensionsChangedEvent
 } from '../shared/extensions';
 import { VARS_IPC, type VarsStatus } from '../shared/vars-ipc';
+import { MEDIA_PATH_IPC } from '../shared/media-tools';
 import { CLOUD_IPC, type CloudChannel, type CloudChannels } from '../shared/cloud-ipc';
 import { STORE_IPC, type StoreChannel, type StoreChannels } from '../shared/store-ipc';
+import { TRANSCRIPTION_IPC, type TranscribeProgress, type TranscribeResult, type TranscriptionStatus } from '../shared/transcription';
 
 /** One typed invoke for every `cloud:*` channel (store plan §2.7). */
 function cloudInvoke<C extends CloudChannel>(channel: C, request?: CloudChannels[C]['req']): Promise<CloudChannels[C]['res']> {
@@ -84,6 +86,7 @@ const bridge: PowermoveBridge = {
     choose: (name, directory) => ipcRenderer.invoke(IPC.exportChoose, { name, directory }),
     release: token => ipcRenderer.invoke(IPC.exportRelease, token),
   },
+  exportSidecar: request => ipcRenderer.invoke(IPC.exportSidecar, request),
   fileUpload: {
     begin: size => ipcRenderer.invoke(IPC.fileSaveUpload, size),
     chunk: (uploadId, data) => ipcRenderer.invoke(IPC.fileSaveChunk, { uploadId, data }),
@@ -126,7 +129,14 @@ const bridge: PowermoveBridge = {
   confirmProjectClose: (name) => ipcRenderer.invoke(IPC.projectConfirmClose, name),
   confirm: (request) => ipcRenderer.invoke(IPC.dialogConfirm, request) as Promise<boolean>,
   clipboardWriteText: (text) => ipcRenderer.invoke(IPC.clipboardWriteText, text) as Promise<void>,
+  pasteMedia: () => ipcRenderer.invoke(IPC.mediaPaste) as Promise<boolean>,
 
+  blender: {
+    status: () => ipcRenderer.invoke(IPC.blenderStatus),
+    choose: () => ipcRenderer.invoke(IPC.blenderChoose),
+    run: job => ipcRenderer.invoke(IPC.blenderRun, job),
+    cancel: () => ipcRenderer.invoke(IPC.blenderCancel),
+  },
   render: {
     start: options => ipcRenderer.invoke(IPC.renderStart,options),
     write: (token,data,audio) => ipcRenderer.invoke(IPC.renderWrite,{token,data,audio}),
@@ -153,8 +163,8 @@ const bridge: PowermoveBridge = {
         name: file.name
       }) as Promise<MediaProxyResult>;
     },
-    createImageSequence: async (files, fps, onProgress) => {
-      const sourcePaths = files.map(file => webUtils.getPathForFile(file));
+    createImageSequence: async (files, fps, onProgress, originalPaths) => {
+      const sourcePaths = files.map((file, index) => originalPaths?.[index] || webUtils.getPathForFile(file));
       if (sourcePaths.some(source => !source)) return { ok: false, error: 'The original image files are no longer available' };
       const requestId = `sequence-${Date.now()}-${++nextMediaRequest}`;
       const listener = (_event: IpcRendererEvent, progress: { requestId: string; completed: number }) => {
@@ -193,6 +203,16 @@ const bridge: PowermoveBridge = {
       ipcRenderer.invoke(IPC.attachmentReveal, request) as Promise<void>
   },
 
+  /* ── agent media tools: asset → readable file (media-tools lane) ── */
+  mediaPath: {
+    lookup: (request) => ipcRenderer.invoke(MEDIA_PATH_IPC.lookup, request),
+    stageBegin: (request) => ipcRenderer.invoke(MEDIA_PATH_IPC.stageBegin, request),
+    stageChunk: (token, offset, data) => ipcRenderer.invoke(MEDIA_PATH_IPC.stageChunk, { token, offset, data }) as Promise<void>,
+    stageFinish: (token) => ipcRenderer.invoke(MEDIA_PATH_IPC.stageFinish, token),
+    stageAbort: (token) => ipcRenderer.invoke(MEDIA_PATH_IPC.stageAbort, token) as Promise<void>,
+    release: (projectId) => ipcRenderer.invoke(MEDIA_PATH_IPC.release, projectId) as Promise<void>
+  },
+
   codex: {
     async run(req, onProgress, onTrace) {
       const listener = (_event: IpcRendererEvent, progress: CodexProgressEvent): void => {
@@ -214,8 +234,10 @@ const bridge: PowermoveBridge = {
     steer: (req) => ipcRenderer.invoke(IPC.codexSteer, req),
     answer: (req) => ipcRenderer.invoke(IPC.codexAnswer, req),
     cancel: (id, preserveChanges = false) => ipcRenderer.invoke(IPC.codexCancel, { id, preserveChanges }) as Promise<void>,
+    cancelTask: (requestId, taskId) => ipcRenderer.invoke(IPC.codexCancelTask, { requestId, taskId }),
     fixPrompt: (req) => ipcRenderer.invoke(IPC.codexFixPrompt, req) as Promise<string>,
     rebasePrompt: (req) => ipcRenderer.invoke(IPC.codexRebasePrompt, req) as Promise<string>,
+    updateFork: (req) => ipcRenderer.invoke(IPC.codexUpdateFork, req),
     restoreChangeSet: (req) => ipcRenderer.invoke(IPC.codexRestoreChangeSet, req),
     requestComputerConsent: (req) =>
       ipcRenderer.invoke(IPC.consentComputer, req) as Promise<ConsentResult>
@@ -267,7 +289,9 @@ const bridge: PowermoveBridge = {
 
   artifacts: {
     read: (ref) => ipcRenderer.invoke(IPC.artifactRead, ref) as Promise<ArtifactFile>,
-    reveal: (ref) => ipcRenderer.invoke(IPC.artifactReveal, ref) as Promise<void>
+    reveal: (ref) => ipcRenderer.invoke(IPC.artifactReveal, ref) as Promise<void>,
+    forget: (projectId) => ipcRenderer.invoke(IPC.artifactForget, projectId) as Promise<void>,
+    sweep: (liveProjectIds) => ipcRenderer.invoke(IPC.artifactSweep, liveProjectIds) as Promise<string[]>
   },
 
   captureWindow: () => ipcRenderer.invoke(IPC.captureWindow) as Promise<CaptureResult>,
@@ -452,6 +476,28 @@ const bridge: PowermoveBridge = {
     onUpdatesChanged: cloudEvent(STORE_IPC.updatesChanged),
     onPublishProgress: cloudEvent(STORE_IPC.publishProgress),
     onLibraryChanged: cloudEvent<void>(STORE_IPC.libraryChanged)
+  },
+
+  /* ── transcription lane: on-device speech models and transcribe ── */
+  transcription: {
+    status: () => ipcRenderer.invoke(TRANSCRIPTION_IPC.status) as Promise<TranscriptionStatus>,
+    download: (modelId) => ipcRenderer.invoke(TRANSCRIPTION_IPC.download, String(modelId)) as Promise<TranscriptionStatus>,
+    cancelDownload: (modelId) => ipcRenderer.invoke(TRANSCRIPTION_IPC.cancelDownload, String(modelId)) as Promise<TranscriptionStatus>,
+    remove: (modelId) => ipcRenderer.invoke(TRANSCRIPTION_IPC.remove, String(modelId)) as Promise<TranscriptionStatus>,
+    setActive: (modelId) => ipcRenderer.invoke(TRANSCRIPTION_IPC.setActive, String(modelId)) as Promise<TranscriptionStatus>,
+    setLanguage: (language) => ipcRenderer.invoke(TRANSCRIPTION_IPC.setLanguage, String(language)) as Promise<TranscriptionStatus>,
+    reveal: () => ipcRenderer.invoke(TRANSCRIPTION_IPC.reveal) as Promise<void>,
+    transcribe: (request) => ipcRenderer.invoke(TRANSCRIPTION_IPC.transcribe, {
+      path: request.path,
+      ...(request.start !== undefined ? { start: request.start } : {}),
+      ...(request.end !== undefined ? { end: request.end } : {}),
+      ...(request.language !== undefined ? { language: request.language } : {}),
+      ...(request.requestId !== undefined ? { requestId: request.requestId } : {})
+    }) as Promise<TranscribeResult>,
+    cancelTranscribe: (requestId) => ipcRenderer.invoke(TRANSCRIPTION_IPC.cancelTranscribe, String(requestId)) as Promise<void>,
+    onStatus: cloudEvent<TranscriptionStatus>(TRANSCRIPTION_IPC.statusChanged),
+    onProgress: cloudEvent<TranscribeProgress>(TRANSCRIPTION_IPC.progress),
+    onModelRequested: cloudEvent<{ reason: string }>(TRANSCRIPTION_IPC.modelRequested)
   }
 };
 

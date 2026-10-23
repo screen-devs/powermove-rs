@@ -46,6 +46,7 @@ const lockedCases = {
     type: 'set_property', target: layer.id, path: 'position.x', value: 100,
     mode: 'static', preserveHandEdits: false,
   }),
+  offset_property: ({ layer }) => ({type:'offset_property',target:layer.id,path:'position.x',delta:1,preserveHandEdits:false}),
   replace_keyframes: ({ layer }) => ({
     type: 'replace_keyframes', target: layer.id, path: 'opacity',
     keyframes: [{ time: 0, value: 10 }, { time: 1, value: 90 }], preserveHandEdits: false,
@@ -86,13 +87,16 @@ const lockedCases = {
     });
     return { type: 'transform_layers', transform: { version: 1 } };
   },
+  add_captions: () => ({ type: 'add_captions', id: 'allowed-captions', cues: [{ start: 0, end: 1, text: 'Allowed' }], select: false }),
+  edit_captions: ({ layer }) => ({ type: 'edit_captions', target: layer.id, op: 'delete', ids: [] }),
 };
 
-it('the locked-layer operation matrix is frozen for all 22 operations', () => {
+it('the locked-layer operation matrix is frozen for all 25 operations', () => {
   const outcomes = {
     group_layers: 'blocked', ungroup_layers: 'blocked', move_to_group: 'blocked',
     set_property: 'blocked',
     replace_keyframes: 'blocked',
+    offset_property: 'blocked',
     set_easing: 'blocked',
     set_expression: 'blocked',
     set_content: 'blocked',
@@ -110,6 +114,8 @@ it('the locked-layer operation matrix is frozen for all 22 operations', () => {
     create_section: 'allowed',
     update_section: 'allowed',
     transform_layers: 'blocked',
+    add_captions: 'allowed',
+    edit_captions: 'blocked',
   };
   assert.deepEqual(Object.keys(outcomes).sort(), Object.keys(fixture().PM.Edit.operations).sort());
 

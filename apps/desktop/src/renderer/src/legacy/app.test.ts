@@ -5,6 +5,7 @@ import { createServicesRegistry } from '../kernel/services';
 import type { PMRegistry } from './registry';
 import { install } from './app';
 import { install as installHistory } from './core/history';
+import { install as installProjects } from './core/projects';
 import { unpackProjectFile } from './core/project-file';
 
 const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
@@ -130,6 +131,8 @@ function appRegistry(withExtensionSurfaces = true, bootProject?: any, bootFile?:
       get: (id: string) => projects.get(id) || null,
       put: (project: any) => projects.set(project.id, project),
       remove: (id: string) => projects.delete(id),
+      destroy: (id: string) => states.delete(id),
+      unwrap: (raw: any) => raw?.proj || raw,
       getState: (id: string) => states.get(id) || null,
       putState: (id: string, state: any) => states.set(id, state),
       openProjects: () => [raw.id],
@@ -159,7 +162,7 @@ function appRegistry(withExtensionSurfaces = true, bootProject?: any, bootFile?:
       return (Array.isArray(keys) ? keys : []).filter((key: any) =>
         key && Number.isFinite(key.t) && key.t >= 0 && typeof key.v === typeof fallback);
     },
-    WS: { init() {}, restoreSnapshot() {}, snapshot: () => ({}), editing: false },
+    WS: { init() {}, restoreSnapshot() {}, snapshot: () => ({}), get: (id: string) => ({ id }), activate() {}, editing: false },
     selectLayers() {},
     L: () => null,
     sel: { layers: [], keys: [], chan: null },
@@ -458,6 +461,82 @@ describe('legacy app install', () => {
     expect(await PM.prepareToClose()).toBe(true);
   });
 
+  it('discards a never-saved project on window close, including recovery and later flushes', async () => {
+    const { PM, memory, listeners, timers } = appRegistry();
+    installProjects(PM);
+    PM.proj.name = 'Discard me';
+    PM.autosave();
+    await timers.get(PM.app.saveTimer)();
+    PM.Projects.putState('P1', { history: { entries: [] }, workspace: {} });
+    memory.set('projectJournal.P1', []);
+    memory.set('autosave', { proj: PM.proj });
+    expect(PM.Projects.get('P1')).not.toBeNull();
+    (window as any).powermove = { confirmProjectClose: async () => 'discard' };
+    installBridgeForTests((window as any).powermove);
+
+    expect(await PM.prepareToClose()).toBe(true);
+    await PM.flushProject();
+    for (const listener of listeners.get('beforeunload') || []) listener();
+    PM.autosave();
+    expect(PM.Projects.list()).toEqual([]);
+    expect(PM.Projects.get('P1')).toBeNull();
+    expect(PM.Projects.getState('P1')).toBeNull();
+    expect(memory.has('projectJournal.P1')).toBe(false);
+    expect(memory.has('autosave')).toBe(false);
+  });
+
+  it('removes a never-saved tab without recapturing it when showing its neighbour', async () => {
+    const { PM, listeners } = appRegistry();
+    installProjects(PM);
+    PM.Projects.put(PM.proj);
+    PM.pause = vi.fn();
+    PM.rasterClear = vi.fn();
+    PM.WS.activate = vi.fn();
+    PM.touch = vi.fn();
+    listeners.get('pm-open-project')![0]({ detail: PM.mkProject({ id: 'P2', name: 'New project' }) });
+    PM.proj.name = 'Edited new project';
+    PM.autosave();
+    (window as any).powermove = { confirmProjectClose: async () => 'discard' };
+    installBridgeForTests((window as any).powermove);
+
+    expect(await PM.Tabs.close('P2')).toBe(true);
+    expect(PM.proj.id).toBe('P1');
+    expect(PM.Tabs.list()).toEqual(['P1']);
+    expect(PM.Projects.get('P2')).toBeNull();
+    expect(PM.Projects.getState('P2')).toBeNull();
+    expect(PM.Projects.list().map((project: any) => project.id)).toEqual(['P1']);
+  });
+
+  it('preserves every project if a later tab cancels the window close', async () => {
+    const { PM, listeners } = appRegistry();
+    PM.pause = vi.fn();
+    PM.rasterClear = vi.fn();
+    PM.WS.activate = vi.fn();
+    PM.touch = vi.fn();
+    PM.proj.name = 'Edited first'; PM.autosave();
+    listeners.get('pm-open-project')![0]({ detail: PM.mkProject({ id: 'P2', name: 'Second' }) });
+    PM.proj.name = 'Edited second'; PM.autosave();
+    const confirmProjectClose = vi.fn().mockResolvedValueOnce('discard').mockResolvedValueOnce('cancel');
+    (window as any).powermove = { confirmProjectClose };
+    installBridgeForTests((window as any).powermove);
+
+    expect(await PM.prepareToClose()).toBe(false);
+    expect(confirmProjectClose).toHaveBeenCalledTimes(2);
+    await PM.flushProject();
+    expect(PM.Projects.list().map((project: any) => project.id)).toEqual(['P1', 'P2']);
+    expect(PM.Tabs.list()).toEqual(['P1', 'P2']);
+  });
+
+  it('keeps a previously saved project in Recents when choosing Don’t Save', async () => {
+    const { PM } = appRegistry(true, undefined, { path: '/tmp/Test.pmv', savedHash: 'previous-save' });
+    (window as any).powermove = { confirmProjectClose: async () => 'discard' };
+    installBridgeForTests((window as any).powermove);
+    expect(await PM.prepareToClose()).toBe(true);
+    await PM.flushProject();
+    expect(PM.Projects.get('P1')).not.toBeNull();
+    expect(PM.projectFileState('P1').path).toBe('/tmp/Test.pmv');
+  });
+
   it('never marks a different project saved when switching during the file dialog', async () => {
     const { PM } = appRegistry();
     let finish!: (result: any) => void;
@@ -551,6 +630,28 @@ describe('legacy app install', () => {
 
     expect(await importing).toEqual([]);
     expect(toasts.at(-1)).toMatch(/switched projects/);
+  });
+
+  it.each([true, false])('matches source settings only for an Open import (%s)', async matchSource => {
+    const { PM } = appRegistry();
+    const asset = { id: 'clip', kind: 'video', name: 'Clip.mp4', w: 720, h: 1280, fps: 30000 / 1001, dur: 2.002 };
+    PM.assetKind = () => 'video';
+    PM.assets.importBatch = vi.fn(async () => [{ status: 'created', asset, persisted: true }]);
+    let settingsAtInsertion: any;
+    PM.commandForAsset = vi.fn((_id, at) => {
+      settingsAtInsertion = { w: PM.proj.w, h: PM.proj.h, fps: PM.proj.fps, dur: PM.proj.dur };
+      return { type: 'add_layer', from: at };
+    });
+    PM.Edit = { apply: vi.fn() };
+    await PM.importFiles([{ name: 'Clip.mp4' }], { matchSource, placement: { at: 0 }, sequence: false });
+    expect(PM.Edit.apply).toHaveBeenCalledOnce();
+    expect(settingsAtInsertion).toEqual(matchSource
+      ? { w: 720, h: 1280, fps: 30000 / 1001, dur: 2.002 }
+      : { w: 1920, h: 1080, fps: 30, dur: 10 });
+    if (matchSource) {
+      expect(PM.proj.work).toEqual([0, 2.002]);
+      expect(PM.proj.exportDefaults.fps).toBe(30000 / 1001);
+    }
   });
 
   it('rejects multiple replacement files and project files without mutating the project', async () => {

@@ -15,9 +15,14 @@ import {
 } from 'electron';
 import path from 'node:path';
 import { readFile, readdir, stat } from 'node:fs/promises';
+import { AgentOrchestrator, type OrchestratedRunContext } from '../agent-orchestrator';
+import { orchestrationProviders } from '../orchestration-providers';
+import { copyChildArtifacts } from './subagent-artifacts';
+import { AGENT_ORCHESTRATION_INSTRUCTIONS } from '../../shared/agent-orchestration';
 
 import {
   IPC,
+  LIMITS,
   PROJECT_ID,
   REQUEST_ID,
   type ArtifactRef,
@@ -30,14 +35,17 @@ import {
   type CodexFixPromptRequest,
   type CodexRebasePromptRequest,
   type CodexRunRequest,
+  type CodexRunResult,
   type CodexAnswerRequest,
   type CodexSteerRequest,
+  type CodexTraceEvent,
   type ConsentRequest
 } from '../../shared/ipc';
 import { EXTENSION_ID } from '../../shared/extensions';
 import { IpcValidationError, isRecord, isString } from '../../shared/guards';
 import { readArtifact, revealArtifact } from './artifacts';
-import { requestComputerConsent } from './consent';
+import { forgetProjectWorkspace, sweepOrphanWorkspaces } from './workspace-lifetime';
+import { requestComputerConsent, revokeStandingConsent } from './consent';
 import { CodexRunner, isCodexRunRequest } from './runner';
 import { ChatGPTAccountClient } from './app-server-account';
 import { discoverCodexBinary, forgetCodexDescription } from './env';
@@ -48,9 +56,14 @@ import { discoverClaudeBinary } from '../claude/env';
 import { buildFixPrompt, buildRebasePrompt } from './instructions';
 import { restoreExtensionChangeSet } from './change-history';
 import { agentWorkspaceRoot, safeAgentComponent, sessionPathFor, type AgentApiPackFile } from './workspace';
-import { PowermoveAgentToolBridge, type PowermoveAgentToolSession } from '../agent-tools/bridge';
+import { PowermoveAgentToolBridge, type OutsideSandboxRunner, type PowermoveAgentToolSession } from '../agent-tools/bridge';
+import { AgentApprovals, type RequestApproval } from '../agent-approvals';
+import { runWorkspaceCommand } from '../compatible-workspace';
 import type { StoreAgentGateway } from '../cloud/store-agent';
 import { readForkRebaseInfo, stageForkRebase } from '../extensions/rebase';
+import { updateFork } from '../extensions/update-fork';
+import { ExternalAgentSession, type ExternalSessionOptions } from '../agent-tools/external-session';
+import { startExternalMcp } from '../agent-tools/external-server';
 
 const FIX_PROMPT_ERROR_CHARS = 4_000;
 const FIX_PROMPT_FILES = 40;
@@ -79,6 +92,17 @@ export interface CodexIpcContext {
   agentToolCommandArgs?: string[];
   /** Test seam; production resolves the same built-in resource root as main boot. */
   builtinExtensionsDir?: string;
+  /** The bundled ffmpeg the agent's media tools run (probe, frames, waveform). */
+  agentMediaFfmpeg?: string;
+  agentExportDirectory?: string;
+  externalMcp?: {
+    /** Desktop boot barrier: only return an editor after its tool listener is ready. */
+    getOwner?(): BrowserWindow['webContents'] | null;
+    ready?(host: Awaited<ReturnType<typeof startExternalMcp>>): void;
+    importMedia?: ExternalSessionOptions['importMedia'];
+    capturePanel?: import('../agent-tools/bridge').PowermoveAgentToolBridgeOptions['capturePanel'];
+    panelInput?: import('../agent-tools/bridge').PowermoveAgentToolBridgeOptions['panelInput'];
+  };
 }
 
 export interface ChatGPTAccountController {
@@ -121,7 +145,7 @@ function requireSteerRequest(value: unknown): CodexSteerRequest {
     !isRecord(value) ||
     !isString(value.id) || !REQUEST_ID.test(value.id) ||
     !isString(value.prompt, 200_000) || value.prompt.length === 0 ||
-    !Array.isArray(value.images) || value.images.length > 6 ||
+    !Array.isArray(value.images) || value.images.length > LIMITS.codexImages ||
     value.images.some((image) => !(image instanceof Uint8Array) || image.byteLength > 4 * 1024 * 1024)
   ) throw new IpcValidationError(IPC.codexSteer, 'invalid steering request');
   return { id: value.id, prompt: value.prompt, images: value.images as Uint8Array[] };
@@ -175,9 +199,9 @@ function requireFixPromptRequest(value: unknown): CodexFixPromptRequest {
   return { id: value.id, error: value.error, files };
 }
 
-function requireRebasePromptRequest(value: unknown): CodexRebasePromptRequest {
+function requireRebasePromptRequest(value: unknown, channel: string = IPC.codexRebasePrompt): CodexRebasePromptRequest {
   if (!isRecord(value) || !isString(value.id) || !EXTENSION_ID.test(value.id)) {
-    throw new IpcValidationError(IPC.codexRebasePrompt, 'invalid request');
+    throw new IpcValidationError(channel, 'invalid request');
   }
   return { id: value.id };
 }
@@ -191,9 +215,10 @@ function builtinExtensionsDirectory(ctx: CodexIpcContext): string {
 
 function createStagingDirectoryResolver(
   req: CodexRunRequest,
-  userData: string
+  userData: string,
+  workspaceId?: string
 ): (forkId: string) => Promise<string> {
-  const prepared = prepareStagingSnapshot(req, userData);
+  const prepared = prepareStagingSnapshot(req, userData, workspaceId);
   return async (forkId: string): Promise<string> => {
     const { resolve } = await prepared;
     return resolve(forkId);
@@ -202,9 +227,10 @@ function createStagingDirectoryResolver(
 
 async function prepareStagingSnapshot(
   req: CodexRunRequest,
-  userData: string
+  userData: string,
+  workspaceId?: string
 ): Promise<{ resolve: (forkId: string) => Promise<string> }> {
-  const root = agentWorkspaceRoot(userData, req.projectId);
+  const root = agentWorkspaceRoot(userData, workspaceId ?? req.projectId);
   const stagingRoot = path.join(root, '.powermove', 'extension-runs');
   const authority = req.access === 'computer' ? 'computer' : 'project';
   const checkpointPath = `${sessionPathFor(root, authority, req.threadId, req.provider ?? 'chatgpt')}.checkpoint.json`;
@@ -256,10 +282,15 @@ async function prepareStagingSnapshot(
 }
 
 function requireConsentRequest(value: unknown): ConsentRequest {
-  if (!isRecord(value) || !isString(value.projectName) || !isString(value.summary)) {
+  if (!isRecord(value) || !isString(value.projectName) || !isString(value.summary)
+    || (value.standing !== undefined && typeof value.standing !== 'boolean')
+    || (value.revoke !== undefined && typeof value.revoke !== 'boolean')) {
     throw new IpcValidationError(IPC.consentComputer, 'invalid request');
   }
-  return { projectName: value.projectName, summary: value.summary };
+  return {
+    projectName: value.projectName, summary: value.summary,
+    ...(value.standing ? { standing: true } : {}), ...(value.revoke ? { revoke: true } : {})
+  };
 }
 
 function requireArtifactRef(channel: string, value: unknown): ArtifactRef {
@@ -307,6 +338,16 @@ function amendLiveResult(text: string, dropCommands: boolean, warning?: string):
   }
 }
 
+/** Asks the person, then runs one command in the run's workspace without the sandbox. */
+function outsideSandboxRunner(root: string, requestApproval: RequestApproval, signal: AbortSignal): OutsideSandboxRunner {
+  return async ({ command, reason, timeoutMs }) => {
+    const decision = await requestApproval({ title: 'Run a command outside the project sandbox?', detail: command, reason }, signal);
+    if (!decision.allowed) throw new Error(decision.message);
+    const result = await runWorkspaceCommand(root, 'computer', command, timeoutMs, signal);
+    return `Exit code: ${result.exitCode ?? 'none'}${result.truncated ? ' (output truncated)' : ''}\n${result.output}`;
+  };
+}
+
 /** Registers the frozen renderer contract without modifying the main bootstrap. */
 export function registerCodexIpc(
   ipcMain: IpcMain,
@@ -323,15 +364,46 @@ export function registerCodexIpc(
   appServerRunner: CodexAppServerRunner = new CodexAppServerRunner()
 ): void {
   const compatible = new CompatibleProvider(ctx.userData);
+  const approvals = new AgentApprovals();
   const runner = new CodexRunner();
   const claudeRunner = new ClaudeRunner();
   const owners = new Map<string, WebContents>();
-  const toolBridge = ctx.agentToolServerPath
+  let forkUpdateQueue: Promise<unknown> = Promise.resolve();
+  const rootToolSessions = new Map<string, PowermoveAgentToolSession>();
+  const activeChildWorkspaces = new Set<string>();
+  const preserveRunEdits = new Set<string>();
+  const cancelProvider = async (id: string): Promise<void> => {
+    compatible.cancel(id);
+    await Promise.all([runner.cancel(id), appServerRunner.cancel(id), claudeRunner.cancel(id)]);
+  };
+  const orchestrator: AgentOrchestrator = new AgentOrchestrator({
+    directory: path.join(ctx.userData, 'Agent Tasks'),
+    providers: () => orchestrationProviders({ chatgpt: account, claude: claudeAccount, compatible }),
+    cancel: cancelProvider,
+    steer: request => appServerRunner.steer(request),
+    answer: request => approvals.answer(request) || appServerRunner.answer(request) || claudeRunner.answer(request),
+    threadControl: async (request, tool, args) => {
+      const session = rootToolSessions.get(request.id);
+      if (!session || !toolBridge) throw new Error('Thread controls are unavailable in this connection.');
+      const response = await toolBridge.callRenderer(session, '__agent_thread_control', { tool, ...args });
+      if (!response.ok) throw new Error(response.error ?? 'Thread control failed.');
+      const value = response.content.find(content => content.type === 'text');
+      if (!value || value.type !== 'text') throw new Error('Thread control returned no result.');
+      return JSON.parse(value.text);
+    },
+    execute: (request, context) => executeProvider(request, context)
+  });
+  const toolBridge: PowermoveAgentToolBridge | null = ctx.agentToolServerPath
     ? new PowermoveAgentToolBridge(ipcMain, {
         mcpServerPath: ctx.agentToolServerPath,
         ...(ctx.agentToolCommand ? { command: ctx.agentToolCommand } : {}),
         ...(ctx.agentToolCommandArgs ? { commandArgs: ctx.agentToolCommandArgs } : {}),
         storeAgent: ctx.storeAgent?.() ?? null,
+        ...(ctx.agentMediaFfmpeg ? { ffmpegPath: ctx.agentMediaFfmpeg } : {}),
+        exportDirectory: ctx.agentExportDirectory,
+        capturePanel: ctx.externalMcp?.capturePanel,
+        panelInput: ctx.externalMcp?.panelInput,
+        orchestrate: (runId, tool, args) => orchestrator.call(runId, tool, args),
         stageForkRebase: ({ forkId, stagingDirectory }) => stageForkRebase({
           forkId,
           stagingDirectory,
@@ -340,6 +412,84 @@ export function registerCodexIpc(
         })
       })
     : null;
+
+  const executeProvider = async (req: CodexRunRequest, execution: OrchestratedRunContext): Promise<CodexRunResult> => {
+    const owner = owners.get(execution.rootRequest.id);
+    if (!owner || owner.isDestroyed()) return { ok: false, error: 'Powermove window is no longer available.', cancelled: true };
+    const workspaceId = execution.isChild ? `subagent-${req.threadId}` : req.threadId?.startsWith('agent-thread-') ? `thread-${req.threadId}` : undefined;
+    let session = rootToolSessions.get(execution.rootRequest.id) ?? null;
+    let openedChildSession = false;
+    if (execution.isChild) {
+      owners.set(req.id, owner);
+      if (workspaceId) activeChildWorkspaces.add(workspaceId);
+    }
+    try {
+      if (execution.isChild && toolBridge) {
+        session = await toolBridge.openSession({
+          runId: req.id, owner, baseRevision: projectRevision(req.projectJSON), context: req.context ?? 'project',
+          inspectionOnly: req.mode === 'editor', transactionSession: session ?? undefined,
+          ...(session?.outsideSandbox ? { outsideSandbox: session.outsideSandbox } : {}),
+          ...(req.mode === 'autonomous' ? { resolveStagingDirectory: createStagingDirectoryResolver(req, ctx.userData, workspaceId) } : {})
+        });
+        openedChildSession = true;
+      }
+      const selectedRunner = req.provider === 'claude' ? claudeRunner : req.mode === 'editor' ? appServerRunner : runner;
+      // The first root turn consumes its grant. Children and continuations are
+      // internal runs under that existing authority, never new IPC grants.
+      const inheritedGrant = execution.isChild || execution.continuation ? { consumeConsentToken: () => true } : {};
+      const additionalInstructions = session ? AGENT_ORCHESTRATION_INSTRUCTIONS + (execution.role ? `\n\nTask role: ${execution.role}` : '') : undefined;
+      const result = req.provider === 'compatible'
+        ? await compatible.run(req, execution.onTrace,
+          session && toolBridge ? (name, args) => toolBridge.callTool(session!, name, args) : undefined,
+          { extensionsDir: ctx.extensionsDir, apiPackFiles: ctx.apiPackFiles, workspaceId, additionalInstructions, outsideSandbox: !!session?.outsideSandbox, ...inheritedGrant,
+            onWorkspace: directory => { if (session) session.stagingDirectory = directory; } })
+        : await selectedRunner.run(req, {
+          userData: ctx.userData, extensionsDir: ctx.extensionsDir, apiPackFiles: ctx.apiPackFiles, workspaceId,
+          codexBinaryPref: ctx.codexBinaryPref(), claudeBinaryPref: ctx.claudeBinaryPref?.() ?? null,
+          ...(session ? { nativeTools: session.mcpConfig } : {}), additionalInstructions, ...inheritedGrant,
+          requestApproval: approvals.requester(req.id, execution.onTrace),
+          onProgress: execution.onProgress, onTrace: execution.onTrace
+        });
+      if (result.ok && result.extensions?.length) await ctx.refreshExtensions?.(result.extensions.map(change => change.id));
+      if (result.ok && workspaceId && req.mode === 'autonomous') {
+        await copyChildArtifacts(ctx.userData, workspaceId, req.projectId, result.text);
+      }
+      return result;
+    } finally {
+      if (execution.isChild) {
+        if (openedChildSession) await session?.finish(false).catch(() => undefined);
+        approvals.closeRun(req.id);
+        owners.delete(req.id);
+        if (workspaceId) activeChildWorkspaces.delete(workspaceId);
+      }
+    }
+  };
+
+  const externalHost = toolBridge && ctx.externalMcp ? startExternalMcp({ userData: ctx.userData,
+    createSession: () => new ExternalAgentSession({ bridge: toolBridge,
+      getOwner: () => ctx.externalMcp?.getOwner ? ctx.externalMcp.getOwner() : ctx.getWindow()?.webContents ?? null, userData: ctx.userData,
+      extensionsDir: ctx.extensionsDir, apiPackFiles: ctx.apiPackFiles,
+      refreshExtensions: ctx.refreshExtensions, importMedia: ctx.externalMcp?.importMedia,
+      attach: async (request, session) => {
+        owners.set(request.id, session.owner); rootToolSessions.set(request.id, session);
+        const workspaceId = `mcp-${session.runId}`;
+        activeChildWorkspaces.add(workspaceId);
+        runningProjects.set(request.projectId, (runningProjects.get(request.projectId) ?? 0) + 1);
+        let detach: (() => Promise<void>) | undefined;
+        const remove = () => {
+          activeChildWorkspaces.delete(workspaceId);
+          owners.delete(request.id); rootToolSessions.delete(request.id);
+          const remaining = (runningProjects.get(request.projectId) ?? 1) - 1;
+          if (remaining) runningProjects.set(request.projectId, remaining); else runningProjects.delete(request.projectId);
+        };
+        try { detach = await orchestrator.attachExternal(request); }
+        catch (error) { remove(); throw error; }
+        return async () => { try { await detach!(); } finally { remove(); } };
+      }
+    })
+  }).then(host => { ctx.externalMcp?.ready?.(host); return host; }) : null;
+  // Do not make native provider runs depend on local MCP discovery succeeding.
+  void externalHost?.catch(error => console.error(`[powermove-mcp] ${error instanceof Error ? error.message : String(error)}`));
 
   const announce = (channel: string, status: unknown): void => {
     if (ctx.broadcast) {
@@ -354,6 +504,18 @@ export function registerCodexIpc(
 
   account.onChanged((status) => announce(IPC.chatgptChanged, status));
   claudeAccount.onChanged((status) => announce(IPC.claudeChanged, status));
+
+  /* A project's workspace is removed with the project, but never under a
+     running agent: removal waits for that project's last run to finish. */
+  const runningProjects = new Map<string, number>();
+  const forgetWhenIdle = new Set<string>();
+  const forget = async (projectId: string): Promise<void> => {
+    if (runningProjects.has(projectId)) { forgetWhenIdle.add(projectId); return; }
+    forgetWhenIdle.delete(projectId);
+    const childWorkspaces = await orchestrator.forgetProject(projectId);
+    await Promise.all(childWorkspaces.map(id => forgetProjectWorkspace(ctx.userData, id)));
+    await forgetProjectWorkspace(ctx.userData, projectId);
+  };
 
   ipcMain.handle(IPC.chatgptStatus, async (event) => {
     requireTrusted(event, ctx);
@@ -449,57 +611,56 @@ export function registerCodexIpc(
 
     const owner = event.sender;
     owners.set(req.id, owner);
+    const threadWorkspaceId = req.threadId?.startsWith('agent-thread-') ? `thread-${req.threadId}` : undefined;
+    if (threadWorkspaceId) activeChildWorkspaces.add(threadWorkspaceId);
+    runningProjects.set(req.projectId, (runningProjects.get(req.projectId) ?? 0) + 1);
     let toolSession: PowermoveAgentToolSession | null = null;
+    const emitTrace = (step: CodexTraceEvent): void => {
+      if (!owner.isDestroyed()) owner.send(IPC.codexEvent, { id: req.id, kind: 'trace', step });
+    };
+    const runEnded = new AbortController();
+    const requestApproval = approvals.requester(req.id, emitTrace);
+    // Codex exec and API models cannot ask the person themselves, so a
+    // supervised Project run asks through Powermove's run_outside_sandbox.
+    const outsideSandbox = req.mode === 'autonomous' && req.access === 'project'
+      && (req.provider === 'compatible' || ((req.provider ?? 'chatgpt') === 'chatgpt' && req.approval === 'supervised'))
+      ? outsideSandboxRunner(agentWorkspaceRoot(ctx.userData, threadWorkspaceId ?? req.projectId), requestApproval, runEnded.signal)
+      : undefined;
     const rendererDestroyed = (): void => {
-      compatible.cancel(req.id);
-      void Promise.all([runner.cancel(req.id), appServerRunner.cancel(req.id), claudeRunner.cancel(req.id)]);
-      void toolSession?.finish(false).catch(() => undefined);
+      void orchestrator.cancelRun(req.id);
+      void cancelProvider(req.id);
     };
     owner.once('destroyed', rendererDestroyed);
     try {
-      const selectedRunner = req.provider === 'claude'
-        ? claudeRunner
-        : (req.mode === 'editor' ? appServerRunner : runner);
       if (toolBridge) {
         toolSession = await toolBridge.openSession({
           runId: req.id,
           owner,
           baseRevision: projectRevision(req.projectJSON),
           context: req.context ?? 'project',
+          inspectionOnly: req.mode === 'editor',
           // Fork rebases stage into the run's extension staging dir, which only
           // autonomous runs own. The resolver snapshots the staging root now and
           // finishes its lookup lazily, so opening the session is not delayed.
           ...(req.mode === 'autonomous'
-            ? { resolveStagingDirectory: createStagingDirectoryResolver(req, ctx.userData) }
-            : {})
+            ? { resolveStagingDirectory: createStagingDirectoryResolver(req, ctx.userData, threadWorkspaceId) }
+            : {}),
+          ...(outsideSandbox ? { outsideSandbox } : {})
         });
+        rootToolSessions.set(req.id, toolSession);
       }
-      let result = req.provider === 'compatible'
-        ? await compatible.run(req, step => { if (!owner.isDestroyed()) owner.send(IPC.codexEvent, { id: req.id, kind: 'trace', step }); },
-          toolSession && toolBridge ? (name, args) => toolBridge.callTool(toolSession!, name, args) : undefined,
-          { extensionsDir: ctx.extensionsDir, apiPackFiles: ctx.apiPackFiles,
-            onWorkspace: directory => { if (toolSession) toolSession.stagingDirectory = directory; } })
-        : await selectedRunner.run(req, {
-        userData: ctx.userData,
-        extensionsDir: ctx.extensionsDir,
-        apiPackFiles: ctx.apiPackFiles,
-        codexBinaryPref: ctx.codexBinaryPref(),
-        claudeBinaryPref: ctx.claudeBinaryPref?.() ?? null,
-        ...(toolSession ? { nativeTools: toolSession.mcpConfig } : {}),
-        onProgress: (text) => {
+      let result = await orchestrator.run(req,
+        (step) => {
+          if (!owner.isDestroyed()) owner.send(IPC.codexEvent, { id: req.id, kind: 'trace', step });
+        },
+        (text) => {
           if (!owner.isDestroyed()) {
             owner.send(IPC.codexEvent, { id: req.id, kind: 'progress', text });
           }
-        },
-        onTrace: (step) => {
-          if (!owner.isDestroyed()) {
-            owner.send(IPC.codexEvent, { id: req.id, kind: 'trace', step });
-          }
-        }
-      });
+        });
       if (toolSession) {
         const changedBeforeFinish = toolSession.changed;
-        const finish = await toolSession.finish(result.ok);
+        const finish = await toolSession.finish(result.ok || preserveRunEdits.has(req.id));
         toolSession = null;
         if (result.ok && req.mode === 'autonomous') {
           result = {
@@ -516,14 +677,22 @@ export function registerCodexIpc(
         }
         if (finish.warning) console.warn(`[agent-tools] ${finish.warning}`);
       }
-      if (result.ok && result.extensions?.length) {
-        await ctx.refreshExtensions?.(result.extensions.map((change) => change.id));
-      }
       return result;
     } finally {
+      runEnded.abort();
+      approvals.closeRun(req.id);
       if (toolSession) await toolSession.finish(false).catch(() => undefined);
+      rootToolSessions.delete(req.id);
+      if (threadWorkspaceId) activeChildWorkspaces.delete(threadWorkspaceId);
+      preserveRunEdits.delete(req.id);
       owner.removeListener('destroyed', rendererDestroyed);
       if (owners.get(req.id) === owner) owners.delete(req.id);
+      const remaining = (runningProjects.get(req.projectId) ?? 1) - 1;
+      if (remaining > 0) runningProjects.set(req.projectId, remaining);
+      else runningProjects.delete(req.projectId);
+      if (!remaining && forgetWhenIdle.has(req.projectId)) {
+        void forget(req.projectId).catch((error) => console.warn(`[agent-workspaces] ${String(error)}`));
+      }
     }
   });
 
@@ -538,7 +707,8 @@ export function registerCodexIpc(
     requireTrusted(event, ctx);
     const req = requireAnswerRequest(rawRequest);
     if (owners.get(req.id) !== event.sender) return { accepted: false };
-    return { accepted: appServerRunner.answer(req) || claudeRunner.answer(req) };
+    const routed = orchestrator.routeAnswer(req);
+    return { accepted: approvals.answer(routed) || appServerRunner.answer(routed) || claudeRunner.answer(routed) };
   });
 
   ipcMain.handle(IPC.codexCancel, async (event, rawRequest: unknown) => {
@@ -548,10 +718,20 @@ export function registerCodexIpc(
       // A provider without live steering is replaced by a continuation run.
       // Seal its completed edits before interrupting it; an explicit Stop still
       // takes the ordinary rollback path.
+      if (req.preserveChanges) preserveRunEdits.add(req.id);
+      const stopping = orchestrator.cancelRun(req.id);
       if (req.preserveChanges) await toolBridge?.finishRun(req.id, true).catch(() => undefined);
-      compatible.cancel(req.id);
-      await Promise.all([runner.cancel(req.id), appServerRunner.cancel(req.id), claudeRunner.cancel(req.id)]);
+      await stopping;
+      await cancelProvider(req.id);
     }
+  });
+
+  ipcMain.handle(IPC.codexCancelTask, async (event, rawRequest: unknown) => {
+    requireTrusted(event, ctx);
+    if (!isRecord(rawRequest) || !isString(rawRequest.requestId) || !REQUEST_ID.test(rawRequest.requestId)
+      || !isString(rawRequest.taskId, 240) || !rawRequest.taskId) throw new IpcValidationError(IPC.codexCancelTask, 'invalid task request');
+    if (owners.get(rawRequest.requestId) !== event.sender) throw new Error('This task belongs to another conversation.');
+    await orchestrator.cancelTask(rawRequest.requestId, rawRequest.taskId);
   });
 
   ipcMain.handle(IPC.codexFixPrompt, async (event, rawRequest: unknown) => {
@@ -569,6 +749,27 @@ export function registerCodexIpc(
     }));
   });
 
+  ipcMain.handle(IPC.codexUpdateFork, async (event, rawRequest: unknown) => {
+    requireTrusted(event, ctx);
+    const request = requireRebasePromptRequest(rawRequest, IPC.codexUpdateFork);
+    const run = forkUpdateQueue.then(async () => {
+      const result = await updateFork({
+        forkId: request.id, userData: ctx.userData,
+        userExtensionsDir: ctx.extensionsDir,
+        builtinExtensionsDir: builtinExtensionsDirectory(ctx)
+      });
+      if (result.kind === 'updated') {
+        // Always return the undo reference after publication, even if registry
+        // refresh fails; the renderer can reload or restore the checked update.
+        try { await ctx.refreshExtensions?.([request.id]); }
+        catch (error) { console.warn('[extensions] Could not refresh the updated fork', error); }
+      }
+      return result;
+    });
+    forkUpdateQueue = run.catch(() => undefined);
+    return run;
+  });
+
   ipcMain.handle(IPC.codexRestoreChangeSet, async (event, rawRequest: unknown) => {
     requireTrusted(event, ctx);
     const req = requireRestoreRequest(rawRequest);
@@ -584,6 +785,7 @@ export function registerCodexIpc(
   ipcMain.handle(IPC.consentComputer, async (event, rawRequest: unknown) => {
     requireTrusted(event, ctx);
     const req = requireConsentRequest(rawRequest);
+    if (req.revoke) { revokeStandingConsent(); return { granted: false }; }
     const window = ctx.getWindow();
     if (window === null || window.isDestroyed()) throw new Error('No Powermove window is available.');
     return await requestComputerConsent(window, req);
@@ -603,9 +805,29 @@ export function registerCodexIpc(
     await revealArtifact(root, reference.path);
   });
 
+  ipcMain.handle(IPC.artifactForget, async (event, projectId: unknown) => {
+    requireTrusted(event, ctx);
+    if (!isString(projectId) || !PROJECT_ID.test(projectId)) throw new IpcValidationError(IPC.artifactForget, 'invalid project id');
+    await forget(projectId);
+  });
+
+  ipcMain.handle(IPC.artifactSweep, async (event, liveProjectIds: unknown) => {
+    requireTrusted(event, ctx);
+    if (!Array.isArray(liveProjectIds) || liveProjectIds.length > 100_000
+      || !liveProjectIds.every((id) => isString(id) && PROJECT_ID.test(id))) {
+      throw new IpcValidationError(IPC.artifactSweep, 'invalid project ids');
+    }
+    // An empty library is more likely unreadable storage than no projects.
+    if (!liveProjectIds.length) return [];
+    return await sweepOrphanWorkspaces(ctx.userData, liveProjectIds,
+      new Set([...runningProjects.keys(), ...forgetWhenIdle, ...activeChildWorkspaces]));
+  });
+
   // before-quit can be cancelled by the document save prompt or recovery flush.
   // Keep active runs and their tool bridge alive until closing is confirmed.
   app.once('will-quit', () => {
+    void externalHost?.then(host => host.close()).catch(() => {});
+    void orchestrator.shutdown();
     compatible.cancelAll();
     void runner.cancelAll();
     void appServerRunner.shutdown();

@@ -1,6 +1,7 @@
 export const EDIT_COMMAND_TYPES = [
   'set_property',
   'replace_keyframes',
+  'offset_property',
   'set_easing',
   'set_expression',
   'set_content',
@@ -20,7 +21,10 @@ export const EDIT_COMMAND_TYPES = [
   'add_marker',
   'create_section',
   'update_section',
-  'transform_layers'
+  'transform_layers',
+  // Captions
+  'add_captions',
+  'edit_captions'
 ] as const;
 
 // Every source-edit operation is currently reachable by the production agent.
@@ -30,6 +34,7 @@ export const EDIT_COMMAND_TYPES = [
 export const AGENT_COMMAND_TYPES = [
   'set_property',
   'replace_keyframes',
+  'offset_property',
   'set_easing',
   'set_expression',
   'set_content',
@@ -49,7 +54,10 @@ export const AGENT_COMMAND_TYPES = [
   'add_marker',
   'create_section',
   'update_section',
-  'transform_layers'
+  'transform_layers',
+  // Captions
+  'add_captions',
+  'edit_captions'
 ] as const;
 
 export type EditCommandType = (typeof EDIT_COMMAND_TYPES)[number];

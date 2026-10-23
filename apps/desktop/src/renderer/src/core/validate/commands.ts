@@ -1,4 +1,5 @@
 import type { BlendMode, Layer, LayerType } from '../types/project';
+import { materialKeyframeMinimum } from '../../../../shared/blender';
 import type {
   Transform,
   TransformAggregate,
@@ -31,6 +32,7 @@ import {
   type LayerPatch,
   type LayerTarget,
   type ReplaceKeyframesCommand,
+  type OffsetPropertyCommand,
   type SectionManifest,
   type SectionVersion,
   type SetCompositionCommand,
@@ -43,9 +45,12 @@ import {
   type SetSceneParameterCommand,
   type SetTransitionCommand,
   type TransformLayersCommand,
-  type UpdateSectionCommand
+  type UpdateSectionCommand,
+  type AddCaptionsCommand,
+  type EditCaptionsCommand
 } from '../types/commands';
 
+import { render3DSchema } from '../../../../shared/blender';
 import { COMMAND_JSON_LIMIT } from '../../../../shared/edit-limits';
 export { COMMAND_JSON_LIMIT } from '../../../../shared/edit-limits';
 export const MAX_EXPRESSION_CHARS = 2_000;
@@ -53,7 +58,7 @@ export const MAX_EXPRESSION_CHARS = 2_000;
 const FORBIDDEN_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 const COMMAND_TYPE_SET = new Set<string>(COMMAND_TYPES);
 const LAYER_TYPES = new Set<LayerType>([
-  'solid', 'text', 'shape', 'image', 'video', 'audio', 'adjustment', 'shader', 'extension', 'null', 'precomp', 'group'
+  'solid', 'text', 'shape', 'image', 'video', 'audio', 'adjustment', 'shader', 'extension', 'null', 'precomp', 'group', 'captions'
 ]);
 const BLEND_MODES = new Set([
   'normal', 'add', 'screen', 'multiply', 'overlay', 'softlight', 'difference', 'lighten', 'darken'
@@ -64,7 +69,7 @@ const LAYER_FIELDS = new Set([
 ]);
 const COMPOSITION_FIELDS = new Set([
   'name', 'width', 'height', 'fps', 'duration', 'background', 'backgroundFill',
-  'shutter', 'workArea'
+  'shutter', 'workArea', 'audioGain', 'render3d'
 ]);
 const EFFECT_FIELDS = new Set(['enabled', 'open', 'index']);
 const EASING_PRESETS = new Set([
@@ -83,6 +88,7 @@ const COMMAND_FIELDS: Record<(typeof COMMAND_TYPES)[number], readonly string[]> 
     'type', 'target', 'path', 'keyframes', 'replace', 'expression',
     'overrideLock', 'preserveHandEdits'
   ],
+  offset_property: ['type', 'target', 'path', 'delta', 'overrideLock', 'preserveHandEdits'],
   set_easing: ['type', 'keyframes', 'curve'],
   set_expression: ['type', 'target', 'path', 'expression'],
   set_content: ['type', 'target', 'patch', 'overrideLock'],
@@ -106,12 +112,15 @@ const COMMAND_FIELDS: Record<(typeof COMMAND_TYPES)[number], readonly string[]> 
   add_marker: ['type', 'id', 'time', 'name'],
   create_section: ['type', 'section'],
   update_section: ['type', 'sectionId', 'layers', 'thumb', 'at', 'version'],
-  transform_layers: ['type', 'transform', 'state']
+  transform_layers: ['type', 'transform', 'state'],
+  add_captions: ['type', 'id', 'name', 'cues', 'text', 'format', 'offset', 'style', 'language', 'from', 'duration', 'index', 'select'],
+  edit_captions: ['type', 'target', 'op', 'cues', 'ids', 'id', 'at', 'by', 'text', 'format', 'replace', 'offset', 'style', 'language', 'overrideLock']
 };
 
 const AGENT_COMMAND_FIELDS = {
   set_property: ['type', 'target', 'path', 'value', 'time', 'mode', 'ease', 'hold', 'preserveHandEdits'],
   replace_keyframes: ['type', 'target', 'path', 'keyframes', 'replace', 'expression', 'preserveHandEdits'],
+  offset_property: ['type', 'target', 'path', 'delta', 'preserveHandEdits'],
   set_expression: COMMAND_FIELDS.set_expression,
   set_content: ['type', 'target', 'patch'],
   set_layer: COMMAND_FIELDS.set_layer,
@@ -128,7 +137,9 @@ const AGENT_COMMAND_FIELDS = {
   set_transition: COMMAND_FIELDS.set_transition,
   set_scene_parameter: COMMAND_FIELDS.set_scene_parameter,
   add_marker: COMMAND_FIELDS.add_marker,
-  transform_layers: COMMAND_FIELDS.transform_layers
+  transform_layers: COMMAND_FIELDS.transform_layers,
+  add_captions: COMMAND_FIELDS.add_captions,
+  edit_captions: ['type', 'target', 'op', 'cues', 'ids', 'id', 'at', 'by', 'text', 'format', 'replace', 'offset', 'style', 'language']
 } as const;
 const AGENT_COMMAND_TYPE_SET = new Set<string>(Object.keys(AGENT_COMMAND_FIELDS));
 
@@ -290,6 +301,21 @@ function parseSetProperty(source: Record<string, unknown>): SetPropertyCommand |
   return out;
 }
 
+function parseOffsetProperty(source: Record<string, unknown>): OffsetPropertyCommand | ValidationError {
+  const path = requiredString(source.path, 'path');
+  if (path instanceof ValidationError) return path;
+  const delta = finite(source.delta, 'delta');
+  if (delta instanceof ValidationError) return delta;
+  const out: OffsetPropertyCommand = { type: 'offset_property', path, delta };
+  const targetError = optionalTarget(source, out);
+  if (targetError) return targetError;
+  for (const key of ['overrideLock', 'preserveHandEdits'] as const) {
+    const error = optionalBoolean(source, out, key);
+    if (error) return error;
+  }
+  return out;
+}
+
 function parseReplaceKeyframes(source: Record<string, unknown>): ReplaceKeyframesCommand | ValidationError {
   const path = requiredString(source.path, 'path');
   if (path instanceof ValidationError) return path;
@@ -302,9 +328,18 @@ function parseReplaceKeyframes(source: Record<string, unknown>): ReplaceKeyframe
     if (!owns(item, 'value')) return invalid('is required', `keyframes[${index}].value`);
     const value = cloneJson(item.value, `keyframes[${index}].value`);
     if (value instanceof ValidationError) return value;
-    const keyframe: CommandKeyframe = { time: Math.max(0, time), value };
+    const keyframe: CommandKeyframe = { time: Math.max(materialKeyframeMinimum(path), time), value };
     if (owns(item, 'ease') && item.ease != null) keyframe.ease = stringified(item.ease);
     if (owns(item, 'hold')) keyframe.hold = Boolean(item.hold);
+    if (item.eo !== undefined || item.ei !== undefined) {
+      if (![item.eo,item.ei].every(h=>Array.isArray(h)&&h.length===2&&h.every(v=>typeof v==='number'&&Number.isFinite(v)))) return invalid('invalid easing handles',`keyframes[${index}]`);
+      keyframe.eo = [...item.eo as [number,number]]; keyframe.ei = [...item.ei as [number,number]];
+    }
+    if (item.spring !== undefined) {
+      const spring = safePatch(item.spring,`keyframes[${index}].spring`);
+      if (spring instanceof ValidationError) return spring;
+      keyframe.spring = spring;
+    }
     keyframes.push(keyframe);
   }
   const out: ReplaceKeyframesCommand = { type: 'replace_keyframes', path, keyframes };
@@ -421,13 +456,18 @@ function parseCompositionPatch(value: unknown): CompositionPatch | ValidationErr
     if (!COMPOSITION_FIELDS.has(key)) return invalid(`unknown composition field "${key}"`, 'patch');
   }
   const out: CompositionPatch = {};
-  for (const key of ['width', 'height', 'fps', 'duration', 'shutter'] as const) {
+  for (const key of ['width', 'height', 'fps', 'duration', 'shutter', 'audioGain'] as const) {
     if (patch[key] == null) continue;
     const number = finite(patch[key], `patch.${key}`);
     if (number instanceof ValidationError) return number;
     out[key] = number;
   }
   for (const key of ['name', 'background'] as const) if (patch[key] != null) out[key] = stringified(patch[key]);
+  if (patch.render3d != null) {
+    const result = render3DSchema.safeParse(patch.render3d);
+    if (!result.success) return invalid('invalid 3D rendering settings', 'patch.render3d');
+    out.render3d = result.data;
+  }
   if (patch.backgroundFill != null) out.backgroundFill = patch.backgroundFill;
   if (patch.workArea != null) {
     if (!Array.isArray(patch.workArea) || patch.workArea.length !== 2) {
@@ -703,6 +743,7 @@ function isLayerContent(type: LayerType, value: unknown): boolean {
     case 'null': return typeof value.color === 'string' && numberFields('w', 'h', 'radius');
     case 'group': return true;
     case 'precomp': return (value.comp === null || typeof value.comp === 'string') && numberFields('w', 'h');
+    case 'captions': return Array.isArray(value.cues) && isRecord(value.style);
   }
 }
 
@@ -971,12 +1012,116 @@ function parseTransformLayers(source: Record<string, unknown>): TransformLayersC
   return out;
 }
 
+/* ── captions ─────────────────────────────────────────────── */
+const CAPTION_OPS = new Set(['replace', 'insert', 'update', 'delete', 'split', 'merge', 'move', 'import', 'style']);
+const CAPTION_FORMATS = new Set(['srt', 'vtt', 'auto']);
+
+function captionCues(value: unknown, path: string, patches: boolean): JsonObject[] | ValidationError {
+  if (!Array.isArray(value)) return invalid('must be an array', path);
+  const out: JsonObject[] = [];
+  for (const [index, item] of value.entries()) {
+    const at = `${path}[${index}]`;
+    if (!isRecord(item)) return invalid('must be an object', at);
+    if (patches && (typeof item.id !== 'string' || !item.id)) return invalid('must name the cue id', `${at}.id`);
+    for (const key of ['start', 'end'] as const) {
+      if (item[key] === undefined && patches) continue;
+      const number = finite(item[key], `${at}.${key}`);
+      if (number instanceof ValidationError) return number;
+    }
+    if (item.text !== undefined && typeof item.text !== 'string') return invalid('must be a string', `${at}.text`);
+    if (!patches && typeof item.text !== 'string') return invalid('must be a string', `${at}.text`);
+    if (item.words !== undefined && !Array.isArray(item.words)) return invalid('must be an array', `${at}.words`);
+    const clone = safePatch(item, at);
+    if (clone instanceof ValidationError) return clone;
+    out.push(clone);
+  }
+  return out;
+}
+
+function stringList(value: unknown, path: string): string[] | ValidationError {
+  if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || !item)) return invalid('must be an array of cue ids', path);
+  return [...value] as string[];
+}
+
+function captionCommon(source: Record<string, unknown>, out: Record<string, unknown>): ValidationError | null {
+  for (const key of ['offset', 'from', 'duration', 'index', 'at', 'by'] as const) {
+    if (source[key] == null) continue;
+    const number = finite(source[key], key);
+    if (number instanceof ValidationError) return number;
+    out[key] = number;
+  }
+  if (source.text != null) {
+    if (typeof source.text !== 'string') return invalid('must be SRT or WebVTT text', 'text');
+    out.text = source.text;
+  }
+  if (source.format != null) {
+    if (!CAPTION_FORMATS.has(String(source.format))) return invalid('must be srt, vtt or auto', 'format');
+    out.format = source.format;
+  }
+  if (source.style !== undefined) {
+    const style = safePatch(source.style, 'style');
+    if (style instanceof ValidationError) return style;
+    out.style = style;
+  }
+  if (source.language !== undefined) {
+    if (source.language !== null && typeof source.language !== 'string') return invalid('must be a language tag', 'language');
+    out.language = source.language;
+  }
+  return null;
+}
+
+function parseAddCaptions(source: Record<string, unknown>): AddCaptionsCommand | ValidationError {
+  const out: Record<string, unknown> = { type: 'add_captions' };
+  for (const key of ['id', 'name'] as const) if (source[key] != null) out[key] = stringified(source[key]);
+  const common = captionCommon(source, out);
+  if (common) return common;
+  if (source.cues !== undefined) {
+    const cues = captionCues(source.cues, 'cues', false);
+    if (cues instanceof ValidationError) return cues;
+    out.cues = cues;
+  }
+  if (source.select != null) out.select = Boolean(source.select);
+  return out as unknown as AddCaptionsCommand;
+}
+
+function parseEditCaptions(source: Record<string, unknown>): EditCaptionsCommand | ValidationError {
+  const op = String(source.op ?? '');
+  if (!CAPTION_OPS.has(op)) return invalid('must be one of replace, insert, update, delete, split, merge, move, import, style', 'op');
+  const out: Record<string, unknown> = { type: 'edit_captions', op };
+  const targetError = optionalTarget(source, out);
+  if (targetError) return targetError;
+  const common = captionCommon(source, out);
+  if (common) return common;
+  if (source.cues !== undefined || op === 'replace' || op === 'insert' || op === 'update') {
+    const cues = captionCues(source.cues ?? [], 'cues', op === 'update');
+    if (cues instanceof ValidationError) return cues;
+    out.cues = cues;
+  }
+  if (source.ids !== undefined || op === 'delete' || op === 'merge') {
+    const ids = stringList(source.ids, 'ids');
+    if (ids instanceof ValidationError) return ids;
+    out.ids = ids;
+  }
+  if (op === 'split') {
+    if (typeof source.id !== 'string' || !source.id) return invalid('must name the cue to split', 'id');
+    if (out.at === undefined) return invalid('must be a composition time', 'at');
+    out.id = source.id;
+  }
+  if (op === 'move' && out.by === undefined) return invalid('must be a number of seconds', 'by');
+  if (op === 'import' && typeof out.text !== 'string') return invalid('must be SRT or WebVTT text', 'text');
+  if (op === 'style' && out.style === undefined) return invalid('must be an object', 'style');
+  if (source.replace != null) out.replace = Boolean(source.replace);
+  if (source.overrideLock != null) out.overrideLock = Boolean(source.overrideLock);
+  return out as unknown as EditCaptionsCommand;
+}
+
 function parseObject(source: Record<string, unknown>): EditCommand | ValidationError {
   if (typeof source.type !== 'string' || !COMMAND_TYPE_SET.has(source.type)) {
     return invalid('unknown edit command type', 'type');
   }
   switch (source.type) {
     case 'set_property': return parseSetProperty(source);
+    case 'offset_property': return parseOffsetProperty(source);
     case 'replace_keyframes': return parseReplaceKeyframes(source);
     case 'set_easing': return parseSetEasing(source);
     case 'set_expression': return parseSetExpression(source);
@@ -1003,6 +1148,8 @@ function parseObject(source: Record<string, unknown>): EditCommand | ValidationE
     case 'create_section': return parseCreateSection(source);
     case 'update_section': return parseUpdateSection(source);
     case 'transform_layers': return parseTransformLayers(source);
+    case 'add_captions': return parseAddCaptions(source);
+    case 'edit_captions': return parseEditCaptions(source);
     default: return invalid('unknown edit command type', 'type');
   }
 }
@@ -1039,7 +1186,7 @@ export function parseAgentEditCommand(raw: unknown): EditCommand | ValidationErr
   for (const key of fields) if (source[key] !== undefined) selected[key] = source[key];
   const command = parseEditCommand(selected);
   if (command instanceof ValidationError) return command;
-  if (command.type === 'set_property' || command.type === 'replace_keyframes') {
+  if (command.type === 'set_property' || command.type === 'replace_keyframes' || command.type === 'offset_property') {
     command.preserveHandEdits = command.preserveHandEdits !== false;
   }
   return command;

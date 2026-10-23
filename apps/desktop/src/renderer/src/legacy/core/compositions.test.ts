@@ -34,6 +34,17 @@ describe('compositions', () => {
     expect(PM.Comps.openTabs()).toEqual([mainId, id]);
   });
 
+  it('keeps render engines per composition and retains them when precomposing',()=>{
+    const PM=composer(),main=PM.proj.compId;
+    PM.proj.render3d={enabled:true,engine:'cycles',samples:32};
+    const id=PM.Comps.create({name:'Native'},{open:false});
+    PM.Comps.open(id);expect(PM.proj.render3d).toBeUndefined();
+    PM.Comps.open(main);expect(PM.proj.render3d.engine).toBe('cycles');
+    const model=PM.mkLayer('solid');PM.addLayer(model);
+    const nested=PM.Comps.precompose([model.id]);
+    expect(PM.proj.comps[nested].render3d).toEqual(PM.proj.render3d);
+    expect(PM.proj.comps[nested].render3d).not.toBe(PM.proj.render3d);
+  });
   it('keeps undo attached to the composition an edit was made in', () => {
     const PM = composer();
     const mainId = PM.proj.compId;
@@ -173,6 +184,30 @@ describe('composition patch paths', () => {
       [{ path: ['comps'], exists: true, value: { A: { n: 1 } } }], 'Root');
     expect(canonical.forward).toEqual([{ path: ['comps', 'B'], exists: true, value: { n: 2 } }]);
     expect(canonical.backward).toEqual([{ path: ['comps', 'B'], exists: false }]);
+  });
+
+  it('never carries one composition\'s output level into another', () => {
+    const project: any = { id: 'P', compId: 'Root', compName: 'Root', w: 10, h: 10, layers: [], audioGain: 0.5, comps: { Intro: { id: 'Intro', name: 'Intro', w: 10, h: 10, layers: [] } } };
+    const inside = rotateProject(project, 'Intro');
+    expect(Object.hasOwn(inside, 'audioGain')).toBe(false);
+    expect(inside.comps.Root.audioGain).toBe(0.5);
+    const back = rotateProject(inside, 'Root');
+    expect(back.audioGain).toBe(0.5);
+    expect(Object.hasOwn(back.comps.Intro, 'audioGain')).toBe(false);
+
+    // The reverse direction: a level set inside the child stays in the child.
+    const child: any = { ...inside, audioGain: 2 };
+    const root = rotateProject(child, 'Root');
+    expect(root.audioGain).toBe(0.5);
+    expect(root.comps.Intro.audioGain).toBe(2);
+
+    // Replacing the open composition wholesale clears a level the replacement lacks.
+    const realized = realizePatches([{ path: ['comps', 'Root'], exists: true, value: { id: 'Root', name: 'Root', layers: [] } }], back);
+    expect(realized).toContainEqual({ path: ['audioGain'], exists: false });
+    // A whole-project patch recorded inside the child is rotated without leaking.
+    const whole = realizePatches([{ path: [], exists: true, value: inside }], back);
+    expect(whole[0]!.value.audioGain).toBe(0.5);
+    expect(Object.hasOwn(whole[0]!.value.comps.Intro, 'audioGain')).toBe(false);
   });
 
   it('rotates without mutating and flattens nested comps from older files', () => {

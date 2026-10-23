@@ -1,10 +1,11 @@
 <script lang="ts">
   import AnimatedRow from './AnimatedRow.svelte';
-  import { anchorPicker, mountOverlayOnBody } from '../../renderer/src/controls/overlay';
+  import { anchorPicker, mountOverlayOnBody } from 'powermove';
   import { onDestroy } from 'svelte';
   import { inspectorContext, type EditBinding, type SelectOption } from './context';
   import TypeSettings from './TypeSettings.svelte';
   import TextAlignment from './TextAlignment.svelte';
+  import { precompCarriesAudio } from './audio';
   import { axisContentKey, type FontStyle } from 'powermove';
 
   const { api, doc, transport, mixed, edit: inspectorEdit } = inspectorContext();
@@ -25,8 +26,11 @@
   let { layer, fontsVersion = 0 }: { layer: any; fontsVersion?: number } = $props();
 
   const content = $derived((doc.tick.values, doc.proj, transport.time, api.anim.resolveContent(layer, transport.time) as Record<string, any>));
+  const modelLayer = $derived((doc.tick.structure, doc.proj, layer.type==='extension' && api.layers.get(String(layer.d?.definition || ''))?.renderer.kind==='layer3d'));
   const shape = $derived((doc.tick.values, doc.proj, content.shape));
   const assets = $derived((doc.tick.assets, doc.tick.structure, doc.proj, Object.values(api.project.get()?.assets ?? {}) as any[]));
+  const precompAudible = $derived((doc.tick.structure, doc.tick.values, doc.proj,
+    layer.type === 'precomp' && precompCarriesAudio(layer.d?.comp, api.project.get()?.comps as any)));
   const shaderMeta = $derived((doc.tick.values, doc.proj, api.uiState.getShaderMeta(layer)));
   const shaderError = $derived((doc.tick.values, doc.proj,
     typeof shaderMeta?.shaderKey === 'string' ? api.render.gl.compileError(shaderMeta.shaderKey) ?? '' : ''));
@@ -190,7 +194,7 @@
 
 </script>
 
-{#if !(layer.type === 'shape' && layer.d.paths?.length)}<Section {api} title="Content" />{/if}
+{#if !modelLayer && !(layer.type === 'shape' && layer.d.paths?.length)}<Section {api} title="Content" />{/if}
 
 {#if layer.type === 'text'}
   <AnimatedRow {layer} label="Text" path="c.text">
@@ -348,6 +352,7 @@
     <AnimatedRow {layer} label="Speed" path="c.speed"><NumField {api} {mixed} get={get('speed', 1)} edit={edit('speed', 'Speed')} label="Speed" step={0.05} precision={2} min={0.05} /></AnimatedRow>
     {#if content.embeddedAudio === true}
       <AnimatedRow {layer} label="Mute audio"><ToggleField {api} {mixed} get={get('audioMuted', false)} edit={edit('audioMuted', 'Mute audio')} label="Mute audio" /></AnimatedRow>
+      <AnimatedRow {layer} label="Audio gain" path="c.audioGain"><NumField {api} {mixed} get={get('audioGain', 1)} edit={edit('audioGain', 'Audio gain')} label="Audio gain" step={0.05} precision={2} min={0} max={4} /></AnimatedRow>
     {/if}
   {/if}
 {:else if layer.type === 'audio'}
@@ -355,6 +360,11 @@
   <AnimatedRow {layer} label="Gain" path="c.gain"><NumField {api} {mixed} get={get('gain', 1)} edit={edit('gain', 'Gain')} label="Gain" step={0.05} precision={2} min={0} max={4} /></AnimatedRow>
   <AnimatedRow {layer} label="Fade in" path="c.fadeIn"><NumField {api} {mixed} get={get('fadeIn', 0)} edit={edit('fadeIn', 'Fade in')} label="Fade in" step={0.05} precision={2} min={0} max={layer.dur} unit="s" /></AnimatedRow>
   <AnimatedRow {layer} label="Fade out" path="c.fadeOut"><NumField {api} {mixed} get={get('fadeOut', 0)} edit={edit('fadeOut', 'Fade out')} label="Fade out" step={0.05} precision={2} min={0} max={layer.dur} unit="s" /></AnimatedRow>
+{:else if layer.type === 'precomp'}
+  {#if precompAudible}
+    <AnimatedRow {layer} label="Mute audio"><ToggleField {api} {mixed} get={get('audioMuted', false)} edit={edit('audioMuted', 'Mute audio')} label="Mute audio" /></AnimatedRow>
+    <AnimatedRow {layer} label="Audio gain" path="c.audioGain"><NumField {api} {mixed} get={get('audioGain', 1)} edit={edit('audioGain', 'Audio gain')} label="Audio gain" step={0.05} precision={2} min={0} max={4} /></AnimatedRow>
+  {/if}
 {:else if layer.type === 'shader'}
   <button
     type="button"
@@ -367,7 +377,7 @@
   {/if}
   <AnimatedRow {layer} label="Width" path="c.w"><NumField {api} {mixed} get={get('w', 0)} edit={edit('w', 'Width')} label="Width" step={1} min={1} unit="px" /></AnimatedRow>
   <AnimatedRow {layer} label="Height" path="c.h"><NumField {api} {mixed} get={get('h', 0)} edit={edit('h', 'Height')} label="Height" step={1} min={1} unit="px" /></AnimatedRow>
-{:else if layer.type === 'extension'}
+{:else if layer.type === 'extension' && !modelLayer}
   <AnimatedRow {layer} label="Width" path="c.w"><NumField {api} {mixed} get={get('w', 0)} edit={edit('w', 'Width')} label="Width" step={1} min={1} unit="px" /></AnimatedRow>
   <AnimatedRow {layer} label="Height" path="c.h"><NumField {api} {mixed} get={get('h', 0)} edit={edit('h', 'Height')} label="Height" step={1} min={1} unit="px" /></AnimatedRow>
 {/if}

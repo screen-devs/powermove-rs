@@ -33,7 +33,7 @@ function create() {
   PM.AgentUI?.setScope('workspace');
   PM.AgentUI?.setDraft('Create a new panel that ', true);
 }
-function open(view?: 'panels' | 'workspaces') {
+function open(view?: 'panels' | 'workspaces' | 'after-effects') {
   ensure().open(view);
 }
 function close() {
@@ -44,7 +44,7 @@ const WorkspaceEditor: any = {
   show() {
     this.el?.remove();
     const add: any = h('button.btn', { onclick: () => {
-      PM.menu(add, Object.values(PM.PANELS).filter((panel: any) => panel.id !== 'toolbar' && !PM.Layout.hasPanel(PM.WS.current, panel.id))
+      PM.menu(add, Object.values(PM.PANELS).filter((panel: any) => panel.id !== 'toolbar' && panel.library !== false && !PM.Layout.hasPanel(PM.WS.current, panel.id))
         .map((panel: any) => ({ label: panel.title, run: () => PM.WS.mutate((workspace: any) => PM.Layout.addPanel(workspace, panel.id, 'right')) })));
     } }, 'Add panel');
     const remove: any = h('button.btn', { onclick: () => {
@@ -78,6 +78,7 @@ PM.LibraryUI = { open, close, reveal, create, get isOpen() { return !!screen?.is
 PM.WorkspaceEditor = WorkspaceEditor;
 PM.bus.on('layout:applied', () => { if (PM.LibraryUI.isOpen) screen?.refresh(); });
 PM.bus.on('workspaces', () => { if (PM.LibraryUI.isOpen) screen?.refresh(); });
+PM.bus.on('after-effects:imported', () => { if (PM.LibraryUI.isOpen) screen?.refresh(true); });
 PM.bus.on('project', close);
 PM.Kernel?.events?.on?.('extensions:changed', () => { if (PM.LibraryUI.isOpen) screen?.refresh(true); });
 }

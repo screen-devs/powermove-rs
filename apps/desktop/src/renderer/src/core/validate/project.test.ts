@@ -240,6 +240,27 @@ describe('sanitizeProject', () => {
     expect(project.layers.every(layer => layer.type in TYPE_META)).toBe(true);
   });
 
+  it('keeps a valid preferred timeline track and drops invalid ones', () => {
+    const project = sanitizeProject({ layers: [
+      { id: 'a', type: 'solid', track: 2 },
+      { id: 'b', type: 'solid', track: -1 },
+      { id: 'c', type: 'solid', track: 1.5 },
+      { id: 'd', type: 'solid', track: '3' },
+    ] });
+    expect(project.layers.map(layer => layer.track)).toEqual([2, undefined, undefined, undefined]);
+    expect('track' in project.layers[1]!).toBe(false);
+  });
+
+  it('keeps soundtrack levels in range and reads a null level as absent', () => {
+    const project = sanitizeProject({ audioGain: 9, layers: [
+      { id: 'v', type: 'video', d: { asset: 'a', embeddedAudio: true, audioGain: null } },
+      { id: 'p', type: 'precomp', d: { comp: 'c', audioGain: 7 } },
+    ] });
+    expect(project.audioGain).toBe(4);
+    expect('audioGain' in (project.layers[0]!.d as object)).toBe(false);
+    expect((project.layers[1]!.d as any).audioGain).toBe(4);
+  });
+
   it('turns an empty object into the mkProject/hydrate defaults', () => {
     const project: Project = sanitizeProject({});
 

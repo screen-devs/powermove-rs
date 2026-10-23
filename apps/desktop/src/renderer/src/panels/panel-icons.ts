@@ -1,8 +1,10 @@
 /** Stable defaults for existing panels; newly authored panels supply `icon`. */
 export const PANEL_ICONS: Record<string, string> = {
   viewer: 'frame', fxbrowser: 'wand', assets: 'project', mods: 'puzzle', notes: 'note',
-  perf: 'speedometer', pexels: 'image', agent: 'sparkle', inspector: 'sliders',
-  shader: 'code', takes: 'layers', timeline: 'timeline', toolbar: 'tools', workspaces: 'grid'
+  perf: 'speedometer', 'layer-effects': 'diamond', pexels: 'image', agent: 'sparkle', inspector: 'sliders',
+  shader: 'code', takes: 'layers', timeline: 'timeline', toolbar: 'tools', workspaces: 'grid',
+  captions: 'captions',
+  mixer: 'speaker'
 };
 
 export function panelIcons(panels: Array<{ id: string; title?: string; icon?: string }>, icons: Record<string, unknown>) {

@@ -1,4 +1,5 @@
 import type { CodexQuestion } from '../../../../shared/ipc';
+import type { AgentTask } from '../../../../shared/agent-orchestration';
 import type { NoticeKind } from '../../errors/presentation';
 import type { AgentModResult } from './mod-result';
 import type { UIPlacement } from './ui-placement';
@@ -9,6 +10,8 @@ export interface AgentOption {
   id: string;
   label: string;
   detail?: string;
+  icon?: string;
+  tone?: 'warning';
 }
 
 export interface AgentMessage {
@@ -56,8 +59,11 @@ export type TraceStep =
       detail?: string;
       /** Bounded result excerpt, set on tool-end. */
       output?: string;
+      /** Agent media tools: settled without a final result (a transcription still running, or waiting on a model). */
+      outcome?: 'pending' | 'needs-model';
       startedAt?: number;
       endedAt?: number;
+      task?: AgentTask;
     }
   | {
       kind: 'question';
@@ -103,6 +109,8 @@ export interface AgentSnapshot {
   model: string;
   reasoningEffort: string;
   accessMode: string;
+  /** The access picker's choice: editor, supervised, auto or full. */
+  permission: string;
   composerDraft: string;
   pendingEntering: boolean;
   models: AgentOption[];
@@ -152,6 +160,7 @@ const EMPTY_SNAPSHOT: AgentSnapshot = {
   model: 'gpt-5.6-sol',
   reasoningEffort: 'high',
   accessMode: 'editor',
+  permission: 'editor',
   composerDraft: '',
   pendingEntering: false,
   models: [],
@@ -219,7 +228,7 @@ function reconcileTrace(next: TraceStep[]): void {
       assignChangedFields(currentStep, nextStep, ['text']);
     } else {
       assignChangedFields(currentStep, nextStep, [
-        'toolName', 'label', 'status', 'detail', 'output', 'startedAt', 'endedAt'
+        'toolName', 'label', 'status', 'detail', 'output', 'startedAt', 'endedAt', 'task'
       ]);
     }
   }

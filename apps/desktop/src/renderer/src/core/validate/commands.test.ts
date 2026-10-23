@@ -78,13 +78,17 @@ const validCommands: unknown[] = [
     state: { scale: 2 }
   },
 
+  {type:'offset_property', target:'a', path:'position.x', delta:2},
   {type: 'group_layers', targets: ['a'], name: 'Group'},
   {type: 'ungroup_layers', targets: ['g']},
   {type: 'move_to_group', targets: ['a'], group: null},
+  { type: 'add_captions', name: 'English', cues: [{ start: 0, end: '1.5', text: 'Hello' }], style: { preset: 'boxed' }, language: 'en' },
+  { type: 'edit_captions', target: 'cap', op: 'split', id: 'c1', at: '2' },
 
 ];
 
 const invalidCommands: unknown[] = [
+  {type:'offset_property',path:'position.x',delta:NaN},
   {type: 'group_layers', targets: []},
   {type: 'ungroup_layers', targets: [12]},
   {type: 'move_to_group', targets: ['a'], group: 12},
@@ -106,11 +110,14 @@ const invalidCommands: unknown[] = [
   { type: 'add_marker', time: Number.POSITIVE_INFINITY },
   { type: 'create_section', section: {} },
   { type: 'update_section', sectionId: 'section-1', layers: [] },
-  { type: 'transform_layers', transform: { edits: [] } }
+  { type: 'transform_layers', transform: { edits: [] } },
+  { type: 'add_captions', cues: [{ start: 0, end: 1 }] },
+  { type: 'edit_captions', op: 'rewrite' }
 ];
 
 const huge = 'x'.repeat(COMMAND_JSON_LIMIT + 1);
 const oversizedCommands: unknown[] = [
+  {type:'offset_property',path:huge,delta:1},
   {type: 'group_layers', targets: [huge]},
   {type: 'ungroup_layers', targets: [huge]},
   {type: 'move_to_group', targets: [huge], group: null},
@@ -135,13 +142,16 @@ const oversizedCommands: unknown[] = [
   {
     type: 'transform_layers',
     transform: { edits: [{ path: 'properties.opacity', value: 1 }], note: huge }
-  }
+  },
+  { type: 'add_captions', text: huge },
+  { type: 'edit_captions', op: 'import', text: huge }
 ];
 
 function exhaustivelyName(command: EditCommand): string {
   switch (command.type) {
     case 'set_property': return command.type;
     case 'replace_keyframes': return command.type;
+    case 'offset_property': return command.type;
     case 'set_easing': return command.type;
     case 'set_expression': return command.type;
     case 'set_content': return command.type;
@@ -160,6 +170,7 @@ function exhaustivelyName(command: EditCommand): string {
     case 'update_section': return command.type;
     case 'group_layers': case 'ungroup_layers': case 'move_to_group': return command.type;
     case 'transform_layers': return command.type;
+    case 'add_captions': case 'edit_captions': return command.type;
     default: return assertNever(command);
   }
 }
@@ -197,6 +208,20 @@ describe('parseEditCommand', () => {
       type: 'add_layer', id: 'custom', layerType: 'extension',
       content: { definition: 'demo.layer', data: { objects: [{ id: 'cube' }] } }, select: false
     });
+  });
+
+  it('validates caption commands', () => {
+    expect(parseEditCommand({ type: 'add_captions', cues: [{ start: 0, end: '1.5', text: 'Hi' }], extra: 1 }))
+      .toEqual({ type: 'add_captions', cues: [{ start: 0, end: '1.5', text: 'Hi' }] });
+    expect(parseEditCommand({ type: 'edit_captions', op: 'update', cues: [{ id: 'a', text: 'x' }] }))
+      .toEqual({ type: 'edit_captions', op: 'update', cues: [{ id: 'a', text: 'x' }] });
+    expect(parseEditCommand({ type: 'edit_captions', op: 'update', cues: [{ text: 'x' }] })).toBeInstanceOf(ValidationError);
+    expect(parseEditCommand({ type: 'edit_captions', op: 'delete' })).toBeInstanceOf(ValidationError);
+    expect(parseEditCommand({ type: 'edit_captions', op: 'move', ids: ['a'] })).toBeInstanceOf(ValidationError);
+    expect(parseEditCommand({ type: 'edit_captions', op: 'import', text: 'x', format: 'ass' })).toBeInstanceOf(ValidationError);
+    expect(parseEditCommand({ type: 'edit_captions', op: 'style' })).toBeInstanceOf(ValidationError);
+    expect(parseAgentEditCommand({ type: 'edit_captions', op: 'delete', ids: ['a'], overrideLock: true }))
+      .toEqual({ type: 'edit_captions', op: 'delete', ids: ['a'] });
   });
 
   it('accepts one canonical example of every operation', () => {
@@ -322,6 +347,13 @@ describe('parseEditCommand', () => {
     expect(deleted).not.toBeInstanceOf(ValidationError);
     if (!(deleted instanceof ValidationError) && deleted.type === 'delete_layers') {
       expect(deleted.targets).toHaveLength(25);
+    }
+  });
+
+  it('retains negative local times only for reused material channels', () => {
+    for (const path of ['shader.roughness', 'm.roughness', 'slots.paint.shader.roughness', 'slots.paint.color', 'opacity']) {
+      const command = parseEditCommand({ type: 'replace_keyframes', path, keyframes: [{ time: -2, value: 0.5 }] });
+      expect(command).toMatchObject({ keyframes: [{ time: path === 'opacity' ? 0 : -2, value: 0.5 }] });
     }
   });
 

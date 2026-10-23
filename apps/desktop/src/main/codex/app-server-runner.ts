@@ -20,6 +20,7 @@ import {
   type NativeMcpServerConfig
 } from '../agent-tools/spec';
 import { fragmentText, humanLabel, outputExcerpt, toolDetail } from '../agent-tools/trace-format';
+import { mediaToolSubject } from '../../shared/media-tools';
 import { imageExtension } from '../image-extension';
 import { loadUserMcpServers, type UserMcpServers } from '../agent-tools/user-mcp';
 
@@ -35,6 +36,7 @@ interface AppServerRunOptions extends RunCallbacks {
   userData: string;
   codexBinaryPref?: string | null;
   nativeTools?: NativeMcpServerConfig;
+  additionalInstructions?: string;
   externalMcpServers?: UserMcpServers;
 }
 
@@ -175,9 +177,10 @@ function appServerToolStart(item: Record<string, unknown>): CodexTraceEvent | nu
   if (type === 'mcptoolcall' || type === 'dynamictoolcall') {
     const rawTool = typeof item.tool === 'string' && item.tool ? item.tool : 'mcp';
     const detail = toolDetail(rawTool, { tool: rawTool });
+    const subject = mediaToolSubject(rawTool, item.arguments);
     return {
       kind: 'tool-start', itemId, toolName: rawTool.slice(0, TRACE_ITEM_ID_CHARS), label: humanLabel(rawTool),
-      ...(detail ? { detail } : {})
+      ...(detail ? { detail } : {}), ...(subject ? { subject } : {})
     };
   }
   return null;
@@ -327,7 +330,7 @@ export class CodexAppServerRunner {
         approvalPolicy: 'never',
         sandbox: 'read-only',
         ephemeral: true,
-        config: liveInspectionConfig(options.nativeTools, externalMcpServers),
+        config: { ...liveInspectionConfig(options.nativeTools, externalMcpServers), ...(options.additionalInstructions ? { developer_instructions: options.additionalInstructions } : {}) },
         ...(req.model ? { model: req.model } : {}),
         serviceName: 'powermove'
       });

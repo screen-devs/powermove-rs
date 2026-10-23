@@ -11,6 +11,7 @@
 export type { TraceStep } from './agent-state.svelte';
 import type { TraceStep } from './agent-state.svelte';
 import { splitUIPlacementText } from './ui-placement';
+import { settleMediaLabel } from '../../../../shared/media-tools';
 
 export type ToolsRowStatus = 'running' | 'partial' | 'error' | 'done';
 
@@ -18,7 +19,7 @@ export type ToolsRowStatus = 'running' | 'partial' | 'error' | 'done';
     Thoughts ride in the same list as calls (harness ToolChips idiom): label
     "Thinking", the first sentence as the chip, the full text as the output. */
 export type ToolDetail = Pick<ToolStep, 'id' | 'label' | 'status'> &
-  Partial<Pick<ToolStep, 'toolName' | 'detail' | 'output' | 'startedAt' | 'endedAt'>> & {
+  Partial<Pick<ToolStep, 'toolName' | 'detail' | 'output' | 'startedAt' | 'endedAt' | 'task'>> & {
     kind: 'tool' | 'thought';
     family: ToolFamily;
   };
@@ -53,9 +54,15 @@ export interface ToolsRow {
 
 /* Icon family for a tool row. Coarser than `toolAction`: the glyph only needs
    to say "shell", "file", "search" — the label says the rest. */
-export type ToolFamily = 'run' | 'edit' | 'read' | 'search' | 'image' | 'computer' | 'panel' | 'think' | 'tool';
+export type ToolFamily = 'run' | 'edit' | 'read' | 'search' | 'image' | 'computer' | 'panel' | 'think' | 'watch' | 'listen' | 'tool';
 
 const FAMILY_RULES: Array<[RegExp, ToolFamily]> = [
+  // Watching and listening to footage: frames and probes vs. sound and speech.
+  [/^(probe_media|sample_media_frames|media_contact_sheet)$/, 'watch'],
+  [/^(media_waveform|transcribe_media|generate_captions)$/, 'listen'],
+  [/^export_captions$/, 'panel'],
+  [/^check_project$/, 'panel'],
+  [/^(delegate_task|orchestrator_capabilities|task_status|task_cancel)$/, 'think'],
   [/panel|workspace|project_state|render_frames|apply_commands|edit_video|rollback/, 'panel'],
   [/^(web|search|browse|fetch|grep|glob|find|ls$|list)|url/, 'search'],
   [/^(bash|command|shell|terminal|exec|run|process)/, 'run'],
@@ -105,11 +112,19 @@ export type ActivityRow =
    `mcp__github__search_issues`). Match on the FAMILY, not the exact name, so a
    new tool still produces a sentence instead of a raw identifier. */
 const ACTION_RULES: Array<[RegExp, string]> = [
+  [/^delegate_task$/, 'delegated tasks'],
+  [/^task_status$/, 'checked subagents'],
+  [/^task_cancel$/, 'stopped a subagent'],
+  [/^orchestrator_capabilities$/, 'checked available models'],
   [/^compact/, 'compacted the conversation'],
   [/^view_image$/, 'viewed images'],
   [/^wait$/, 'waited'],
   [/^(agent|task)$/, 'worked with subagents'],
   [/^get_project_state$/, 'inspected the project'],
+  [/^list_media$/, 'inspected project media'],
+  [/^replace_media$/, 'replaced media'],
+  [/^import_media$/, 'imported media'],
+  [/^manage_media$/, 'managed project media'],
   [/^get_panel_layout$/, 'checked the panel layout'],
   [/^open_panel$/, 'opened a panel'],
   [/^get_panel_state$/, 'checked panel controls'],
@@ -118,6 +133,14 @@ const ACTION_RULES: Array<[RegExp, string]> = [
   [/^computer_use_panel$/, 'tested panel controls'],
   [/^get_workspace_state$/, 'inspected the workspace'],
   [/^render_frames$/, 'previewed composition frames'],
+  [/^probe_media$/, 'probed media'],
+  [/^sample_media_frames$/, 'sampled footage'],
+  [/^media_contact_sheet$/, 'built contact sheets'],
+  [/^media_waveform$/, 'mapped silences'],
+  [/^transcribe_media$/, 'transcribed speech'],
+  [/^check_project$/, 'checked the project'],
+  [/^generate_captions$/, 'captioned speech'],
+  [/^export_captions$/, 'exported captions'],
   [/^apply_commands$/, 'edited the composition'],
   [/^edit_video$/, 'edited video clips'],
   [/^rollback_changes$/, 'undid agent changes'],
@@ -181,7 +204,9 @@ function thoughtDetail(step: ThoughtStep): ToolDetail {
 export function groupedToolRow(work: WorkStep[]): ToolsRow {
   const steps = work.filter((step): step is ToolStep => step.kind === 'tool');
   const thoughts = work.filter((step): step is ThoughtStep => step.kind === 'thought');
-  const actions = [...new Set(steps.map((step) => toolAction(step.toolName)))];
+  const actions = [...new Set(steps.map((step) => step.outcome === 'pending'
+    ? 'started a transcription'
+    : step.outcome === 'needs-model' ? 'asked for a transcription model' : toolAction(step.toolName)))];
   const failedCount = steps.filter((step) => step.status === 'error').length;
   const successCount = steps.filter((step) => step.status === 'done').length;
   const settledCount = steps.filter((step) => step.status !== 'running').length;
@@ -203,8 +228,10 @@ export function groupedToolRow(work: WorkStep[]): ToolsRow {
   // The header counts calls (harness "4 tool calls"); the natural-language
   // summary of what was done stays reachable as the tooltip. A reasoning-only
   // stretch reads like the harness ThinkingState header.
+  const taskCount = steps.filter(step => step.task).length;
+  const callCount = steps.length - taskCount;
   const label = steps.length
-    ? `${steps.length} tool ${steps.length === 1 ? 'call' : 'calls'}`
+    ? [taskCount ? `${taskCount} ${taskCount === 1 ? 'task' : 'tasks'}` : '', callCount ? `${callCount} tool ${callCount === 1 ? 'call' : 'calls'}` : ''].filter(Boolean).join(' · ')
     : thinking ? 'Thinking' : span ? `Thought for ${span}` : 'Thought';
   const current = [...steps].reverse().find((step) => step.status === 'running' && step.label);
   const row: ToolsRow = {
@@ -223,8 +250,8 @@ export function groupedToolRow(work: WorkStep[]): ToolsRow {
       ? thoughtDetail(step)
       : {
           kind: 'tool' as const,
-          id: step.id, label: step.label, status: step.status, toolName: step.toolName,
-          detail: step.detail, output: step.output, startedAt: step.startedAt, endedAt: step.endedAt,
+          id: step.id, label: settleMediaLabel(step.toolName, step.label, step.status), status: step.status, toolName: step.toolName,
+          detail: step.detail, output: step.output, startedAt: step.startedAt, endedAt: step.endedAt, task: step.task,
           family: toolFamily(step.toolName)
         }).filter((detail) => Boolean(detail.label)),
     files: [...new Set(steps
@@ -240,8 +267,8 @@ export function groupedToolRow(work: WorkStep[]): ToolsRow {
     row.detail = [row.summary, ...steps
       .filter((step) => Boolean(step.label))
       .map((step) => failedCount > 0
-        ? `${step.status === 'error' ? 'Failed' : step.status === 'continued' ? 'Continued' : 'Succeeded'} · ${step.label}`
-        : step.label)];
+        ? `${step.status === 'error' ? 'Failed' : step.status === 'continued' ? 'Continued' : 'Succeeded'} · ${settleMediaLabel(step.toolName, step.label, step.status)}`
+        : settleMediaLabel(step.toolName, step.label, step.status))];
   }
   return row;
 }

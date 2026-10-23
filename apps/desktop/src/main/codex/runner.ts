@@ -34,6 +34,7 @@ import {
   clearSession,
   discardExtensionStage,
   preserveCancelledRun,
+  removeEmptyRunDirectory,
   prepareAgentWorkspace,
   readSession,
   sessionPathFor,
@@ -46,6 +47,7 @@ import { imageExtension } from '../image-extension';
 
 const MODES = ['editor', 'autonomous'] as const;
 const ACCESS = ['editor', 'project', 'computer'] as const;
+const APPROVALS = ['supervised', 'auto'] as const;
 const EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
 const PROVIDERS = ['chatgpt', 'claude', 'compatible'] as const;
 const DEFAULT_TIMEOUT_MS = 3_600_000;
@@ -70,6 +72,8 @@ export interface CodexRunOptions {
   spawnProcess?: SpawnLike;
   consumeConsentToken?: (token: string) => boolean;
   nativeTools?: NativeMcpServerConfig;
+  workspaceId?: string;
+  additionalInstructions?: string;
   externalMcpServers?: UserMcpServers;
 }
 
@@ -125,6 +129,7 @@ export function isCodexRunRequest(value: unknown): value is CodexRunRequest {
     isRecord(attachment) && isString(attachment.name) &&
     isBytes(attachment.data))) return false;
   if (!(value.consentToken === null || isString(value.consentToken))) return false;
+  if (value.approval !== undefined && !isOneOf(value.approval, APPROVALS)) return false;
 
   return value.mode === 'editor' || value.projectJSON !== null;
 }
@@ -418,7 +423,7 @@ export class CodexRunner {
         options.userData,
         authority,
         agentResultSchema(),
-        { extensionsDir: options.extensionsDir, apiPackFiles }
+        { extensionsDir: options.extensionsDir, apiPackFiles, workspaceId: options.workspaceId }
       );
       state.layout = layout;
       if (this.cancelled.has(req.id)) {
@@ -440,14 +445,16 @@ export class CodexRunner {
             artifactPath: `artifacts/${layout.runId}`,
             access: authority,
             context: req.context,
+            request: prompt,
             extensionsDir: layout.extensionsDir
-          }),
+          }) + (options.additionalInstructions ? `\n\n${options.additionalInstructions}` : ''),
           prompt,
           imagePaths: layout.imagePaths,
           model: req.model,
           reasoningEffort: req.reasoningEffort,
           access: authority,
           shellNetwork: req.access === 'project',
+          approval: req.approval ?? 'auto',
           extensionsDir: layout.extensionsDir,
           sessionId,
           nativeTools: options.nativeTools,
@@ -542,6 +549,7 @@ export class CodexRunner {
       this.active.delete(req.id);
       this.cancelled.delete(req.id);
       release();
+      if (state.layout) await removeEmptyRunDirectory(state.layout);
       if (editorDirectory) await rm(editorDirectory, { recursive: true, force: true });
     }
   }

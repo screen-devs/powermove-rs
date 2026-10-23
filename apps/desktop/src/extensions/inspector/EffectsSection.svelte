@@ -4,15 +4,14 @@
   import type { EditCommand } from 'powermove';
   import { evaluatedValue } from './multi-edit';
   import AnimatedRow from './AnimatedRow.svelte';
-  import ChannelRow from './ChannelRow.svelte';
-  /* App-local clipboard survives layer/inspector remounts without replacing the user's system clipboard. */
-  import { copyEffects, effectPasteCommands } from './effect-clipboard';
+  import ParameterList from './ParameterList.svelte';
+  /* App-local effect snapshots survive layer/inspector remounts. */
+  import { effectPasteCommands } from './effect-clipboard';
   import Icon from './Icon.svelte';
-  import { showFxMenu } from './actions';
   import { inspectorRefresh } from './refresh.svelte.js';
 
   const { api, doc, transport, mixed, edit: inspectorEdit, inspector } = inspectorContext();
-  const { ColorField, Section, ToggleField } = api.ui.controls;
+  const { ToggleField } = api.ui.controls;
 
   let { layer }: { layer: any } = $props();
 
@@ -126,8 +125,7 @@
     selectedIds = copied.map((effect: any) => effect.id);
     selectionAnchor = fallback.id;
     inspector()?.setEffectSelection(layer.id, selectedIds);
-    const count = copyEffects(copied);
-    api.ui.toast?.(`Copied ${count} ${count === 1 ? 'effect' : 'effects'}`);
+    api.commands.run('copyLayers');
   }
 
   function pasteEffects(): void {
@@ -262,18 +260,6 @@
   role="group"
   aria-label="Effects section"
 >
-  <Section {api} title="Effects" />
-  {#if effects.length === 0}
-    <button
-      type="button"
-      class="chip wide"
-      onpointerdown={(event) => {
-        event.preventDefault();
-        showFxMenu(api, event.currentTarget, layer);
-      }}
-    ><Icon name="plus" />Add effect</button>
-  {/if}
-
   {#if effects.length > 0}
   <div class="fx-list" role="listbox" aria-label="Effects" aria-multiselectable="true">
     {#each effects as effect, index (effect.id)}
@@ -331,60 +317,27 @@
 
       {#if expanded}
         <div class="grp fx-params" id={paramsId}>
-          <AnimatedRow {layer} path={`${effect.id}.$enabled`} label="Enabled">
-            <ToggleField {api} {mixed} get={() => enabled(effect)} edit={propertyEdit(`${effect.id}.$enabled`, 'Enable effect')} label="Enabled" />
-          </AnimatedRow>
-          {#each definition.params ?? [] as parameter (parameter.k)}
-            {@const property = effect.p?.[parameter.k]}
-            {#if property}
-              {#if parameter.type === 'color'}
-                <AnimatedRow {layer} path={`${effect.id}.${parameter.k}`} label={parameter.label}>
-                  <ColorField {api} {mixed}
-                    get={() => (doc.tick.values, doc.proj, api.anim.evP(layer, property, transport.time, parameter.k))}
-                    edit={propertyEdit(`${effect.id}.${parameter.k}`, parameter.label)} label={parameter.label} />
-                </AnimatedRow>
-              {:else if parameter.type === 'toggle'}
-                <AnimatedRow {layer} path={`${effect.id}.${parameter.k}`} label={parameter.label}>
-                  <ToggleField {api} {mixed}
-                    get={() => (doc.tick.values, doc.proj, api.anim.evP(layer, property, transport.time, parameter.k))}
-                    edit={propertyEdit(`${effect.id}.${parameter.k}`, parameter.label)} label={parameter.label} />
-                </AnimatedRow>
-              {:else}
-                <ChannelRow
-
-                  {layer}
-                  channel={`${effect.id}.${parameter.k}`}
-                  label={parameter.label}
-                  {property}
-                  getValue={(time) => api.anim.evP(layer, property, time, parameter.k)}
-                  step={'step' in parameter ? parameter.step : undefined}
-                  min={'min' in parameter ? parameter.min : undefined}
-                  max={'max' in parameter ? parameter.max : undefined}
-                  unit={'unit' in parameter ? parameter.unit : undefined}
-                />
-              {/if}
-            {/if}
-          {/each}
+          <ParameterList {layer} params={definition.params ?? []} properties={effect.p ?? {}} prefix={effect.id} ui={definition.ui}>
+            {#snippet extra()}
+              <AnimatedRow {layer} path={`${effect.id}.$enabled`} label="Enabled">
+                <ToggleField {api} {mixed} get={() => enabled(effect)} edit={propertyEdit(`${effect.id}.$enabled`, 'Enable effect')} label="Enabled" />
+              </AnimatedRow>
+            {/snippet}
+          </ParameterList>
         </div>
       {/if}
       {/if}
     {/each}
   </div>
   {/if}
+
 </div>
 
 <style>
   .effects-section {
     display: flex;
     flex-direction: column;
-    gap: 4px;
-  }
-
-  /* The heading is wrapped by this component, so the global :first-child
-     reset would otherwise erase the divider between Stroke and Effects. */
-  .effects-section :global(.sec) {
-    margin-top: 8px;
-    border-top: 1px solid var(--section-line);
+    gap: 0;
   }
 
   .fx-head {
@@ -397,7 +350,6 @@
 
   .fx-head.selected {
     background: var(--accent-dim);
-    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 52%, transparent);
   }
 
   .fx-head.dragging {

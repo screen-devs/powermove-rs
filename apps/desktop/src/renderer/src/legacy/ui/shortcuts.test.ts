@@ -98,6 +98,16 @@ describe('legacy shortcut install', () => {
     expect(PM.commandForAsset('image').properties).toBeUndefined();
   });
 
+  it('adds packed Blender assets asynchronously and keeps ordinary asset actions synchronous',async()=>{
+    const PM:any=editorRuntime();
+    PM.proj.assets.audio={id:'audio',kind:'audio',name:'Tone.wav',dur:1};
+    const audio=PM.cmd('addFromAsset','audio');expect(audio.type).toBe('audio');expect(audio).not.toBeInstanceOf(Promise);
+    const group=layer(PM,'imported-model',{type:'group'});
+    PM.proj.assets.blend={id:'blend',kind:'model',format:'blend',name:'Product.blend'};
+    const model=vi.fn(async()=>({ok:true,data:{result:{id:group.id}}}));
+    PM.Kernel.api=vi.fn(()=>({scene3d:{model}}));
+    expect(await PM.cmd('addFromAsset','blend')).toBe(group);expect(model).toHaveBeenCalledWith({operation:'import_blend',sourceAssetId:'blend',name:'Product'});
+  });
   it('does not register the removed shader-layer creation command', () => {
     const PM = shortcutsRegistry();
 
@@ -391,6 +401,18 @@ describe('pro editor shortcut behavior', () => {
     expect(PM.hist.undo()).toBe(true);
     expect(ids(PM)).toEqual([video.id]);
     expect(PM.L(video.id).d.embeddedAudio).toBe(true);
+  });
+
+  it('keeps the soundtrack level and mute when separating audio', () => {
+    const PM = editorRuntime();
+    const video = layer(PM, 'video', {
+      type: 'video', name: 'Interview', from: 0, dur: 4,
+      d: { asset: 'video-asset', trim: 0, speed: 1, embeddedAudio: true, audioGain: 0.5, audioMuted: true },
+    });
+    PM.cmd('separateAudio', video.id);
+    const audio = PM.firstSel();
+    expect(audio.d.gain).toBe(0.5);
+    expect(audio.on).toBe(false);
   });
 
   it('splits every visible unlocked root layer with no selection and treats boundaries as no-ops', () => {

@@ -13,13 +13,21 @@ import { EventEmitter } from 'node:events';
 
 import { IPC, type AgentToolRequestEvent, type AgentToolResponseEvent, type CodexProgressEvent, type CodexRunResult } from '../shared/ipc';
 import { WEB } from '../shared/wire';
+import { MEDIA_SOURCE_TOOL } from '../shared/media-tools';
 import type { RemoteClient } from './clients';
 
 /** Tools that need a real UI: pixels, panel DOM, synthetic input. */
 export const DISPLAY_TOOLS = new Set([
   'get_panel_layout', 'open_panel', 'get_panel_state', 'interact_panel', 'capture_panel', 'computer_use_panel',
-  'render_frames', '__panel_bounds', '__prepare_panel_input'
+  'render_frames', '__panel_bounds', '__prepare_panel_input', '__agent_thread_control'
 ]);
+
+/* Agent media tools resolve an asset to a host file through a renderer: a
+   tab can upload bytes the host lacks, the engine can only find the host's
+   own copy, so a tab that has the run's project open is preferred. A tab on
+   another project would look the asset up in the wrong document, so it is
+   never used (media-tools lane). */
+export const TAB_FIRST_TOOLS = new Set([MEDIA_SOURCE_TOOL]);
 
 const MAX_BUFFERED_EVENTS = 5000;
 
@@ -41,6 +49,8 @@ export interface RunHubDeps {
   engine(): RemoteClient | null;
   /** A live tab to show things on, most recent first. */
   tabs(): RemoteClient[];
+  /** Live tabs that have a project open, most recent first (media-tools lane). */
+  tabsOn?(projectId: string): RemoteClient[];
   /** Deliver a synthetic tool response into the bridge as if the owner answered. */
   respond(owner: RunOwner, response: AgentToolResponseEvent): void;
   log?(line: string): void;
@@ -65,6 +75,7 @@ export class RunOwner extends EventEmitter {
     if (this.destroyed) return;
     if (channel === IPC.codexEvent) {
       const event = payload as CodexProgressEvent;
+      if (event.kind === 'trace' && event.step.kind === 'task') this.hub.noteChildOwner(event.step.task.childRunId, this, ['queued', 'running', 'waiting'].includes(event.step.task.status));
       this.record.events.push(event);
       if (this.record.events.length > MAX_BUFFERED_EVENTS) {
         const excess = this.record.events.length - MAX_BUFFERED_EVENTS;
@@ -127,6 +138,7 @@ export class RunHub {
   private readonly owners = new Map<string, RunOwner>();
   private readonly records = new Map<string, RunRecord>();
   private readonly pendingCalls = new Map<string, RunOwner>();
+  private readonly childOwners = new Map<string, RunOwner>();
 
   constructor(readonly deps: RunHubDeps) {}
 
@@ -152,6 +164,11 @@ export class RunHub {
   }
 
   owner(runId: string): RunOwner | null { return this.owners.get(runId) ?? null; }
+  controlOwner(runId: string): RunOwner | null { return this.owner(runId) ?? this.childOwners.get(runId) ?? null; }
+  noteChildOwner(childRunId: string, owner: RunOwner, active: boolean): void {
+    if (active) this.childOwners.set(childRunId, owner);
+    else if (this.childOwners.get(childRunId) === owner) this.childOwners.delete(childRunId);
+  }
   record(runId: string): RunRecord | null { return this.records.get(runId) ?? null; }
 
   /** Runs for a project: live ones first, then finished ones a tab may not have seen. */
@@ -167,8 +184,13 @@ export class RunHub {
   }
   expectResponse(callId: string, owner: RunOwner): void { this.pendingCalls.set(callId, owner); }
 
-  targetFor(tool: string, _owner: RunOwner): RemoteClient | null {
+  targetFor(tool: string, owner: RunOwner): RemoteClient | null {
+    if (tool === '__agent_thread_control') return owner.attachedTabs[0] ?? this.deps.tabs()[0] ?? null;
     if (DISPLAY_TOOLS.has(tool)) return this.deps.tabs()[0] ?? null;
+    if (TAB_FIRST_TOOLS.has(tool)) {
+      const tab = this.deps.tabsOn?.(owner.record.projectId).find((client) => !client.isDestroyed());
+      return tab ?? this.deps.engine() ?? null;
+    }
     return this.deps.engine() ?? this.deps.tabs()[0] ?? null;
   }
 
@@ -179,6 +201,7 @@ export class RunHub {
         this.records.delete(id);
         this.owners.get(id)?.destroy();
         this.owners.delete(id);
+        for (const [childId, owner] of this.childOwners) if (owner.record.id === id) this.childOwners.delete(childId);
       }
     }
   }
@@ -186,5 +209,6 @@ export class RunHub {
   shutdown(): void {
     for (const owner of this.owners.values()) owner.destroy();
     this.owners.clear();
+    this.childOwners.clear();
   }
 }

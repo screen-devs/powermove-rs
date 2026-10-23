@@ -1,3 +1,5 @@
+import type { OnboardingChoice } from './creative-workspace';
+import type { AgentTask } from './agent-orchestration';
 /*
  * Frozen Phase 1 IPC contract between the sandboxed renderer and the main
  * process. Every channel here is the ONLY way the renderer reaches native
@@ -19,10 +21,13 @@ export const IPC = {
   onboardingLogoTarget: 'onboarding:logo-target',
   onboardingLogoTargetReport: 'onboarding:logo-target-report',
   onboardingBegin: 'onboarding:begin',
+  onboardingAppearance: 'onboarding:appearance',
 
   fileSave: 'file:save',
   exportChoose: 'export:choose',
   exportRelease: 'export:release',
+  /* Captions: an .srt/.vtt beside a video this window just exported. */
+  exportSidecar: 'export:sidecar',
   fileSaveUpload: 'file:save-upload',
   fileSaveChunk: 'file:save-chunk',
   fileSaveAbort: 'file:save-abort',
@@ -39,7 +44,12 @@ export const IPC = {
   projectConfirmClose: 'project:confirm-close',
   dialogConfirm: 'dialog:confirm',
   clipboardWriteText: 'clipboard:write-text',
+  mediaPaste: 'media:paste',
 
+  blenderStatus: 'blender:status',
+  blenderChoose: 'blender:choose',
+  blenderRun: 'blender:run',
+  blenderCancel: 'blender:cancel',
   renderStart: 'render:start',
   renderWrite: 'render:write',
   renderFinish: 'render:finish',
@@ -76,8 +86,10 @@ export const IPC = {
   codexSteer: 'codex:steer',
   codexAnswer: 'codex:answer',
   codexCancel: 'codex:cancel',
+  codexCancelTask: 'codex:cancel-task',
   codexFixPrompt: 'codex:fix-prompt',
   codexRebasePrompt: 'codex:rebase-prompt',
+  codexUpdateFork: 'codex:update-fork',
   codexRestoreChangeSet: 'codex:restore-change-set',
   codexEvent: 'codex:event', // main → renderer
   agentToolRequest: 'agent-tool:request', // main → renderer
@@ -100,6 +112,8 @@ export const IPC = {
 
   artifactRead: 'agent:artifact:read',
   artifactReveal: 'agent:reveal',
+  artifactForget: 'agent:artifacts:forget',
+  artifactSweep: 'agent:artifacts:sweep',
 
   captureWindow: 'capture:window',
 
@@ -223,7 +237,11 @@ export interface OnboardingBridge {
   animationFailed(message: string): void;
   reportLogoTarget(target: OnboardingLogoTarget): void;
   onLogoTarget(callback: (target: OnboardingLogoTarget) => void): () => void;
-  begin(): Promise<void>;
+  begin(choice?: OnboardingChoice): Promise<void>;
+  appearance(): Promise<'light' | 'dark'>;
+  /* ── transcription lane ── */
+  /** The Transcription step: start a model download that outlives onboarding. */
+  transcription?: import('./transcription').OnboardingTranscriptionBridge;
 }
 
 export type IpcChannel = (typeof IPC)[keyof typeof IPC];
@@ -234,7 +252,7 @@ const PROJECT_SNAPSHOT_BYTES = 32 * 1024 * 1024;
 
 export const LIMITS = {
   fileSaveBytes: 256 * 1024 * 1024, // direct IPC / local recovery bound
-  codexImages: 6,
+  codexImages: 12, // Six references, a selected region, and representative composition frames.
   codexImageBytes: 4 * 1024 * 1024,
   codexAttachments: 6,
   codexAttachmentBytes: 100 * 1024,
@@ -260,6 +278,10 @@ export interface FileSaveRequest {
   destinationToken?: string;
 }
 export type FileSaveResult = { ok: true; path: string } | { ok: false; cancelled: boolean; error?: string };
+/** Captions sidecar: `path` is the exported video; `suffix` adds ".en" etc. */
+export interface ExportSidecarRequest { path: string; extension: 'srt' | 'vtt'; suffix?: string; text: string }
+/** The only suffixes a sidecar may carry ("en", "pt-BR", "Notes-2"). */
+export const SIDECAR_SUFFIX_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
 export interface ProjectSaveRequest {
   name: string; projectId: string; saveAs?: boolean; documentBytes: number;
   media: import('./project-incremental').SaveMedia[];
@@ -301,6 +323,10 @@ export type CodexMode = 'editor' | 'autonomous';
 export type CodexAccess = 'editor' | 'project' | 'computer';
 export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
 export type AgentProviderId = 'chatgpt' | 'claude' | 'compatible';
+/** Who approves an action the Project sandbox blocks: the person each time
+ * (`supervised`), or a provider's automatic reviewer where one exists (`auto`;
+ * providers without one still ask the person). */
+export type AgentApproval = 'supervised' | 'auto';
 
 export interface CodexModelOption {
   id: string;
@@ -333,6 +359,8 @@ export interface CodexRunRequest {
   context?: 'app' | 'project';
   attachments: CodexAttachment[];
   consentToken: string | null; // required when access === 'computer'
+  /** Project access only; omitted by older renderers, which meant `auto`. */
+  approval?: AgentApproval;
 }
 
 export interface AgentExtensionChange {
@@ -417,6 +445,10 @@ export interface CodexRebasePromptRequest {
   id: string;
 }
 
+export type ForkUpdateResult =
+  | { kind: 'updated'; version: string; projectId: string; changeSetId: string }
+  | { kind: 'needs-agent'; reason: 'conflict' | 'validation'; conflicts: string[] };
+
 /* Structured activity, streamed from main as it happens. Every `thought` and
    `answer` event is an APPEND-ONLY fragment: the renderer concatenates
    consecutive fragments into the current live row, so a provider that streams
@@ -427,6 +459,7 @@ export interface CodexRebasePromptRequest {
    known (label only), then again once the arguments are complete (with
    `detail`); the renderer patches the existing row instead of adding one. */
 export type CodexTraceEvent =
+  | { kind: 'task'; task: AgentTask }
   | { kind: 'thought'; text: string }
   | { kind: 'answer'; text: string }
   | {
@@ -437,6 +470,8 @@ export type CodexTraceEvent =
       label: string;
       /** The tool's primary argument in mono: a command, a file path, a query. ≤ LIMITS.codexToolDetailChars */
       detail?: string;
+      /** Agent media tools only: the sanitized target, so the row can name the clip. */
+      subject?: import('./media-tools').AgentMediaToolSubject;
     }
   | {
       kind: 'tool-end';
@@ -452,6 +487,8 @@ export type CodexTraceEvent =
   | {
       kind: 'question';
       itemId: string;
+      /** A child can hold a question on behalf of the root conversation. */
+      requestId?: string;
       questions: CodexQuestion[];
       transport: 'reply' | 'message';
       blocking: boolean;
@@ -515,10 +552,14 @@ export interface ClaudeAccountStatus {
 }
 
 /* Computer authority: main shows a native confirmation and mints a one-use,
-   short-lived token. It is never persisted. */
+   short-lived token. It is never persisted. A `standing` request asks once
+   for Full access and then mints tokens without asking again, until `revoke`
+   or the app quits. */
 export interface ConsentRequest {
   projectName: string;
   summary: string;
+  standing?: boolean;
+  revoke?: boolean;
 }
 export type ConsentResult = { granted: true; token: string; expiresAt: number } | { granted: false };
 
@@ -572,6 +613,7 @@ export type MenuCommand =
   | 'open'
   | 'import'
   | 'importSequence'
+  | 'importFolder'
   | 'export'
   | 'contextUndo'
   | 'contextRedo'
@@ -693,6 +735,8 @@ export interface PowermoveBridge {
     choose(name: string, directory?: boolean): Promise<string | null>;
     release(token: string): Promise<void>;
   };
+  /** Captions: write a subtitle sidecar next to an exported video. */
+  exportSidecar?(request: ExportSidecarRequest): Promise<FileSaveResult>;
   saveFile(req: FileSaveRequest): Promise<FileSaveResult>;
   openProjectFile(): Promise<ProjectOpenResult>;
   /** Opens a project file the user already picked, keeping its path for Save.
@@ -708,7 +752,15 @@ export interface PowermoveBridge {
   confirm(request: ConfirmRequest): Promise<boolean>;
   /** Writes plain text to the system clipboard while the window has focus; nothing is ever read back. */
   clipboardWriteText?(text: string): Promise<void>;
+  /** Native user-initiated media paste. Returns false when there is no media; exposes no clipboard data. */
+  pasteMedia?(): Promise<boolean>;
 
+  blender?: {
+    status(): Promise<import('./blender').BlenderStatus>;
+    choose(): Promise<import('./blender').BlenderStatus | null>;
+    run(job: import('./blender').BlenderJob): Promise<import('./blender').BlenderOutput>;
+    cancel(): Promise<void>;
+  };
   render: {
     start(options:{width:number;height:number;fps:number;format:'prores'|'mp4';alpha:boolean;name:string;bitrateMbps?:number}):Promise<string | null>;
     write(token:string,data:Uint8Array,audio?:boolean):Promise<void>;
@@ -728,7 +780,8 @@ export interface PowermoveBridge {
     sourcePath(file: File): string | null;
     revealSource(sourcePath: string): Promise<void>;
     createPlaybackProxy(file: File, sourcePath?: string): Promise<MediaProxyResult>;
-    createImageSequence(files: File[], fps: number, onProgress?: (completed: number) => void): Promise<MediaProxyResult>;
+    /** `originalPaths[i]`, when given, names files[i] on disk for Files the host cannot map itself. */
+    createImageSequence(files: File[], fps: number, onProgress?: (completed: number) => void, originalPaths?: Array<string | undefined>): Promise<MediaProxyResult>;
     /** Encode frames the renderer decoded from an animated image into a proxy. */
     beginAnimation(fps: number, repeats: number[]): Promise<string>;
     writeAnimationFrame(token: string, index: number, offset: number, data: Uint8Array): Promise<void>;
@@ -743,6 +796,10 @@ export interface PowermoveBridge {
     reveal(request: AttachmentRevealRequest): Promise<void>;
   };
 
+  /* ── agent media tools: asset → readable file (media-tools lane) ── */
+  /** Resolve media assets to files main/the host can read (renderer/src/media/media-path.ts). */
+  mediaPath?: import('./media-tools').MediaPathBridge;
+
   codex: {
     run(
       req: CodexRunRequest,
@@ -752,8 +809,10 @@ export interface PowermoveBridge {
     steer(req: CodexSteerRequest): Promise<CodexSteerResult>;
     answer(req: CodexAnswerRequest): Promise<CodexSteerResult>;
     cancel(id: string, preserveChanges?: boolean): Promise<void>;
+    cancelTask?(requestId: string, taskId: string): Promise<void>;
     fixPrompt(req: CodexFixPromptRequest): Promise<string>;
     rebasePrompt(req: CodexRebasePromptRequest): Promise<string>;
+    updateFork(req: CodexRebasePromptRequest): Promise<ForkUpdateResult>;
     restoreChangeSet(req: AgentChangeSetRestoreRequest): Promise<AgentChangeSetRestoreResult>;
     requestComputerConsent(req: ConsentRequest): Promise<ConsentResult>;
   };
@@ -789,6 +848,10 @@ export interface PowermoveBridge {
   artifacts: {
     read(ref: ArtifactRef): Promise<ArtifactFile>;
     reveal(ref: ArtifactRef): Promise<void>;
+    /** Delete a project's agent workspace; called when the project is destroyed. */
+    forget(projectId: string): Promise<void>;
+    /** Remove idle workspaces for projects not in `liveProjectIds`. */
+    sweep(liveProjectIds: string[]): Promise<string[]>;
   };
 
   captureWindow(): Promise<CaptureResult>;
@@ -880,6 +943,10 @@ export interface PowermoveBridge {
 
   /** The Store: browse the registry; install, update and remove store extensions. */
   extensionStore: import('./store-ipc').StoreBridge;
+
+  /* ── transcription lane ── */
+  /** On-device transcription: models, downloads, transcribe (absent on hosts without the engine). */
+  transcription?: import('./transcription').TranscriptionBridge;
 }
 
 export interface SandboxInputKey {

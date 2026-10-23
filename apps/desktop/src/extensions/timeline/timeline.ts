@@ -9,6 +9,8 @@ import { graphAxisColor, graphValueTicks, graphKeyShape, graphPlotTop } from './
 import { adjacentKeyframe } from './keyframe-navigation';
 import { draggedPropertyValue, propertyMetadata } from './property-values';
 import { element, iconNode, normalizeTimelineChrome, selectedLayers } from './api-helpers';
+import { createTrackView, normalizeTimelineMode, TIMELINE_MODES, TRACK_GUTTER, type TimelineMode } from './track-view';
+import { createCaptionTrack } from './caption-track';
 /* Ported from js/ui/timeline.js — behavior-preserving. */
 import { expandScaleKeyIds, keyMembers, timelineProperties, trackChannels, trackSelected } from './property-tracks';
 import {
@@ -450,6 +452,17 @@ export function planKeyframeMove<Property>(
   return { delta, moves, removed };
 }
 
+/** As in After Effects, Option-dragging the first or last key of a multi-key
+    selection stretches its timing about the key at the opposite end. */
+export function keyframeStretchAnchor(selectedTimes: number[], grabbed: number): { anchor: number; grabbed: number } | null {
+  if (selectedTimes.length < 2) return null;
+  const first = Math.min(...selectedTimes), last = Math.max(...selectedTimes);
+  if (last - first < 1e-9) return null;
+  if (Math.abs(grabbed - last) < 1e-6) return { anchor: first, grabbed: last };
+  if (Math.abs(grabbed - first) < 1e-6) return { anchor: last, grabbed: first };
+  return null;
+}
+
 /** Materialize a plan without mutating its source. Useful for tests and for
     consumers that keep their own keyframe storage. */
 export function applyKeyframeMovePlan<Property>(
@@ -516,9 +529,10 @@ export const timelinePanelOptions = {
   library: { width: 800, height: 440 },
 } as const;
 
-/** Audio clips are read by their waveform; a name label only crowds it. */
+/** Audio clips are read by their waveform and captions by their cue text;
+    a name label only crowds them. */
 export function shouldDrawClipLabel(layerType: unknown): boolean {
-return layerType !== 'audio';
+return layerType !== 'audio' && layerType !== 'captions';
 }
 
 /** Compatibility name for tests and downstream forks of the legacy runtime. */
@@ -556,6 +570,13 @@ if (sessionTimeline) {
   T.graph = !!sessionTimeline.graph;
   T.graphCombined = !!sessionTimeline.graphCombined;
 }
+/* Layer (After Effects) vs track (Premiere) presentation is a personal working
+   style, so it follows the user across projects rather than the session. */
+T.mode = normalizeTimelineMode(previous?.mode ?? api.storage.get('mode'));
+T.trackSnap = previous?.trackSnap ?? api.storage.get('trackSnap') !== false;
+T.trackDrag = null; T.trackDrop = null; T.trackHover = null;
+T.trackScrollY = Number.isFinite(previous?.trackScrollY) ? previous.trackScrollY : 0;
+const tracksMode = () => T.mode === 'tracks';
 runtimes.set(api, T);
 mountedRuntime = T;
 T.keySelectionActive = !!(T.keySelectionActive || api.selection.keys().length);
@@ -660,6 +681,12 @@ const SNAP_ACQUIRE_PX = 10;
 const SNAP_RELEASE_PX = 15;
 function shiftSnapping(event?: any) {
   return shiftHeld || !!event?.shiftKey || !!event?.getModifierState?.('Shift');
+}
+/* Strip moves and trims snap with Shift in the layer timeline. The track
+   timeline follows Premiere instead: its magnet toggle snaps by default and
+   Shift inverts it for one gesture. */
+function edgeSnapping(event?: any) {
+  return tracksMode() ? T.trackSnap !== false ? !shiftSnapping(event) : shiftSnapping(event) : shiftSnapping(event);
 }
 function beginDrag(event: any, options: any) {
   let control: any;
@@ -776,12 +803,25 @@ function buildHead(head: any) {
       T.graphViewBounds = null; invalidate('timeline');
     } },
   ]), 'Graph options');
+  const snap = btn('magnet', () => {
+    T.trackSnap = !T.trackSnap;
+    api.storage.set('trackSnap', T.trackSnap);
+    syncGraphControls();
+  }, 'Snap clips to edges, markers and the playhead (hold Shift to invert)');
+  snap.classList.add('tl-snap');
   let graphShown: string | undefined;
   syncGraphControls = () => {
+    syncModeControls();
+    const tracks = tracksMode();
     const shown = Boolean(T.graph);
-    const mode = shown ? (T.graphCombined ? 'both' : 'graph') : 'dope';
+    const view = shown ? (T.graphCombined ? 'both' : 'graph') : 'dope';
+    const mode = tracks ? `tracks:${T.trackSnap !== false}:${view}` : view;
     if (graphShown === mode) return;
     graphShown = mode;
+    /* The track timeline unfolds keyframes inside its tracks, so the dope
+       sheet / graph switch applies there too; it adds Premiere's magnet. */
+    snap.hidden = !tracks; snap.style.display = tracks ? '' : 'none';
+    snap.classList.toggle('on', T.trackSnap !== false); snap.setAttribute('aria-pressed', String(T.trackSnap !== false));
     graph.classList.toggle('on', mode === 'graph');
     for (const [button, active] of [[dope, mode === 'dope'], [both, mode === 'both']] as const) {
       button.classList.toggle('on', active); button.setAttribute('aria-pressed', String(active));
@@ -790,7 +830,7 @@ function buildHead(head: any) {
     graphOptions.hidden = !shown;
     graphOptions.style.display = shown ? '' : 'none';
   };
-  const graphSlot = h('div.tl-group.tl-graph-slot', graphOptions, dope, both, graph);
+  const graphSlot = h('div.tl-group.tl-graph-slot', graphOptions, dope, both, graph, snap);
   const transport = h('div.tl-group.tl-transport',
     playBtn,
     time,
@@ -852,6 +892,49 @@ function buildHead(head: any) {
     beginDrag(e, { cursor: 'ew-resize', move: (dx: any) => api.transport.setTime(startTime + dx / 12 / api.project.get().fps) });
   }, undefined, headCleanups);
 }
+
+let modeButtons: Array<[TimelineMode, HTMLElement]> = [];
+function syncModeControls() {
+  for (const [mode, button] of modeButtons) {
+    const on = T.mode === mode;
+    if (button.getAttribute('aria-checked') === String(on)) continue;
+    button.classList.toggle('on', on); button.setAttribute('aria-checked', String(on));
+  }
+  const panel = (attachedWrap ?? document.querySelector('#tl-canvas-wrap'))?.closest?.('.panel') as HTMLElement | null;
+  if (panel && panel.dataset.timelineMode !== T.mode) panel.dataset.timelineMode = T.mode;
+}
+function setMode(next: unknown) {
+  const mode = normalizeTimelineMode(next);
+  if (T.mode === mode) return;
+  T.mode = mode;
+  api.storage.set('mode', mode);
+  /* The two views have unrelated row geometry; keep only the time viewport. */
+  T.scrollY = 0; T.trackScrollY = 0;
+  T.trackDrag = null; T.trackDrop = null; T.trackHover = null; T.reorder = null; T.drop = null; T.dropRow = null;
+  rowsDirty = true;
+  syncGraphControls();
+  /* Paint now: gutter width and lane geometry are resolved while drawing, and
+     pointer hit tests must not see the previous mode's layout meanwhile. */
+  if (T.ctx) draw();
+  invalidate('timeline');
+}
+T.setMode = setMode;
+let modeCleanups: Array<() => void> = [];
+runtimeCleanups.push(() => runCleanups(modeCleanups));
+T.attachModeSwitch = (host: HTMLElement) => {
+  runCleanups(modeCleanups);
+  host.id = 'tl-mode';
+  host.setAttribute('role', 'radiogroup');
+  host.setAttribute('aria-label', 'Timeline mode');
+  modeButtons = TIMELINE_MODES.map(mode => {
+    const button = h('button.tl-mode-button', { type: 'button', role: 'radio', title: mode.title, 'data-mode': mode.id },
+      iconNode(api, mode.icon), h('span', {}, mode.label));
+    listen(button, 'click', () => setMode(mode.id), undefined, modeCleanups);
+    return [mode.id, button] as [TimelineMode, HTMLElement];
+  });
+  host.replaceChildren(...modeButtons.map(([, button]) => button));
+  syncModeControls();
+};
 
 function refreshTimelineManifest() {
   syncGraphControls();
@@ -990,6 +1073,8 @@ const rowShift = (idx: any) => T.drop && !T.graph && idx >= T.drop.rowIdx ? 1 : 
 const rowY = (idx: any) => rawRowY(idx + rowShift(idx));
 const graphTop = () => graphPlotTop(T.ruler, T.hgt, Boolean(T.graphCombined), T.graphSplit);
 const inGraph = (x: number, y: number) => Boolean(T.graph && x >= T.gut && y >= graphTop());
+/* Bottom of the track view: the graph, when shown, takes the space below it. */
+const tracksBottom = () => T.graph ? graphTop() : T.hgt;
 
 /* ── draw ──────────────────────────────────────────────── */
 onEvent('project:changed', () => { rowsDirty = true; invalidate('timeline'); });
@@ -1058,6 +1143,92 @@ function refreshInk() {
 }
 refreshInk();
 
+const clipKeyTimes = new WeakMap<object, { version: unknown; times: number[] }>();
+function layerKeyTimes(L: any): number[] {
+  const version = api.anim.version();
+  const cached = clipKeyTimes.get(L);
+  if (cached && cached.version === version) return cached.times;
+  const times = new Set<number>();
+  for (const row of timelineProperties(api, L, space3d)) {
+    for (const axis of trackChannels(row)) for (const key of axis.prop.kf) times.add(key.t);
+  }
+  const sorted = [...times].sort((a, b) => a - b);
+  clipKeyTimes.set(L, { version, times: sorted });
+  return sorted;
+}
+/* Caption cues on captions strips, in both timeline views. */
+const captionTrack = createCaptionTrack({
+  api, T, t2x, x2t,
+  theme: () => theme,
+  roundRect, clipText,
+  clipPalette: (L) => clipPalette(L) as any,
+  mix: (color, toward, amount) => mixHex(color, toward, amount),
+  fui: () => fui(),
+  beginDrag, invalidate, edgeSnapping,
+  wrap: () => document.querySelector<HTMLElement>('#tl-canvas-wrap'),
+  cleanup: (dispose) => { runtimeCleanups.push(dispose); },
+});
+T.captionTrack = captionTrack;
+/* Programmatic "edit this cue" requests (Add Caption, the agent) open the
+   inline editor here when the cue's strip is on screen. */
+{
+  const captionsService = api.services.get<any>('captions');
+  const stop = captionsService?.onEditRequest?.(({ layerId, cueId }: { layerId: string; cueId: string }) => {
+    const L: any = api.model.layer(layerId);
+    const cue = L?.d?.cues?.find((item: any) => item.id === cueId);
+    if (!L || !cue || !T.cv?.isConnected || !T.w) return false;
+    const at = L.from + cue.start;
+    if (t2x(at) < T.gut || t2x(at) > T.w - 40) { T.scrollT = Math.max(-.4, at - (T.w - T.gut) * .25 / T.pps); }
+    let top: number | null = null, height = T.row;
+    if (tracksMode()) {
+      const item = trackView.layout().byId.get(L.id);
+      if (item) { top = trackView.laneY(item.area, item.lane); height = trackView.rowHeight(); }
+    } else {
+      buildRows();
+      const index = T.rows.findIndex((row: any) => row.kind === 'layer' && row.L.id === L.id);
+      if (index >= 0) { keepRowsVisible(index, 0); top = rowY(index); }
+    }
+    if (top == null || top < T.ruler || top > T.hgt - 10) return false;
+    draw();
+    return captionTrack.edit(L, cueId, top, height);
+  });
+  if (stop) runtimeCleanups.push(stop);
+}
+
+const trackView = createTrackView({
+  api, T, t2x, x2t,
+  theme: () => theme, ink: INK,
+  drawClip: (c, L, y, height) => drawClip(c, L, y, height),
+  keyTimes: (L) => layerKeyTimes(L),
+  props: (L) => visibleProps(L).map((p: any) => ({ kind: 'prop', L, ...p })),
+  keyframeSize: () => T.style.keyframeSize,
+  keySelected: (key) => keySelected(key),
+  rowSelected: (row) => api.selection.layers().includes(row.L.id) && trackSelected(row, api.selection.chan() ?? ''),
+  keyDown: (e, row, x, y) => keyDown(e, row, x, y, -1),
+  keyMarquee: (e) => marquee(e, { additive: e.shiftKey || e.metaKey }),
+  editKeyAt: (row, x) => editKeyAt(row, x),
+  focusRow: (row) => {
+    api.selection.set({ chan: row.key });
+    T.focusGraph(row.L, row.key);
+    if (!api.selection.layers().includes(row.L.id)) api.selection.select(row.L.id);
+    T.keySelectionActive = true;
+  },
+  toggleAnimation: (row) => togglePropertyAnimation(row),
+  icoAnimationDiamond: (c, x, y, animated, current) => icoAnimationDiamond(c, x, y, animated, current),
+  fitValue: (c, value, unit, width) => fittedPropertyValue(c, value, unit, width),
+  clipPalette: (L) => clipPalette(L) as any,
+  roundRect, clipText, rgba,
+  captions: captionTrack,
+  fui: () => fui(), fmono: () => fmono(), niceStep,
+  icoEye, icoLock, icoSpeaker, drawParentWhip,
+  supportsParent: (L) => layerSupportsTransform(L.type) && shouldDrawClipLabel(L.type),
+  visible: (L) => !!evaluatedValue(L, L.on, api.transport.time(), 'l.on'),
+  beginDrag, invalidate, edgeSnapping,
+  layerEdgeSnapper: (ids) => layerEdgeSnapper(ids),
+  trim: (e, side) => trim(e, side),
+});
+T.trackView = trackView;
+
 function draw() {
   try { drawInner(); } catch (e: any) { console.error('[timeline draw]', e, e.stack); }
 }
@@ -1076,14 +1247,16 @@ function animatedTimelineFlag(value: any): boolean {
 function timelineBackdropKey(): unknown[] | null {
   // Graph curves and active drag adornments keep their full drawing path.
   // One bounded viewport bitmap is sufficient; no frame history is retained.
-  if (T.graph || T.drop || T.reorder || T.marquee || T.quickOffset || !api.uiState.timelineVersion
+  if (T.graph || T.drop || T.reorder || T.marquee || T.quickOffset || T.trackDrag || T.trackDrop || !api.uiState.timelineVersion
+      || (tracksMode() && trackView.unfolded())
       || T.cv.width * T.cv.height * 4 > 32 * 1024 * 1024) return null;
   const p = api.project.get();
   const key: unknown[] = [T.cv, T.ctx, T.cv.width, T.cv.height, T.w, T.hgt, T.dpr,
     T.rows, T.gut, T.row, T.ruler, T.pps, T.scrollT, T.scrollY, T.hoverRow, T.dropRow,
     T.style.clipRadius, T.style.keyframeSize, T.style.showLayerNumbers, T.style.showTypeBadges,
     theme, p, p.dur, p.fps, p.work?.[0], p.work?.[1], api.project.revision(),
-    api.anim.version(), api.uiState.timelineVersion()];
+    api.anim.version(), api.uiState.timelineVersion(), T.mode, T.trackHover?.area, T.trackHover?.lane, T.trackHover?.clip, T.trackScrollY,
+    captionTrack.version()];
   const [first, end] = visibleRowRange();
   for (let i = first; i < end; i++) {
     const row = T.rows[i];
@@ -1159,16 +1332,20 @@ function drawInner(preview?: TimelinePreviewTarget) {
   }
   const labelWidth = propertyLabelWidth;
   T.propertyValueX = 100 + labelWidth + 12;
-  T.gut = Math.max(T.gut, T.propertyValueX + 90);
+  /* Track headers carry no property columns; they keep a fixed, narrower width. */
+  T.gut = tracksMode() && !preview ? TRACK_GUTTER : Math.max(T.gut, T.propertyValueX + 90);
   if (preview) {
     T.scrollT = 0;
     T.scrollY = 0;
     T.pps = Math.max(.01, (W - T.gut - 16) / Math.max(.5, Number(api.project.get().dur) || .5));
   } else syncHeadGeometry();
 
+  const tracks = tracksMode() && !preview;
   const rowBottom = T.graph && T.graphCombined ? graphTop() : H;
-  const maxScroll = Math.max(0, T.rows.length * T.row - (rowBottom - T.ruler));
-  T.scrollY = clamp(T.scrollY, 0, maxScroll);
+  const contentHeight = tracks ? trackView.contentHeight() : T.rows.length * T.row;
+  const maxScroll = Math.max(0, contentHeight - (rowBottom - T.ruler));
+  if (tracks) T.trackScrollY = clamp(Number(T.trackScrollY) || 0, 0, maxScroll);
+  else T.scrollY = clamp(T.scrollY, 0, maxScroll);
 
   /* Keep the playhead visible by advancing a page at the edge. Pinning it to
      the edge moved every clip, ruler label and waveform every display tick,
@@ -1189,7 +1366,7 @@ function drawInner(preview?: TimelinePreviewTarget) {
     // dimensions; scaling to W/H would soften the entire cached timeline.
     c.drawImage(backdrop, 0, 0, backdrop.width / T.dpr, backdrop.height / T.dpr);
     // Only property readouts and animated gutter indicators follow time.
-    if (drawGutter(c, W, H, true)) {
+    if (!tracks && drawGutter(c, W, H, true)) {
       // Retain the latest readouts too. Otherwise restoring the backdrop on
       // the next tick would replace unchanged values with their initial text.
       const context = backdrop.getContext('2d');
@@ -1203,8 +1380,24 @@ function drawInner(preview?: TimelinePreviewTarget) {
     }
   } else {
     c.fillStyle = theme.panel; c.fillRect(0, 0, W, H);
-    drawTracksBg(c, W, H);
-    if (T.graph) {
+    if (tracks) {
+      /* The track view draws its own lanes, clips, unfolded keyframes and
+         headers; the graph editor, when shown, sits below it. */
+      const bottom = tracksBottom();
+      if (bottom > T.ruler) {
+        c.save(); c.beginPath(); c.rect(0, 0, W, bottom); c.clip();
+        trackView.draw(c, W, bottom);
+        c.restore();
+      }
+      if (T.graph) {
+        drawGraph(c, W, H);
+        c.fillStyle = theme.panel; c.fillRect(0, graphTop(), T.gut, H - graphTop());
+        c.strokeStyle = theme.line; c.beginPath(); c.moveTo(T.gut - .5, graphTop()); c.lineTo(T.gut - .5, H); c.stroke();
+      }
+    }
+    else drawTracksBg(c, W, H);
+    if (tracks) { /* drawn above */ }
+    else if (T.graph) {
       if (T.graphCombined) {
         c.save(); c.beginPath(); c.rect(T.gut, T.ruler, W - T.gut, graphTop() - T.ruler); c.clip();
         drawClips(c, W, graphTop()); c.restore();
@@ -1212,7 +1405,7 @@ function drawInner(preview?: TimelinePreviewTarget) {
       drawGraph(c, W, H);
     }
     else { drawClips(c, W, H); drawDropGhost(c, W, H); }
-    drawGutter(c, W, H);
+    if (!tracks) drawGutter(c, W, H);
     if (T.graph) drawGraphReadout(c, W, H);
     if (T.reorder) {
       const d = T.reorder, y = rowY(d.row), left = 74 + Math.min(48, d.depth * 12);
@@ -1243,7 +1436,7 @@ function drawInner(preview?: TimelinePreviewTarget) {
     else delete T.cv.dataset.snapTarget;
   }
   drawQuickOffset(c, W, H);
-  drawScrollThumb(c, W, rowBottom, maxScroll);
+  drawScrollThumb(c, W, rowBottom, tracks ? T.trackScrollY : T.scrollY, maxScroll, contentHeight);
   if ((window as any).__tlDebug) {
     const px = t2x(api.transport.time());
     const msg = '[tl] t=' + api.transport.time().toFixed(3) + ' px=' + (isFinite(px) ? px.toFixed(1) : String(px)) + ' gut=' + T.gut + ' W=' + W + ' sT=' + T.scrollT.toFixed(3) + ' pps=' + T.pps + ' rows=' + T.rows.length + ' graph=' + T.graph;
@@ -1275,7 +1468,7 @@ T.renderPreview = (canvas: HTMLCanvasElement, width: number, height: number) => 
   const saved = {
     cv: T.cv, ctx: T.ctx, w: T.w, hgt: T.hgt, dpr: T.dpr,
     gut: T.gut, row: T.row, ruler: T.ruler, pps: T.pps,
-    scrollT: T.scrollT, scrollY: T.scrollY, graph: T.graph,
+    scrollT: T.scrollT, scrollY: T.scrollY, graph: T.graph, mode: T.mode,
     style: T.style, rows: T.rows, propertyValueX: T.propertyValueX,
     hover: T.hover, marquee: T.marquee, dropRow: T.dropRow, drop: T.drop, reorder: T.reorder,
     quickOffset: T.quickOffset,
@@ -1285,6 +1478,7 @@ T.renderPreview = (canvas: HTMLCanvasElement, width: number, height: number) => 
     T.row = 30;
     T.ruler = 28;
     T.graph = false;
+    T.mode = 'layers';
     T.hover = null;
     T.marquee = null;
     T.dropRow = null;
@@ -1304,12 +1498,11 @@ T.renderPreview = (canvas: HTMLCanvasElement, width: number, height: number) => 
 };
 
 /* Thin scrollbar on the right edge of the track area when rows overflow. */
-function drawScrollThumb(c: any, W: any, H: any, maxScroll: any) {
+function drawScrollThumb(c: any, W: any, H: any, scroll: number, maxScroll: any, total: number) {
   if (maxScroll <= 0) return;
   const trackH = H - T.ruler;
-  const total = T.rows.length * T.row;
   const th = Math.max(18, trackH * trackH / total);
-  const ty = T.ruler + (trackH - th) * (T.scrollY / maxScroll);
+  const ty = T.ruler + (trackH - th) * (scroll / maxScroll);
   c.fillStyle = INK.thumb;
   roundRect(c, W - 5, ty, 3, th, 1.5); c.fill();
 }
@@ -1434,7 +1627,10 @@ function drawClips(c: any, W: any, H: any) {
     const y = rowY(i);
     if (y + T.row < T.ruler || y > H) continue;
     const r = T.rows[i];
-    if (r.kind === 'layer') drawClip(c, r.L.type === 'group' ? { ...r.L, ...api.groups.span(r.L) } : r.L, y);
+    if (r.kind === 'layer') {
+      drawClip(c, r.L.type === 'group' ? { ...r.L, ...api.groups.span(r.L) } : r.L, y);
+      if (r.L.type === 'captions') captionTrack.draw(c, r.L, y, T.row, W);
+    }
     else drawPropKeys(c, r, y);
   }
   c.restore();
@@ -1547,6 +1743,7 @@ const CLIP_TYPES: Record<string, { body: string; primary: string; foreground: st
   shader: { body: '#413B60', primary: '#A99AE0', foreground: '#ECE8F8' },
   extension: { body: '#40395D', primary: '#B2A6EF', foreground: '#F0EDFF' },
   null:   { body: '#3E434B', primary: '#A2A9B3', foreground: '#EEF0F3' },
+  captions: { body: '#4C4430', primary: '#D8BD74', foreground: '#F5EFDD' },
 };
 const CLIP_FALLBACK = { body: '#34505A', primary: '#8DB8C6', foreground: '#E6F1F4' };
 function mixHex(color: string, toward: [number, number, number], amount: number) {
@@ -1568,11 +1765,11 @@ function clipPalette(L: any) {
   };
 }
 
-function drawClip(c: any, L: any, y: any) {
+function drawClip(c: any, L: any, y: any, rowHeight = T.row) {
   const x0 = t2x(L.from), x1 = t2x(L.from + L.dur);
   if (x1 < T.gut || x0 > T.w) return;
   /* Clips fill their row with a 1px breath between neighbours. */
-  const hh = T.row - 2;
+  const hh = rowHeight - 2;
   const yy = y + 1;
   const sel = api.selection.layers().includes(L.id);
   const r = Math.min(4, T.style.clipRadius);
@@ -1586,6 +1783,8 @@ function drawClip(c: any, L: any, y: any) {
      body, inner top highlight, hairline ring one shade under the body. */
   c.shadowColor = dark ? 'rgba(0,0,0,.35)' : 'rgba(15,15,20,.12)';
   c.shadowBlur = 4; c.shadowOffsetY = 2;
+  /* A captions strip is the lane its cues sit on: a quieter body. */
+  if (L.type === 'captions') c.globalAlpha *= .55;
   roundRect(c, x0, yy, w, hh, r);
   const g = c.createLinearGradient(0, yy, 0, yy + hh);
   g.addColorStop(0, mixHex(pal.body, [255, 255, 255], dark ? .06 : .04));
@@ -1645,6 +1844,20 @@ function drawClip(c: any, L: any, y: any) {
   c.lineWidth = sel ? 4 : 2; c.stroke();
   c.restore();
   c.restore();
+}
+
+/* Parent pickwhip: a spiral to drag onto a layer, then a chevron for the
+   parent menu. x is the spiral's centre; the chevron ends 21px right of it. */
+function drawParentWhip(c: any, x: number, cy: number, color: string) {
+  c.strokeStyle = color; c.lineWidth = 1.2;
+  c.beginPath();
+  for (let step = 0; step <= 32; step++) {
+    const angle = step / 32 * Math.PI * 3, radius = 1 + step / 32 * 4;
+    const px = x + Math.cos(angle) * radius, py = cy + Math.sin(angle) * radius;
+    if (!step) c.moveTo(px, py); else c.lineTo(px, py);
+  }
+  c.stroke();
+  c.beginPath(); c.moveTo(x + 15, cy - 1.5); c.lineTo(x + 18, cy + 1.5); c.lineTo(x + 21, cy - 1.5); c.stroke();
 }
 
 function drawPropKeys(c: any, r: any, y: any) {
@@ -1767,17 +1980,7 @@ function drawGutter(c: any, W: any, H: any, dynamicOnly = false): boolean {
       const audioX = embeddedAudioToggleX(L);
       const nameRight = T.gut - (hasParentControl ? 50 : 12) - statusWidth - (audioX == null ? 0 : AUDIO_TOGGLE_WIDTH);
       clipText(c, L.name, 96 + indent, iy, Math.max(0, nameRight - 96 - indent));
-      if (showParentControl) {
-        c.strokeStyle = L.parent ? theme.accent : theme.tx3; c.lineWidth = 1.2;
-        c.beginPath();
-        for (let step = 0; step <= 32; step++) {
-          const angle = step / 32 * Math.PI * 3, radius = 1 + step / 32 * 4;
-          const x = T.gut - 30 + Math.cos(angle) * radius, py = iy + Math.sin(angle) * radius;
-          if (!step) c.moveTo(x, py); else c.lineTo(x, py);
-        }
-        c.stroke();
-        c.beginPath(); c.moveTo(T.gut - 15, iy - 1.5); c.lineTo(T.gut - 12, iy + 1.5); c.lineTo(T.gut - 9, iy - 1.5); c.stroke();
-      }
+      if (showParentControl) drawParentWhip(c, T.gut - 30, iy, L.parent ? theme.accent : theme.tx3);
       let statusX = nameRight + 8;
       if (L.solo) { c.fillStyle = theme.accent; c.fillText('●', statusX, iy); statusX += 12; }
       if (evaluatedValue(L, L.mblur, api.transport.time(), 'l.mblur')) {
@@ -2398,7 +2601,10 @@ function hitRow(y: any) {
 function bind(cv: any, wrap: any) {
   listen(cv, 'pointerdown', onDown, undefined, canvasCleanups);
   listen(cv, 'pointermove', onMove, undefined, canvasCleanups);
-  listen(cv, 'pointerleave', () => setHoverRow(null), undefined, canvasCleanups);
+  listen(cv, 'pointerleave', () => {
+    setHoverRow(null);
+    if (T.trackHover && !T.trackDrag) { T.trackHover = null; invalidate('timeline'); }
+  }, undefined, canvasCleanups);
   listen(cv, 'dblclick', onDbl, undefined, canvasCleanups);
   listen(cv, 'contextmenu', onCtx, undefined, canvasCleanups);
   /* FX browser drops. Non-fx drags (OS files) fall through to the window
@@ -2408,7 +2614,11 @@ function bind(cv: any, wrap: any) {
     T.dropRow = index;
     invalidate('timeline');
   };
-  const dropLayerAt = (y: number) => {
+  const dropLayerAt = (y: number, x = T.gut + 1) => {
+    if (tracksMode()) {
+      const layer = trackView.layerAt(x, y);
+      return layer ? { layer, index: -1 } : null;
+    }
     const hr = hitRow(y);
     return hr?.row?.L ? { layer: hr.row.L, index: hr.i } : null;
   };
@@ -2458,8 +2668,8 @@ function bind(cv: any, wrap: any) {
     const dt = e.dataTransfer;
     if (api.dnd.hasFxDrag(dt)) {
       e.preventDefault(); dt.dropEffect = 'copy';
-      const hit = e.offsetX > T.gut ? dropLayerAt(e.offsetY) : null;
-      setDropRow(hit ? hit.index : null);
+      const hit = e.offsetX > T.gut ? dropLayerAt(e.offsetY, e.offsetX) : null;
+      setDropRow(hit && !tracksMode() ? hit.index : null);
       return;
     }
     if (!api.dnd.hasMediaDrag(dt)) return;
@@ -2467,18 +2677,25 @@ function bind(cv: any, wrap: any) {
     /* Payload data is unreadable during dragover; the drag source parks a
        description on api so the ghost can carry its name, kind and length. */
     const src = api.dnd.mediaDrag || { name: 'Media', kind: 'file', dur: undefined };
+    if (tracksMode()) {
+      trackView.setDrop({ ...trackView.dropTarget(e.offsetX, e.offsetY, src.kind), name: src.name, kind: src.kind, dur: src.dur });
+      return;
+    }
     setMediaDrop({ ...mediaDropAt(e), name: src.name, kind: src.kind, dur: src.dur });
   }, undefined, canvasCleanups);
-  listen(cv, 'dragleave', () => { setDropRow(null); setMediaDrop(null); }, undefined, canvasCleanups);
+  listen(cv, 'dragleave', () => { setDropRow(null); setMediaDrop(null); trackView.setDrop(null); }, undefined, canvasCleanups);
   listen(cv, 'drop', (e: any) => {
     const dt = e.dataTransfer;
     const fx = api.dnd.readFxDrag(dt);
     /* resolve while the slot is still open so the drop lands where the ghost showed */
-    const placement = mediaDropAt(e);
-    setDropRow(null); setMediaDrop(null);
+    /* The track view always adds new media on top of the stack, then lifts
+       it to the hovered track; packing keeps it clear of every clip below. */
+    const trackDrop = tracksMode() ? trackView.dropTarget(e.offsetX, e.offsetY, api.dnd.mediaDrag?.kind ?? 'file') : null;
+    const placement = trackDrop ? { at: trackDrop.at, index: 0, rowIdx: 0 } : mediaDropAt(e);
+    setDropRow(null); setMediaDrop(null); trackView.setDrop(null);
     if (fx) {
       e.preventDefault(); e.stopPropagation();
-      const hit = dropLayerAt(e.offsetY);
+      const hit = dropLayerAt(e.offsetY, e.offsetX);
       const L = hit?.layer || api.selection.first();
       let edge: 'in' | 'out' | undefined;
       if (L && fx.kind === 'transition') {
@@ -2493,9 +2710,11 @@ function bind(cv: any, wrap: any) {
     if (!asset && !files.length) return;
     e.preventDefault(); e.stopPropagation();
     const { at, index } = placement;
+    const before = new Set(api.project.get().layers.map((layer: any) => layer.id));
     if (asset?.kind === 'comp') {
       /* A composition from the Project panel nests as a precomp layer. */
       api.commands.run('addCompositionToTimeline', asset.id, { from: at, index });
+      if (trackDrop) trackView.placeOnTrack(before, trackDrop.lane);
       return;
     }
     if (asset) {
@@ -2504,8 +2723,10 @@ function bind(cv: any, wrap: any) {
       command.index = index;
       const result = api.edit.apply(command, { label: 'Add ' + asset.name, origin: 'command' });
       if (result?.ok === false) api.ui.toast(result.message || 'Could not add ' + asset.name);
+      else if (trackDrop) trackView.placeOnTrack(before, trackDrop.lane);
     } else {
-      api.media.importFiles(files, { placement: { at, index } });
+      // The DataTransfer itself carries any dropped folders' contents.
+      api.media.importFiles(dt, { placement: { at, index }, asFolder: e.altKey });
     }
   }, undefined, canvasCleanups);
   listen(cv, 'wheel', (e: any) => {
@@ -2526,7 +2747,8 @@ function bind(cv: any, wrap: any) {
         const pixels = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? T.hgt : 1);
         const delta = g.y2v(pixels) - g.y2v(0);
         T.graphViewBounds = [g.vmin + delta, g.vmax + delta];
-      } else T.scrollY += e.deltaY;
+      } else if (tracksMode()) T.trackScrollY += e.deltaY;
+      else T.scrollY += e.deltaY;
       T.scrollT += e.deltaX / T.pps;
     }
     T.scrollT = Math.max(-.4, T.scrollT);
@@ -2541,8 +2763,17 @@ function setHoverRow(index: number | null) {
 }
 function onMove(e: any) {
   const x = e.offsetX, y = e.offsetY;
-  setHoverRow(hitRow(y)?.i ?? null);
+  if (tracksMode() && y < tracksBottom() - (T.graph && T.graphCombined ? 4 : 0)) {
+    const workHit = x > T.gut && workAreaHit(x, y);
+    const next = workHit ? { cursor: workHit.kind === 'handle' ? 'ew-resize' : 'grab', title: '' }
+      : y < T.ruler ? { cursor: x > T.gut ? 'ew-resize' : 'default', title: '' }
+      : trackView.hover(x, y);
+    T.cv.title = next.title; T.cv.style.cursor = next.cursor;
+    return;
+  }
+  if (!tracksMode()) setHoverRow(hitRow(y)?.i ?? null);
   if (T.graph && T.graphCombined && x > T.gut && Math.abs(y - graphTop()) < 4) { T.cv.style.cursor = 'ns-resize'; return; }
+  if (tracksMode() && !inGraph(x, y)) { T.cv.style.cursor = 'default'; T.cv.title = ''; return; }
   if (inGraph(x, y)) {
     const graph = T._graph;
     const grip = graph?.transform ? graphTransformHandleAtPoint(graph.selectionBounds, x, y) : null;
@@ -2573,7 +2804,9 @@ function onMove(e: any) {
       const L = hr.row.L;
       const x0 = t2x(L.from), x1 = t2x(L.from + L.dur);
       const stagger = L.lock ? null : textStagger.hit(L, x, y, t2x, rowY(hr.i) + 1, T.row - 2);
-      if (Math.abs(x - x0) < 5 || Math.abs(x - x1) < 5) cur = 'ew-resize';
+      const cueHover = L.type === 'captions' ? captionTrack.hover(L, x) : null;
+      if (cueHover) { cur = cueHover.cursor; title = cueHover.title; }
+      else if (Math.abs(x - x0) < 5 || Math.abs(x - x1) < 5) cur = 'ew-resize';
       else if (stagger) { cur = stagger.part === 'end' ? 'ew-resize' : 'grab'; title = stagger.band.animator.name; }
       else if (x > x0 && x < x1) cur = 'grab';
     } else if (!workHit && hr && hr.row.kind === 'prop') {
@@ -2631,6 +2864,10 @@ function onDown(e: any) {
     if (hit?.kind === 'bar') return workAreaMove(e);
     return scrub(e);
   }
+  if (tracksMode() && !(T.graph && T.graphCombined && x > T.gut && Math.abs(y - graphTop()) < 4)) {
+    if (y < tracksBottom()) return trackView.down(e, x, y);
+    return inGraph(x, y) ? graphDown(e, x, y) : undefined;
+  }
   if (x < T.gut) return gutterDown(e, x, y);
   if (T.graph && T.graphCombined && Math.abs(y - graphTop()) < 4) {
     const start = graphTop();
@@ -2651,6 +2888,16 @@ function onDown(e: any) {
   if (quickOffsetModifiers(e) && api.selection.layers().includes(L.id) && quickOffsetLayerGroups().length > 1) {
     if (L.lock) return;
     return quickOffsetLayers(e);
+  }
+  // A captions strip's cues take the pointer; its empty lane moves the layer.
+  if (L.type === 'captions' && !e.shiftKey && !e.metaKey && !e.ctrlKey && captionTrack.hit(L, x)) {
+    if (!api.selection.layers().includes(L.id)) api.selection.select([L.id]);
+    captionTrack.down(e, L, x);
+    return;
+  }
+  if (L.type === 'captions' && (e.shiftKey || e.metaKey || e.ctrlKey) && captionTrack.hit(L, x) && api.selection.layers().includes(L.id)) {
+    captionTrack.down(e, L, x);
+    return;
   }
   if (!selectLayerForPointer(L, e)) return;
   // Locking protects clip content and trim edits, while the clip body remains
@@ -2745,6 +2992,9 @@ function quickOffsetLayers(e: any) {
 
 function selectLayerForPointer(L: any, event: PointerEvent) {
   T.keySelectionActive = false;
+  // A click on a layer (its name, clip body or empty lane) selects the layer,
+  // not the cues picked before it.
+  if (captionTrack.selection().layerId) captionTrack.select(null, []);
   api.selection.set({ keys: [] });
   const selected = api.selection.layers().includes(L.id);
   const toggle = event.metaKey || event.ctrlKey;
@@ -3144,7 +3394,7 @@ function slide(e: any) {
     move: (dx: any, dy: any, ev: any) => {
       moved = true;
       const requested = dx / T.pps;
-      const { delta, snapped } = shiftSnapping(ev) ? snapper.resolve(probes, requested) : snapper.release(requested);
+      const { delta, snapped } = edgeSnapping(ev) ? snapper.resolve(probes, requested) : snapper.release(requested);
       const dt = Math.max(delta, -earliest);
       if (Math.abs(dt - delta) > 1e-9) T.snapGuide = null;
       const at = (from: number) => snapped ? Math.max(0, from + dt) : Math.max(0, api.util.snapF(from + dt, api.project.get().fps));
@@ -3196,7 +3446,10 @@ function layerEdgeSnapper(movingIds: string[]) {
 function trim(e: any, side: any) {
   const selectedIds = new Set(api.groups.expand(api.selection.layers()) || api.selection.layers());
   const layers = api.project.get().layers.filter((l: any) => selectedIds.has(l.id) && l.type !== 'group' && !l.lock && !(api.groups.ancestors(l) || []).some((g: any) => g.lock));
-  const start = layers.map((L: any) => ({ L, from: L.from, dur: L.dur, trim: Number(L.d && L.d.trim) || 0 }));
+  /* Caption cues live in layer time; keep the gesture's starting cues so
+     every move re-bases from them and an in-edge drag that comes back
+     restores what it passed over. */
+  const start = layers.map((L: any) => ({ L, from: L.from, dur: L.dur, trim: Number(L.d && L.d.trim) || 0, d: { ...L.d } }));
   api.edit.begin('Trim clip', { origin: 'timeline' });
   const snapper = layerEdgeSnapper(start.map((s: any) => s.L.id));
   const probes: EdgeSnapProbe[] = start.map((s: any) => side === 'in'
@@ -3208,7 +3461,7 @@ function trim(e: any, side: any) {
     move: (dx: any, _dy: any, ev: any) => {
       moved = true;
       const requested = dx / T.pps;
-      const { delta, snapped } = shiftSnapping(ev) ? snapper.resolve(probes, requested) : snapper.release(requested);
+      const { delta, snapped } = edgeSnapping(ev) ? snapper.resolve(probes, requested) : snapper.release(requested);
       const dt = snapped ? delta : api.util.snapF(delta, api.project.get().fps);
       start.forEach((s: any) => {
         if (side === 'in') {
@@ -3218,6 +3471,9 @@ function trim(e: any, side: any) {
           if (api.media.timing.isTimed(s.L)) {
             const rate = api.media.timing.rate(s.L);
             api.edit.dispatch({ type: 'set_content', target: s.L.id, patch: { trim: Math.max(0, s.trim + (nf - s.from) * rate) } });
+          } else {
+            const content = api.media.timing.startPatch({ ...s.L, from: s.from, d: s.d }, nf);
+            if (content) api.edit.dispatch({ type: 'set_content', target: s.L.id, patch: content });
           }
         } else api.edit.dispatch({ type: 'set_layer', target: s.L.id, patch: { duration: Math.max(1 / api.project.get().fps, s.dur + dt) } });
       });
@@ -3349,13 +3605,26 @@ function keyDown(e: any, r: any, x: any, y: any, rowIdx: any) {
   const snapshot = captureKeyframeGesture(entries);
   const quickOffset = quickModifier && new Set(snapshot.items
     .filter((item: any) => item.selected).map((item: any) => item.offsetIndex)).size > 1;
+  const stretch = !quickModifier && !additive && e.altKey ? keyframeStretchAnchor(
+    snapshot.items.filter((item: any) => item.selected).map((item: any) => item.compositionTime),
+    r.L.from + hit.t,
+  ) : null;
+  const eases = stretch ? captureKeyframeEases(snapshot) : [];
+  const label = stretch ? 'Stretch keyframes' : quickOffset ? 'Quick offset keyframes' : 'Move keyframe';
   let snapLock: KeyframeGroupSnapLock | null = null;
   let moved = false;
   const clearQuickOffset = () => { T.quickOffset = null; };
   beginDrag(e, {
     move: (dx: any, dy: any, event: PointerEvent) => {
       if (!moved && Math.hypot(dx, dy) < 3) return;
-      if (!moved) { moved = true; api.history.begin(quickOffset ? 'Quick offset keyframes' : 'Move keyframe'); }
+      if (!moved) { moved = true; api.history.begin(label); }
+      if (stretch) {
+        applyGraphKeyframeScale(snapshot, {
+          anchorTime: stretch.anchor, anchorValue: 0, valueScale: 1,
+          timeScale: (stretch.grabbed + dx / T.pps - stretch.anchor) / (stretch.grabbed - stretch.anchor),
+        }, eases);
+        return;
+      }
       let delta = dx / T.pps;
       if (!quickOffset && shiftSnapping(event)) {
         const snap = snapKeyframeGesture(snapshot, delta, snapLock);
@@ -3373,13 +3642,13 @@ function keyDown(e: any, r: any, x: any, y: any, rowIdx: any) {
     },
     up: () => {
       clearQuickOffset();
-      if (moved) api.history.commit(quickOffset ? 'Quick offset keyframes' : 'Move keyframe');
+      if (moved) api.history.commit(label);
       else if (additive && wasSelected) setSelectedKeys(selectionAfterKeyGesture(baseSelection, hitIds, true, false));
       invalidate('timeline');
     },
     cancel: () => {
       clearQuickOffset();
-      if (moved) { restoreKeyframeGesture(snapshot); api.history.cancel(); api.anim.touch(); }
+      if (moved) { restoreKeyframeGesture(snapshot); restoreKeyframeEases(eases); api.history.cancel(); api.anim.touch(); }
       invalidate('timeline');
     },
   });
@@ -3481,12 +3750,27 @@ function dragGraphSelection(e: any, g: any, L: any, click?: () => void) {
 
 /* Rebuild from the pointer-down snapshot on every move, like the move gesture:
    a scale the box later backs away from leaves nothing behind. */
+/* restoreKeyframeGesture only knows times and values; a scale also rescales
+   the stored ease speeds, so those are captured and put back separately. */
+function captureKeyframeEases(snapshot: any) {
+  return snapshot.items.filter((item: any) => item.selected).map((item: any) => ({
+    key: item.key, inSpeed: item.key.inEase?.speed, outSpeed: item.key.outEase?.speed,
+  }));
+}
+function restoreKeyframeEases(eases: any[]) {
+  for (const ease of eases) {
+    if (typeof ease.inSpeed === 'number' && ease.key.inEase) ease.key.inEase.speed = ease.inSpeed;
+    if (typeof ease.outSpeed === 'number' && ease.key.outEase) ease.key.outEase.speed = ease.outSpeed;
+  }
+}
+
 function applyGraphKeyframeScale(snapshot: any, request: any, eases: any[]) {
   restoreKeyframeGesture(snapshot);
   const plan = planGraphKeyframeScale(snapshot.items, request, api.project.get().fps);
   plan.moves.forEach(({ item, time, value }: any) => {
     item.key.t = time;
-    if (typeof item.key.v === 'number' && Number.isFinite(value)) item.key.v = api.util.round(value, 3);
+    // A time-only stretch leaves values exactly as they were, unrounded.
+    if (plan.valueScale !== 1 && typeof item.key.v === 'number' && Number.isFinite(value)) item.key.v = api.util.round(value, 3);
   });
   /* Influence is a ratio and survives a scale untouched, but the stored speed
      is value-per-second, so it has to follow value over time to keep the drawn
@@ -3513,9 +3797,7 @@ function dragGraphTransform(e: any, g: any, grip: GraphTransformHandle) {
   const entries = selectedKeyEntries().filter((entry: any) => !entry.L.lock && visibleProperties.has(entry.prop));
   if (!box || entries.length < 2) return;
   const snapshot = captureKeyframeGesture(entries);
-  const eases = snapshot.items.filter((item: any) => item.selected).map((item: any) => ({
-    key: item.key, inSpeed: item.key.inEase?.speed, outSpeed: item.key.outEase?.speed,
-  }));
+  const eases = captureKeyframeEases(snapshot);
   /* y grows downward, so the northern grips carry the *highest* value. */
   const east = grip.includes('e'), west = grip.includes('w');
   const north = grip.includes('n'), south = grip.includes('s');
@@ -3558,13 +3840,8 @@ function dragGraphTransform(e: any, g: any, grip: GraphTransformHandle) {
     },
     cancel: () => {
       if (moved) {
-        /* restoreKeyframeGesture only knows times and values; the eases this
-           gesture rescaled have to be put back by hand. */
         restoreKeyframeGesture(snapshot);
-        for (const ease of eases) {
-          if (typeof ease.inSpeed === 'number' && ease.key.inEase) ease.key.inEase.speed = ease.inSpeed;
-          if (typeof ease.outSpeed === 'number' && ease.key.outEase) ease.key.outEase.speed = ease.outSpeed;
-        }
+        restoreKeyframeEases(eases);
         api.history.cancel(); api.anim.touch();
       }
       T.graphDragBounds = null; T.graphReadout = null;
@@ -3694,6 +3971,7 @@ function keysInMarquee(m: any, graph: any = false) {
     });
     return picked;
   }
+  if (tracksMode()) return trackView.keysIn(m);
   T.rows.forEach((row: any, i: any) => {
     if (row.kind !== 'prop') return;
     const cy = rowY(i) + T.row / 2;
@@ -3748,7 +4026,7 @@ function marquee(e: any, opt: any = {}) {
       } else if (graphPoints && !additive) {
         const nextKeys = graphPickedIds.length ? graphPickedIds : originalKeys;
         setSelectedKeys(nextKeys, layersForKeys(nextKeys));
-      } else if (T.marquee && !api.selection.keys().length) {
+      } else if (T.marquee && !api.selection.keys().length && !tracksMode()) {
         const m = T.marquee;
         const picked: any[] = [];
         T.rows.forEach((row: any, i: any) => {
@@ -3772,6 +4050,7 @@ function marquee(e: any, opt: any = {}) {
 
 function onDbl(e: any) {
   const x = e.offsetX, y = e.offsetY;
+  if (tracksMode() && y >= T.ruler && y < tracksBottom()) { trackView.doubleClick(x, y); return; }
   if (inGraph(x, y) && y >= graphTop() + 28) {
     const hit = [...(T._graph?.points || [])]
       .map((point: any) => ({ point, distance: Math.hypot(x - point.x, y - point.y) }))
@@ -3788,15 +4067,8 @@ function onDbl(e: any) {
   // value edit is available without opening the context menu first.
   if (!inGraph(x, y) && x > T.gut && y >= T.ruler) {
     const hr = hitRow(y);
-    if (hr?.row.kind === 'prop') {
-      const row = hr.row;
-      const key = row.prop.kf.find((candidate: any) => Math.abs(t2x(row.L.from + candidate.t) - x) < 7);
-      if (key) {
-        const members = key.members ?? [{ key, prop: row.prop, L: row.L }];
-        editKeyframeValues(keyframeContextEntries(members, api.selection.keys(), selectedKeyEntries()));
-        return;
-      }
-    }
+    if (hr?.row.kind === 'prop' && editKeyAt(hr.row, x)) return;
+    if (hr?.row.kind === 'layer' && hr.row.L.type === 'captions' && captionTrack.doubleClick(hr.row.L, x, rowY(hr.i), T.row)) return;
   }
   const workHit: any = x > T.gut && workAreaHit(x, y);
   if (workHit?.kind === 'bar') {
@@ -3810,6 +4082,15 @@ function onDbl(e: any) {
     if (hr && hr.row.kind === 'layer' && hr.row.L.type === 'precomp' && hr.row.L.d?.comp) { api.commands.run('openComposition', hr.row.L.d.comp); return; }
     if (hr && hr.row.kind === 'layer' && x > 90) renameLayer(hr.row.L, hr.i);
   }
+}
+/* Double-clicking a key opens the value editor, for the whole selection when
+   the key is part of it. Shared by layer rows and unfolded tracks. */
+function editKeyAt(row: any, x: number) {
+  const key = row.prop.kf.find((candidate: any) => Math.abs(t2x(row.L.from + candidate.t) - x) < 7);
+  if (!key) return false;
+  const members = key.members ?? [{ key, prop: row.prop, L: row.L }];
+  editKeyframeValues(keyframeContextEntries(members, api.selection.keys(), selectedKeyEntries()));
+  return true;
 }
 function renameLayer(L: any, rowIdx: any) {
   const wrap = document.querySelector<HTMLElement>('#tl-canvas-wrap');
@@ -3941,13 +4222,18 @@ function pushKeyframeMenu(items: any[], clickedEntries: any[]) {
 T.layerAtPoint = (clientX: number, clientY: number) => {
   const rect = T.cv?.getBoundingClientRect();
   if (!rect || clientX < rect.left || clientX > rect.right || clientY < rect.top + T.ruler || clientY > rect.bottom) return null;
+  if (tracksMode()) return trackView.layerAt(clientX - rect.left, clientY - rect.top) ?? trackView.rowAt(clientX - rect.left, clientY - rect.top)?.L ?? null;
   return hitRow(clientY - rect.top)?.row?.L || null;
 };
 
 function onCtx(e: any) {
   e.preventDefault();
   const x = e.offsetX, y = e.offsetY;
-  const hr = hitRow(y);
+  const inTracks = tracksMode() && y >= T.ruler && y < tracksBottom();
+  const trackLayer = inTracks ? trackView.layerAt(x, y) : null;
+  if (trackLayer) { api.ui.showLayerMenu(trackLayer, e, 'timeline'); return; }
+  const trackRow = inTracks ? trackView.rowAt(x, y) : null;
+  const hr = tracksMode() ? trackRow && { row: trackRow, i: -1 } : hitRow(y);
   const items: any[] = [];
   const graphPoint = inGraph(x, y)
     ? [...(T._graph?.points || [])]
@@ -3976,7 +4262,10 @@ function onCtx(e: any) {
   } else if (!inGraph(x, y)) {
     items.push({ label: 'Set work area start', icon: 'frame', run: () => api.edit.apply({ type: 'set_composition', patch: { workArea: [Math.min(api.transport.time(), api.project.get().work[1] - 1 / api.project.get().fps), api.project.get().work[1]] } }, { label: 'Work area', origin: 'timeline' }) },
       { label: 'Set work area end', icon: 'frame', run: () => api.edit.apply({ type: 'set_composition', patch: { workArea: [api.project.get().work[0], Math.max(api.transport.time(), api.project.get().work[0] + 1 / api.project.get().fps)] } }, { label: 'Work area', origin: 'timeline' }) },
-      { label: 'Reset work area', icon: 'undo', run: () => api.edit.apply({ type: 'set_composition', patch: { workArea: [0, api.project.get().dur] } }, { label: 'Work area', origin: 'timeline' }) });
+      { label: 'Reset work area', icon: 'undo', run: () => api.edit.apply({ type: 'set_composition', patch: { workArea: [0, api.project.get().dur] } }, { label: 'Work area', origin: 'timeline' }) },
+      '-', tracksMode()
+        ? { label: 'Switch to Layer timeline', icon: 'layers', run: () => setMode('layers') }
+        : { label: 'Switch to Track timeline', icon: 'film', run: () => setMode('tracks') });
   }
   /* Extension contributions land at the end, so the positions a user has
      learned for the built-in rows never move. `layer:context` only fires over a

@@ -8,6 +8,10 @@
  */
 
 import type { Component } from 'svelte';
+import type { Scene3D, SceneObject, SceneLight, SceneSource } from '../core/scene3d/schema';
+import type { Scene3DEdit } from '../core/scene3d/operations';
+export type { Scene3D, SceneObject, SceneLight, SceneSource, SceneChannel } from '../core/scene3d/schema';
+export type { Scene3DEdit } from '../core/scene3d/operations';
 import type {
   BlendMode,
   Channel,
@@ -110,7 +114,7 @@ export interface PanelsAPI {
   refresh(id: string): void;
 }
 
-export type PanelDock = 'left' | 'center' | 'right';
+export type PanelDock = 'left' | 'center' | 'right' | 'bottom';
 export interface PanelOpenOptions { dock?: PanelDock; index?: number }
 
 /* ── commands & keybindings ──────────────────────────────── */
@@ -158,6 +162,12 @@ export interface KeybindingDefinition {
   looseModifiers?: boolean;
   /** Lower runs first; extension bindings default to 0, built-ins to 100. */
   priority?: number;
+  /**
+   * The command applies only in some context and returns false otherwise.
+   * The key's browser default is then cancelled only when the command handles
+   * it, so a declined key keeps its normal behavior (e.g. Shift+Tab focus).
+   */
+  contextual?: boolean;
 }
 
 export interface KeybindingsAPI {
@@ -171,10 +181,21 @@ export interface KeybindingsAPI {
 
 /* ── effects & transitions ───────────────────────────────── */
 
-export type EffectParamDefinition =
+export interface ParameterPresentation {
+  /** Secondary controls live under More. Explicit false keeps a control visible. */
+  advanced?: boolean;
+  /** Numeric choices, or boolean choices for an existing toggle. */
+  options?: { v: number | boolean; label: string }[];
+}
+
+export type ParameterWidget =
+  | { kind: 'ramp'; start: string; end: string; midpoint?: string; mode?: string }
+  | { kind: 'point'; x: string; y: string; label?: string; advanced?: boolean };
+
+export type EffectParamDefinition = ParameterPresentation & (
   | { k: string; label: string; def: number; min: number; max: number; step?: number; unit?: string; type?: 'number' }
   | { k: string; label: string; def: string; type: 'color' }
-  | { k: string; label: string; def: boolean; type: 'toggle' };
+  | { k: string; label: string; def: boolean; type: 'toggle' });
 
 /**
  * Fragment shader body contract (GLSL ES 3.00). The kernel prepends the common
@@ -196,6 +217,8 @@ export interface EffectDefinition {
   group: string;
   /** At most 32 params; keys must be unique and match /^[a-z][a-zA-Z0-9]*$/. */
   params: EffectParamDefinition[];
+  /** Visual controls bind existing keys; project data and animation paths stay the same. */
+  ui?: ParameterWidget[];
   /** Non-empty shader body, at most 65,536 characters. */
   frag: string;
   passes?: number; // 1..8
@@ -222,6 +245,8 @@ export interface TransitionDefinition {
   group?: string;
   /** Same 32-param limit and key restrictions as effects. */
   params: EffectParamDefinition[];
+  /** Visual controls bind existing keys; project data and animation paths stay the same. */
+  ui?: ParameterWidget[];
   frag: string;
   rawShader?: boolean;
 }
@@ -254,6 +279,8 @@ export interface ExtensionLayerDefinition {
   width?: number;
   height?: number;
   params: EffectParamDefinition[];
+  /** Visual controls bind existing keys; project data and animation paths stay the same. */
+  ui?: ParameterWidget[];
   defaults?: JsonObject;
   renderer: {
     kind: 'fragment';
@@ -263,7 +290,112 @@ export interface ExtensionLayerDefinition {
     kind: 'mesh';
     /** Key inside layer `data` containing the durable model asset id. */
     assetField: string;
+  } | {
+    /** Kernel-owned physically based scene renderer; data.scene is validated project source. */
+    kind: 'scene3d';
+  } | {
+    kind: 'layer3d';
+    role: 'object'|'light'|'camera';
   };
+}
+
+export type Scene3DViewportShading='wireframe'|'solid'|'material'|'rendered';
+export type Scene3DViewportTool='tweak'|'box'|'cursor'|'move'|'rotate'|'scale';
+/** Blender viewport state. Preferences persist locally; view, cursor and active object are per composition. */
+export interface Scene3DViewportState {
+  tool:Scene3DViewportTool;
+  orientation:'global'|'local'|'view';
+  pivot:'median'|'individual'|'cursor'|'active'|'bounds';
+  snap:boolean;
+  overlays:boolean;
+  toolbar:boolean;
+  sidebar:boolean;
+  lockCamera:boolean;
+  xray:boolean;
+  shading:Scene3DViewportShading;
+  /** The composition contains 3D layers; the viewport UI is shown only then. */
+  hasScene:boolean;
+  /** Blender keys apply: pointer over the viewer, 3D composition, no 2D layers selected. */
+  inContext:boolean;
+  view:{mode:'camera'|'editor';projection:'perspective'|'orthographic';axis:'front'|'back'|'right'|'left'|'top'|'bottom'|null;label:string;fov:number};
+  cursor:[number,number,number];
+  active:string|null;
+  selected:string[];
+  modal:boolean;
+  hasCamera:boolean;
+  /** Edit Mode: the edited model and its selected/total points. */
+  editMode:{layer:string;selected:number;total:number}|null;
+}
+/** The 3D viewport attached over a composition stage. */
+export interface Scene3DViewportController {
+  update(rect:{x:number;y:number;width:number;height:number},selection?:readonly string[]):void;
+  pointerDown(event:PointerEvent):boolean;
+  objectPress(event:PointerEvent,layerId:string):boolean;
+  hover(clientX:number,clientY:number):boolean;
+  cursorAt(clientX:number,clientY:number):string|null;
+  wheel(event:WheelEvent):boolean;
+  contextMenu(event:MouseEvent):boolean;
+  startTransform(mode:'translate'|'rotate'|'scale'|'trackball'):boolean;
+  armBoxSelect():boolean;
+  armZoomBorder():boolean;
+  startWalk():boolean;
+  extrude():boolean;
+  takeBoxSelect():boolean;
+  modalActive():boolean;
+  pointer():{clientX:number;clientY:number}|null;
+  covers(ids:readonly string[]):boolean;
+  glyphsIn(box:{x0:number;y0:number;x1:number;y1:number}):string[];
+  active():boolean;
+  cancel():void;
+  dispose():void;
+}
+export interface Scene3DViewportAPI {
+  attach(stage:HTMLElement,host:{panComposition(dx:number,dy:number):void;zoomComposition(factor:number,clientX:number,clientY:number):void}):Scene3DViewportController;
+  state():Scene3DViewportState;
+  onChange(listener:(state:Scene3DViewportState)=>void):Disposable;
+  inContext():boolean;
+  readonly operators:readonly string[];
+  /** Run a Blender viewport operator by name, e.g. `view.front`, `transform.translate`, `select.all`. False when it does not apply. */
+  run(operator:string,...args:unknown[]):boolean;
+}
+export interface Scene3DAPI {
+  model(args:{operation:'create_model'|'regenerate_model'|'import_blend';recipe?:unknown;target?:string;name?:string;file?:File;sourceAssetId?:string},meta?:EditMeta):Promise<EditResult>;
+  modelRecipes:ReadonlyArray<{id:string;label:string;parameters:Record<string,string|number>}>;
+  modelFieldsFor(kind:string):Record<string,{label?:string;min?:number;max?:number;step?:number;kind?:string}>;
+  getAutoKey():boolean;
+  setAutoKey(enabled:boolean):void;
+  modelFields:Record<string,{label:string;min?:number;max?:number;step?:number;kind?:string}>;
+  materialPresets:ReadonlyArray<{id:string;label:string}>;
+  createMaterial(preset?:import('../../../shared/blender').BlenderMaterial['preset']):import('../../../shared/blender').BlenderMaterial;
+  materials():Array<{id:string;name:string;users:number;material:any}>;
+  setMaterial(target:string,slot:string,material:any,shared?:boolean):EditResult;
+  getRendering():import('../../../shared/blender').Render3DSettings;
+  setRendering(patch:Partial<import('../../../shared/blender').Render3DSettings>,meta?:EditMeta):EditResult;
+  blenderStatus():Promise<import('../../../shared/blender').BlenderStatus>;
+  chooseBlender():Promise<import('../../../shared/blender').BlenderStatus|null>;
+  previewState():{mode:'draft'|'rendered';busy:boolean;error:string|null;engine:'eevee'|'cycles';shading:Scene3DViewportShading};
+  setPreviewMode(mode:'draft'|'rendered'):void;
+  onPreviewChange(listener:(state:{mode:'draft'|'rendered';busy:boolean;error:string|null;engine:'eevee'|'cycles';shading:Scene3DViewportShading})=>void):Disposable;
+  renderFrame():Promise<void>;
+  cancelRender():Promise<void>;
+  isGroup(layerId:string):boolean;
+  getView():'camera'|'editor';
+  setView(mode:'camera'|'editor'):void;
+  onViewChange(listener:(mode:'camera'|'editor')=>void):Disposable;
+  frame(selected?:boolean):void;
+  /** Blender-style 3D viewport: view, tools, selection, transforms and editor settings. */
+  readonly viewport:Scene3DViewportAPI;
+  /** Pack selected OBJ/MTL/texture files into a durable GLB, or return a standalone model. */
+  prepareImport(files: File[]): Promise<File>;
+  /** Explicit undoable upgrade of a v1 model layer, preserving channels and baking camera animation. */
+  convert(layerId: string): EditResult;
+  createScene(): Scene3D;
+  createObject(id: string,source?: SceneSource,name?: string): SceneObject;
+  createLight(id: string,type?: SceneLight['type'],name?: string): SceneLight;
+  edit(args: Scene3DEdit,meta?: EditMeta): EditResult;
+  describe(layerId?: string): Scene3D|null;
+  selection(): {layerId: string|null;ids: string[]};
+  select(layerId: string|null,ids: string[]): void;
 }
 
 export interface ExtensionLayersAPI {
@@ -610,7 +742,13 @@ export interface InspectorAPI {
   registerSection(section: InspectorSectionDefinition): Disposable;
   sections(): InspectorSectionDefinition[];
 }
-export interface ImportFilesOptions { project?: Project; placement?: ImportPlacement | null; sequence?: boolean; replaceAssetId?: string }
+export interface ImportFilesOptions {
+  project?: Project; placement?: ImportPlacement | null; sequence?: boolean; replaceAssetId?: string;
+  /** Media folder (`project.assetFolders` id) that receives the imported media. */
+  folder?: string | null;
+  /** For a dropped folder: keep it as a media folder of individual files rather than an image sequence. */
+  asFolder?: boolean;
+}
 export interface RuntimeAsset extends AssetRecord { blob?: Blob; sourceText?: string; [key: string]: unknown }
 export interface WaveformOptions { [key: string]: unknown }
 export interface FontCatalog {
@@ -631,9 +769,16 @@ export interface MediaAPI {
   registerImportDefaults(defaults: ImportDefaults): Disposable;
   /** Latest active mod's override, or null for the native import behavior. Returns a Promise when sandboxed. */
   getImportDefaults(): ImportDefaults | null;
-  readonly timing: { isTimed(layer: Layer): boolean; rate(layer: Layer): number; earliestStart(layer: Layer): number };
+  readonly timing: {
+    isTimed(layer: Layer): boolean; rate(layer: Layer): number; earliestStart(layer: Layer): number;
+    /** Content patch keeping the clip's content in place when its In point moves to `nextFrom` (media trim, caption cues); null when untimed. */
+    startPatch(layer: Layer, nextFrom: number): JsonObject | null;
+    /** Content patch for the head of a split at composition time `cut` (caption cues past the cut leave); null when nothing changes. */
+    endPatch(layer: Layer, cut: number): JsonObject | null;
+  };
   /** Requires the full-access permission for Store extensions. */
-  importFiles(files: FileList | File[], options?: ImportFilesOptions): Promise<unknown>;
+  /** Pass a drop's DataTransfer to import dropped folders as well as files. */
+  importFiles(files: FileList | File[] | DataTransfer, options?: ImportFilesOptions): Promise<unknown>;
   commandForAsset(id?: string, at?: number): EditCommand | undefined;
   /** Requires the full-access permission for Store extensions. */
   readonly audio: { drawWaveform(ctx: CanvasRenderingContext2D, layer: Layer, options?: WaveformOptions): boolean };
@@ -796,10 +941,15 @@ export interface ControlBindingOptions {
 }
 
 export interface ControlsAPI {
+  readonly Segmented: Component<{options:{id:string;label:string}[];value:string;onChange:(id:string)=>void;label?:string}>;
   /** Kernel-provided control components; props match src/renderer/src/controls — stable within apiVersion 1. */
   readonly NumField: ControlComponent;
   readonly ColorField: ControlComponent;
   readonly FillField: ControlComponent;
+  readonly RampField: ControlComponent;
+  readonly PointField: ControlComponent;
+  readonly SliderField: ControlComponent;
+  readonly Disclosure: ControlComponent;
   readonly FontField: ControlComponent;
   readonly SelectField: ControlComponent;
   readonly TextField: ControlComponent;
@@ -940,6 +1090,31 @@ export interface ToolService { tool: string; toolShape: string; setTool(tool: st
 export interface ShaderHooks { syncShaderUniforms(layer: Layer): void }
 
 /**
+ * Captions service, registered by the host as `captions`. The timeline and
+ * any panel read and change the cue selection through it and reach the
+ * caption workflows (import, export, generation, inline editing). Cue edits
+ * themselves are ordinary `add_captions` / `edit_captions` commands.
+ */
+export interface CaptionSelection { layerId: string | null; cues: string[] }
+export interface CaptionsService {
+  selection(): CaptionSelection;
+  /** Select cues of one captions layer (also selects the layer); null clears. */
+  select(layerId: string | null, cues: string[]): void;
+  /** Called after the cue selection changes. Returns an unsubscribe. */
+  onChange(listener: () => void): () => void;
+  /** Ask the surface showing the cue to start editing its text in place. */
+  editCue(layerId: string, cueId: string): void;
+  /** The surface that owns inline editing registers here; returns unregister. */
+  onEditRequest(listener: (request: { layerId: string; cueId: string }) => boolean | void): () => void;
+  /** Import an SRT or WebVTT file as a new captions layer. */
+  importFile(file?: File, options?: { at?: number }): Promise<string | null>;
+  /** Export a captions layer as a sidecar file (asks for options when omitted). */
+  exportFile(layerId?: string, format?: 'srt' | 'vtt'): Promise<boolean>;
+  /** Transcribe audio/video layers into a new captions layer. */
+  generate(layerIds?: string[]): Promise<{ ok: boolean; layerId?: string; message?: string }>;
+}
+
+/**
  * Services is a typed LIFO compatibility registry for extension-owned runtime capabilities. Registering the same name shadows the prior implementation; disposing restores it. Registration itself has no project side effects.
  * The host registers `raster` (RenderAPI['raster']). Capture that service before
  * wrapping it; calling api.render.raster from inside its override would recurse.
@@ -966,6 +1141,7 @@ export interface StorageAPI {
 /* ── events ──────────────────────────────────────────────── */
 
 export interface KernelEvents {
+  'scene3d:selection': {layerId: string|null;ids: string[]};
   'inspector:changed': undefined;
   'project:changed': { kind: 'values' | 'structure' | 'project' | 'assets' | 'library' | 'history' | 'replace' };
   selection: Selection;
@@ -1012,7 +1188,7 @@ export interface ExtensionsAPI {
   reveal(id: string): Promise<void>;
   /** Ask the agent to repair a failing extension (opens the agent panel with a prefilled prompt). */
   requestFix(id: string): void;
-  /** Ask the agent to rebase a stale user fork onto its newly shipped built-in. */
+  /** Update a customized built-in locally; offer agent help for unresolved changes. */
   rebase(id: string): void;
   /** Open the sheet where the user enters an extension's declared `vars` values. */
   setUp(id: string): void;
@@ -1094,6 +1270,7 @@ export interface PowermoveAPI {
   readonly effects: EffectsAPI;
   readonly transitions: TransitionsAPI;
   readonly layers: ExtensionLayersAPI;
+  readonly scene3d: Scene3DAPI;
   readonly assets: AssetsAPI;
   readonly theme: ThemeAPI;
   readonly palette: PaletteAPI;

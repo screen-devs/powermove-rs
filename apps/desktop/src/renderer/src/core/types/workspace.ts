@@ -96,6 +96,8 @@ export type GeneratedControlAction =
 interface GeneratedControlBase {
   type: GeneratedControlType;
   label: string;
+  /** Secondary controls appear under More; old panels default to five primary controls. */
+  advanced?: boolean;
   /** normalizeControl deliberately preserves authored extension metadata. */
   [key: string]: unknown;
 }
@@ -228,6 +230,7 @@ interface WorkspaceManifestBase {
   schemaVersion: 1;
   id: string;
   name: string;
+  sourceApp?: 'after-effects' | null;
   density: WorkspaceDensity;
   theme: WorkspaceTheme;
   chrome: WorkspaceChrome;

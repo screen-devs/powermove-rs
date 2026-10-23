@@ -1,6 +1,9 @@
 import type { InspectorService, Layer, PowermoveAPI } from 'powermove';
 
+import EffectsPanel from './EffectsPanel.svelte';
 import InspectorPanel from './InspectorPanel.svelte';
+import { showFxMenu } from './actions';
+import { inspectorSelection } from './multi-edit';
 import {
   clearEffectClipboard,
   copyEffects,
@@ -103,5 +106,28 @@ export default function activate(api: PowermoveAPI): void {
     title: 'Properties',
     component: InspectorPanel as any,
     header: () => {}
+  });
+  /* The applied-effects stack lives in its own dockable panel; the Effects
+     browser (`fxbrowser`) is where new effects are found. */
+  api.panels.register({
+    id: 'layer-effects',
+    icon: 'diamond',
+    title: 'Layer Effects',
+    component: EffectsPanel as any,
+    header: (header) => {
+      const add = document.createElement('button');
+      add.type = 'button';
+      add.className = 'iconbtn panel-action';
+      add.title = 'Add effect';
+      add.setAttribute('aria-label', 'Add effect');
+      add.innerHTML = api.ui.icon('plus');
+      add.addEventListener('click', () => {
+        const layers = api.selection.layers()
+          .map((id) => api.model.layer(id))
+          .filter((layer): layer is Layer => layer !== null);
+        showFxMenu(api, add, inspectorSelection(api, layers)[0]);
+      });
+      header.insertBefore(add, header.querySelector('.panel-options'));
+    }
   });
 }

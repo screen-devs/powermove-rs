@@ -1,4 +1,5 @@
 import { webmTimestampScale } from '../../../../shared/video-timing';
+import { mp4FrameRate } from '../../../../shared/mp4-frame-rate';
 import { createCloudMedia, cloudSourcePaths, readLocalMediaSource } from '../core/cloud-media';
 import { prepareVideoPreview } from '../core/video-preview';
 import { disposeVideoInstances } from '../core/video-instances';
@@ -11,6 +12,7 @@ import {
 import { fontAnchorOffset } from '../core/font-anchor';
 import { animatedGlyphs, isIdentityGlyph, textAnimationKey, textAnimationState } from '../core/text-animation';
 import { glyphLayout, textSourceLines } from '../core/text-layout';
+import { createCaptionRasterizer } from '../../captions/render';
 import { rasterPaths, pathValues, groupMatrix } from '../core/vector-paths';
 import { createVariableFontRenderer, variationEntries, variationSettings } from '../../typography/font-renderer';
 export { variationEntries as textVariationEntries, variationSettings as formatFontVariationSettings } from '../../typography/font-renderer';
@@ -20,6 +22,9 @@ import { cornerRadii, isUniformCircular, roundedRectPath } from './corner-geomet
 /* Ported from js/gl/raster.js — behavior-preserving. */
 import type { PMRegistry } from '../registry';
 import { parseObj } from '../../kernel/obj';
+import { loadGltf,disposeModel } from '../../core/scene3d/import-model';
+import {disposeBlenderFrames} from '../../core/scene3d/rendering';
+import { disposeSceneRuntimes } from '../../core/scene3d/service';
 import { parseSvg } from '../core/svg-import';
 import { inspectorService, viewerService } from '../core/services';
 import { capturePoster } from '../core/poster';
@@ -456,8 +461,55 @@ function rasterShape(d: any, scale: any, crop?: RasterWindow) {
   return { cv, w, h: hh, anchorX: pad, anchorY: pad, selection, uv };
 }
 
+/* ── captions ──────────────────────────────────────────── */
+const captions = createCaptionRasterizer({
+  canvas: getCanvas,
+  font: (style) => fontStr(style),
+  fontReady: (font, text) => {
+    const fonts = window.document.fonts;
+    return typeof fonts?.check !== 'function' || fonts.check(font, text);
+  },
+});
+const captionComp = () => PM.curComp?.() || PM.proj;
+/** The caption showing at `time`, rasterized, or null between cues. */
+function rasterCaptions(L: any, scale: number, time: number, uploaded?: (key: string) => any) {
+  const comp = captionComp();
+  const frame = captions.frame(L.d, time - L.from, comp.w, comp.h);
+  if (!frame) return null;
+  const key = 'cap|' + frame.key + '|' + Math.round(scale * 1000) / 1000;
+  let e = cache.get(key);
+  if (e?.blank && Date.now() >= e.retryAt) { release(key, e); e = null; }
+  if (!e) { const stub = uploaded?.(key); if (stub && !stub.blank) e = stub; }
+  if (!e) {
+    e = captions.draw(frame, scale);
+    e.dirty = true;
+    e.bytes = Math.max(0, Number(e.cv?.width || 0) * Number(e.cv?.height || 0) * 4);
+    if (e.blank) {
+      e.retryAt = Date.now() + BLANK_RETRY_MS;
+      window.setTimeout(() => PM.invalidate?.('render'), BLANK_RETRY_MS + 16);
+      (window.document as any)?.fonts?.ready?.then?.(() => PM.invalidate?.('render'));
+    }
+    cache.set(key, e);
+    cacheBytes += e.bytes;
+    if (PM.Memory?.maintain) PM.Memory.maintain('raster', cache.size > MAX);
+    else evict();
+  }
+  e.used = ++tick;
+  e.key = key;
+  return e;
+}
+/** Selection bounds of a captions layer at `time`, in layer space. */
+PM.captionBounds = (L: any, time: any = PM.time) => {
+  const comp = captionComp();
+  const frame = captions.frame(L.d, time - L.from, comp.w, comp.h);
+  if (!frame) return captions.idleBounds(L.d, comp.w, comp.h);
+  const { x0, y0, x1, y1 } = frame.block;
+  return { x0, y0, x1, y1, w: x1 - x0, h: y1 - y0, ax: 0, ay: 0 };
+};
+
 /** Get (and cache) a rasterized bitmap for a layer. `scale` = render supersample. */
 PM.raster = (L: any, scale: any = 1, time: any = PM.time, uploaded?: (key: string) => any, crop?: RasterWindow) => {
+  if (L.type === 'captions') return rasterCaptions(L, scale, time, uploaded);
   const d = L.type === 'text' ? resolvedTextContent(L, time) : resolveContent(PM, L, time);
   const animation=L.type==='text'&&(L.d.animators?.length||L.d.styles?.length)?textAnimation(L,d,time):null;
   // Above the bitmap dimension limit, different requested zoom densities
@@ -513,6 +565,7 @@ PM.raster = (L: any, scale: any = 1, time: any = PM.time, uploaded?: (key: strin
 };
 PM.rasterStats = () => ({ size: cache.size, bytes: cacheBytes, maxBytes: MAX_BYTES });
 PM.rasterClear = () => {
+  captions.clear();
   textGeometryCache.clear();
   textLayoutCache.clear();
   for (const [key, entry] of [...cache]) release(key, entry);
@@ -531,7 +584,7 @@ function assetKind(file: any) {
   if (mime.startsWith('video/')) return 'video';
   if (PM.Audio && PM.Audio.accepts(file)) return 'audio';
   const ext = mediaExtension(file.name);
-  if (ext === 'obj' || mime === 'model/obj' || mime === 'text/plain+obj') return 'model';
+  if (['obj','glb','gltf','blend'].includes(ext) || ['application/x-blender','model/obj','text/plain+obj','model/gltf-binary','model/gltf+json'].includes(mime)) return 'model';
   if (isImageExtension(ext)) return 'image';
   if (isVideoExtension(ext)) return 'video';
   return null;
@@ -555,6 +608,7 @@ function disposeAsset(a: any) {
     if (disposedAssets.has(a)) return;
     disposedAssets.add(a);
   }
+  if(a?.object3d)disposeModel(a.object3d);
   disposeVideoInstances(a);
   if (a.preview) {
     cancelPreviewVideoSeek(a.preview.el);
@@ -625,6 +679,12 @@ async function prepareAsset({ id, name, kind, blob, meta = {}, onStage }: any) {
   const imageSequence = importedSequences.get(blob) || meta.imageSequence;
   if (kind === 'audio') return PM.Audio.prepareAsset({ id, name, blob, meta });
   if (kind === 'model') {
+    if(/\.blend$/i.test(name)||meta.format==='blend'){if(blob.size>256*1024*1024)throw new Error('Blender sources must be smaller than 256 MB');return {id,name,kind,format:'blend',blob,size:blob.size};}
+    if(blob.size>128*1024*1024)throw new Error('3D models must be smaller than 128 MB');
+    if(/\.(glb|gltf)$/i.test(name) || /^model\/gltf/.test(blob.type)) {
+      const loaded=await loadGltf(blob);
+      return {id,name,kind,format:/\.gltf$/i.test(name)?'gltf':'glb',blob,...loaded,size:blob.size};
+    }
     const sourceText = await blob.text();
     const mesh = parseObj(sourceText);
     return {
@@ -709,6 +769,7 @@ async function prepareAsset({ id, name, kind, blob, meta = {}, onStage }: any) {
       id, name, kind, url, el, storageKey: meta.storageKey,
       w: w || meta.w || 0, h: hh || meta.h || 0,
       dur: dur || meta.dur || 0, size: sourceBlob.size || meta.size || 0,
+      ...(kind === 'video' ? { fps: imageSequence?.fps || meta.fps || await mp4FrameRate(blob) } : {}),
       playbackProxy: playbackProxyUsed,
       playbackProxyVersion,
       ...(kind === 'video' ? { videoTimestampScale: await webmTimestampScale(sourceBlob) } : {}),
@@ -763,6 +824,7 @@ function assetIdentity(id: any, file: any, kind: any, prepared: any, fingerprint
     id, name: file.name, kind, fingerprint, storageKey,
     ...(sourcePath ? { sourcePath } : {}),
     size: prepared.size, dur: prepared.dur, w: prepared.w, h: prepared.h,
+    ...(prepared.fps ? { fps: prepared.fps } : {}),
     channels: prepared.channels || 0, sampleRate: prepared.sampleRate || 0,
     playbackProxy: prepared.playbackProxy === true,
     playbackProxyVersion: Number(prepared.playbackProxyVersion) || 0,
@@ -847,10 +909,11 @@ async function prepareImportedAsset(file: any, { id, assertCurrentProject, resol
   const persisted = persistedResult.value;
   return { prepared, kind, fingerprint, storageKey, sourcePath, persisted };
 }
-async function ingestAsset(file: any, { silent = false, layerDefinition, onStage }: any = {}) {
+async function ingestAsset(file: any, { silent = false, layerDefinition, onStage, assertCurrent, requirePersisted = false, newAsset = false }: any = {}) {
   const targetProject = PM.proj;
   const targetEpoch = assetEpoch;
   const assertCurrentProject = () => {
+    assertCurrent?.();
     if (PM.proj !== targetProject || assetEpoch !== targetEpoch) {
       const error = new Error('Import stopped because you switched projects · import the file again in the intended project');
       (error as any).code = 'STALE_MEDIA_IMPORT';
@@ -861,6 +924,10 @@ async function ingestAsset(file: any, { silent = false, layerDefinition, onStage
   const { prepared, kind, fingerprint, storageKey, sourcePath, persisted } = await prepareImportedAsset(file, {
     id: provisionalId, assertCurrentProject, onStage,
   });
+  if (requirePersisted && !persisted) {
+    disposeAsset(prepared);
+    throw new Error('Could not store imported media; no media was added');
+  }
   let posterBlob: Blob | null = null;
   try {
     posterBlob = await capturePoster(prepared);
@@ -876,7 +943,7 @@ async function ingestAsset(file: any, { silent = false, layerDefinition, onStage
   const { id: _identityId, persisted: _identityPersisted, ...identity } = assetIdentity(
     provisionalId, file, kind, prepared, fingerprint, storageKey, sourcePath, persisted, layerDefinition,
   );
-  const plan = PM.MediaImport.match(PM.proj, PM.assets.map, identity);
+  const plan = newAsset ? { canonicalId: null, aliases: [] } : PM.MediaImport.match(PM.proj, PM.assets.map, identity);
   const existingMeta = plan.canonicalId && PM.proj.assets[plan.canonicalId];
   const existingLive = plan.canonicalId && PM.assets.map.get(plan.canonicalId);
   const wasMissing = !!(existingMeta && !existingLive);
@@ -899,7 +966,8 @@ async function ingestAsset(file: any, { silent = false, layerDefinition, onStage
     if (kind === 'audio' && PM.Audio) PM.Audio.rebalanceCache();
   }
   Object.assign(asset, identity, { id, persisted });
-  PM.proj.assets[id] = { id, ...identity, persisted };
+  // Re-importing media keeps the media folder it was filed in.
+  PM.proj.assets[id] = { id, ...identity, persisted, ...(existingMeta?.folder ? { folder: existingMeta.folder } : {}) };
   if (posterBlob) setPoster(id, posterBlob);
   const relinkedLayers = PM.MediaImport.coalesce(PM.proj, id, plan.aliases);
   plan.aliases.forEach((alias: any) => {
@@ -979,7 +1047,7 @@ PM.assets = {
     }
     return results;
   },
-  async replace(id: any, file: any, { onStage }: any = {}) {
+  async replace(id: any, file: any, { onStage, assertCurrent }: any = {}) {
     const targetProject = PM.proj;
     const targetProjectId = targetProject?.id;
     const targetEpoch = assetEpoch;
@@ -993,6 +1061,7 @@ PM.assets = {
       throw new Error(`Choose ${article} ${currentMeta.kind} file to replace this ${currentMeta.kind} media`);
     }
     const assertCurrentProject = () => {
+      assertCurrent?.();
       if (PM.proj !== targetProject || assetEpoch !== targetEpoch || PM.proj?.assets?.[id] !== currentMeta) {
         const error = new Error('Replacement stopped because you switched projects · replace the file again in the intended project');
         (error as any).code = 'STALE_MEDIA_REPLACEMENT';
@@ -1025,7 +1094,10 @@ PM.assets = {
         catch (error) { }
       }
       assertCurrentProject();
-      const nextMeta = assetIdentity(id, file, kind, prepared, fingerprint, storageKey, sourcePath, true, currentMeta.layerDefinition);
+      const nextMeta = {
+        ...assetIdentity(id, file, kind, prepared, fingerprint, storageKey, sourcePath, true, currentMeta.layerDefinition),
+        ...(currentMeta.folder ? { folder: currentMeta.folder } : {}),
+      };
       Object.assign(prepared, nextMeta);
 
       const applyVersion = (meta: any, runtime: any, poster: Blob | null) => {
@@ -1051,6 +1123,7 @@ PM.assets = {
         PM.autosave?.();
       };
 
+      assertCurrentProject();
       applyVersion(nextMeta, prepared, nextPoster);
       const retainedRuntimes = [...new Set([previousRuntime, prepared].filter(Boolean))];
       retainedRuntimes.forEach(retainHistoryAsset);
@@ -1068,6 +1141,7 @@ PM.assets = {
         retainedRuntimes.forEach(runtime => releaseHistoryAsset(runtime, id));
         throw new Error('Could not add the replacement to Undo history · the original file is unchanged');
       }
+      PM.assets.errors.delete(id);
       if (kind === 'audio' && PM.Audio) PM.Audio.rebalanceCache();
       return { asset: prepared, previous: previousRuntime, previousName: currentMeta.name, meta: nextMeta, persisted: true };
     } catch (error) {
@@ -1079,6 +1153,7 @@ PM.assets = {
   poster: (id: any) => posterUrls.get(String(id)) || '',
   revokePoster,
   clear() {
+    disposeSceneRuntimes(PM);disposeBlenderFrames(PM);
     assetEpoch++;
     cloudMedia.clear();
     for (const [id, a] of PM.assets.map) {
