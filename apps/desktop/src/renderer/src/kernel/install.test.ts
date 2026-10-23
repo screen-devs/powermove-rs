@@ -6,60 +6,9 @@ import { RUNTIME_GLOBAL, runtimeGlobals } from './runtime-globals';
 import { doc } from '../state/document.svelte';
 import { sel } from '../state/selection.svelte';
 import { perf, transport } from '../state/transport.svelte';
+import { fakePM } from './__fixtures__/fake-pm';
 
 type LegacyPM = Record<string, any>;
-
-function fakePM(): LegacyPM {
-  const listeners = new Map<string, Set<(...args: any[]) => void>>();
-  const store: Record<string, unknown> = {};
-  const workspace = { id: 'design', panels: ['viewer'] };
-  const PM: LegacyPM = {
-    proj: { id: 'p', revision: 7, assets: {} },
-    sel: { layers: ['L1'], keys: ['k1', 4], chan: 'position.x' },
-    time: 12,
-    playing: false,
-    PANELS: { viewer: {} },
-    bus: {
-      on: (event: string, fn: (...args: any[]) => void) => {
-        const set = listeners.get(event) ?? new Set();
-        set.add(fn);
-        listeners.set(event, set);
-        return () => void set.delete(fn);
-      },
-      emit: (event: string, ...args: any[]) => listeners.get(event)?.forEach((fn) => fn(...args))
-    },
-    Edit: { apply: vi.fn(() => ({ ok: true, message: 'ok', data: {} })) },
-    hist: { undo: vi.fn(), redo: vi.fn() },
-    Export: { snapshot: vi.fn(async () => 'data:image/jpeg;base64,x') },
-    assets: {
-      add: vi.fn(async (file: File, options: any) => {
-        const asset = { id: 'asset-1', name: file.name, kind: 'model', sourceText: await file.text() };
-        PM.proj.assets[asset.id] = { id: asset.id, name: asset.name, kind: asset.kind, layerDefinition: options?.layerDefinition };
-        return asset;
-      }),
-      get: vi.fn(() => null)
-    },
-    selectLayers: vi.fn(),
-    setTime: vi.fn(),
-    play: vi.fn(),
-    pause: vi.fn(),
-    toast: vi.fn(),
-    menu: vi.fn(),
-    icon: (name: string) => `<svg data-icon="${name}"></svg>`,
-    modal: vi.fn((opts: any) => ({ close: vi.fn(), body: document.createElement('div'), opts })),
-    palette: vi.fn(),
-    cmd: vi.fn(),
-    store: {
-      get: (key: string, fallback: unknown) => store[key] ?? fallback,
-      set: (key: string, value: unknown) => void (store[key] = value)
-    },
-    WS: { current: workspace, mutate: vi.fn((fn: (w: unknown) => void) => fn(workspace)) },
-    Layout: { addPanel: vi.fn(), removePanel: vi.fn(), hasPanel: vi.fn(() => false), refresh: vi.fn() },
-    listeners,
-    store_: store
-  };
-  return PM;
-}
 
 let installed: InstalledKernel | null = null;
 
@@ -395,10 +344,13 @@ describe('installKernel', () => {
     installed = installKernel(PM);
     const api = installed.api('demo');
 
+    // Notices carry the extension that raised them, so the overlay can tell an
+    // extension's alert from the editor's own error.
+    const source = { source: { id: 'demo', name: 'demo' } };
     api.ui.toast('hi');
-    expect(PM.toast).toHaveBeenCalledWith('hi', 2200, {});
+    expect(PM.toast).toHaveBeenCalledWith('hi', 2200, source);
     api.ui.toast('sticky', { sticky: true });
-    expect(PM.toast).toHaveBeenLastCalledWith('sticky', 8000, { sticky: true });
+    expect(PM.toast).toHaveBeenLastCalledWith('sticky', 8000, { sticky: true, ...source });
 
     api.ui.menu({ x: 10, y: 20 }, [{ label: 'A' }]);
     expect(PM.menu).toHaveBeenCalledWith(document.body, [{ label: 'A' }], { x: 10, y: 20 });
@@ -690,4 +642,14 @@ describe('installKernel', () => {
     expect(emit.mock.calls.filter((call) => call[0] === 'layout')).toHaveLength(2);
     expect(PM.Layout.apply).toHaveBeenCalledTimes(2);
   });
+});
+
+
+it('reads durable text assets larger than 64 MB', async () => {
+  const PM = fakePM();
+  PM.proj.assets.large = { id: 'large', name: 'large.obj' };
+  const text = 'x'.repeat(64 * 1024 * 1024) + 'end';
+  PM.MediaStore = { get: vi.fn(async () => new Blob([text])) };
+  installed = installKernel(PM);
+  expect(await installed.api('models').assets.readText('large')).toBe(text);
 });

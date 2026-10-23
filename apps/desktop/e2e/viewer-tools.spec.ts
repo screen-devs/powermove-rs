@@ -1,4 +1,4 @@
-import { expect, test } from './helpers/app';
+import { chooseNativeMenu, inspectNativeMenu, expect, test } from './helpers/app';
 
 async function cleanProject(page: any, name: string) {
   return page.evaluate(async (projectName: string) => {
@@ -25,6 +25,30 @@ async function compositionPoint(page: any, x: number, y: number) {
 }
 
 test.describe('@viewer After Effects tool behavior', () => {
+  test('keeps tool buttons clear of native window drag regions after resizing', async ({ session }) => {
+    await session.openEditor();
+    const { page, app } = session;
+    for (const width of [1280, 980, 1600]) {
+      await app.evaluate(({ BrowserWindow }, nextWidth) => {
+        BrowserWindow.getAllWindows().find(window => !window.isDestroyed())!.setSize(nextWidth, 800);
+      }, width);
+      await expect.poll(() => page.evaluate(() => {
+        const toolbar = document.getElementById('toolbar-strip')!.getBoundingClientRect();
+        return [...document.querySelectorAll('.titlebar-drag')].some(element => {
+          const drag = element.getBoundingClientRect();
+          return drag.left < toolbar.right && drag.right > toolbar.left
+            && drag.top < toolbar.bottom && drag.bottom > toolbar.top;
+        });
+      })).toBe(false);
+      for (const tool of ['text', 'shape', 'hand', 'select']) {
+        await page.locator(`#toolbar button[data-tool="${tool}"]`).click();
+        await expect(page.locator(`#toolbar button[data-tool="${tool}"]`)).toHaveAttribute('aria-pressed', 'true');
+        expect(await page.evaluate(() => (window as any).PM.Kernel.services.get('tool').tool)).toBe(tool);
+      }
+    }
+    expect(session.diagnostics.pageErrors).toEqual([]);
+  });
+
   test('keeps tools distinct from creation commands and draws an undoable shape', async ({ session }) => {
     await session.openEditor();
     const { page } = session;
@@ -35,10 +59,14 @@ test.describe('@viewer After Effects tool behavior', () => {
       buttons.map((button) => button.dataset.tool));
     expect(tools).toEqual(['select', 'hand', 'shape', 'text']);
     await page.locator('#toolbar').screenshot({ path: '/private/tmp/powermove-toolbar.png' });
-    await page.getByRole('button', { name: 'Selection and transform tools', exact: true }).click();
-    await expect(page.getByRole('menuitem', { name: 'Rotation Tool (W)', exact: true })).toBeVisible();
-    await page.screenshot({ path: '/private/tmp/powermove-toolbar-menu.png' });
-    await page.keyboard.press('Escape');
+    const previousTool = await page.evaluate(() => (window as any).PM.Kernel.services.get('tool').tool);
+    const menu = await inspectNativeMenu(session, () =>
+      page.getByRole('button', { name: 'Selection and transform tools', exact: true }).click());
+    expect(menu).toContainEqual({ label: 'Rotation Tool (W)', enabled: true });
+    expect(await page.evaluate(() => (window as any).PM.Kernel.services.get('tool').tool)).toBe(previousTool);
+    await chooseNativeMenu(session, 'Rotation Tool (W)', () =>
+      page.getByRole('button', { name: 'Selection and transform tools', exact: true }).click());
+    await expect(page.locator('#toolbar button[data-tool="rotate"]')).toHaveAttribute('aria-pressed', 'true');
     await page.locator('#toolbar button[data-tool="shape"]').click();
     expect(await page.evaluate(() => { const PM = (window as any).PM; const tool = PM.Kernel.services.get('tool'); return [tool.tool, tool.toolShape]; })).toEqual(['shape', 'rect']);
 
@@ -164,8 +192,8 @@ test.describe('@viewer After Effects tool behavior', () => {
     });
     expect(text).toEqual({ tool: 'text', type: 'text', text: '', position: [120, 80] });
 
-    // Dragging with Type creates an AE-style paragraph box whose dimensions
-    // are ordinary animation channels, not static source metadata.
+    // Dragging with Type creates a wrapping paragraph with automatic height.
+    // Both dimensions remain ordinary animation channels.
     await page.locator('#toolbar button[data-tool="text"]').click();
     const paragraphStart = await compositionPoint(page, 430, 60);
     const paragraphEnd = await compositionPoint(page, 590, 150);
@@ -181,20 +209,20 @@ test.describe('@viewer After Effects tool behavior', () => {
       };
     });
     expect(paragraph).toEqual({
-      type: 'text', position: [430, 60], box: [160, 90],
+      type: 'text', position: [430, 60], box: [160, 0],
       channels: ['c.boxWidth', 'c.boxHeight'],
     });
 
     // Zoom follows the pointer; Space temporarily pans and restores the active tool.
-    await page.getByRole('button', { name: 'Navigation tools', exact: true }).click();
-    await page.getByRole('menuitem', { name: 'Zoom Tool (Z)', exact: true }).click();
+    await chooseNativeMenu(session, 'Zoom Tool (Z)', () =>
+      page.getByRole('button', { name: 'Navigation tools', exact: true }).click());
     const zoomAt = await compositionPoint(page, 160, 90);
     await page.mouse.click(zoomAt.x, zoomAt.y);
     const zoomed = await page.evaluate(() => { const PM = (window as any).PM; const viewer = PM.Kernel.services.get('viewer'); const tool = PM.Kernel.services.get('tool'); return ({ tool: tool.tool, fit: viewer.fit, zoom: viewer.zoom }); });
     expect(zoomed.tool).toBe('zoom'); expect(zoomed.fit).toBe(false); expect(zoomed.zoom).toBeGreaterThan(0);
 
-    await page.getByRole('button', { name: 'Selection and transform tools', exact: true }).click();
-    await page.getByRole('menuitem', { name: 'Selection Tool (V)', exact: true }).click();
+    await chooseNativeMenu(session, 'Selection Tool (V)', () =>
+      page.getByRole('button', { name: 'Selection and transform tools', exact: true }).click());
     await page.mouse.move(zoomAt.x, zoomAt.y);
     await page.keyboard.down('Space');
     await expect(page.locator('#stage-inner')).toHaveCSS('cursor', 'grab');

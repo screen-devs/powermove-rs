@@ -1,5 +1,5 @@
 import { expect } from '@playwright/test';
-import { test } from './helpers/app';
+import { chooseNativeMenu, test } from './helpers/app';
 import type { Page } from '@playwright/test';
 
 async function scaleFixture(page: Page) {
@@ -84,9 +84,8 @@ test('Scale keys move outside the layer, delete together, and never delete their
   expect(await page.evaluate((id) => (window as any).PM.L(id).p['scale.y'].kf.length, id)).toBe(2);
   await page.evaluate(async () => {
     const PM = (window as any).PM;
-    // replaceProject sets fixture data; register its tab as a real open project
-    // before exercising close/reopen instead of reopening the demo tab.
-    PM.Projects.markOpen(PM.proj.id);
+    // replaceProject sets fixture data; this window already owns that document,
+    // so the relaunch below restores it rather than the welcome demo.
     await PM.flushProject();
   });
   await session.relaunch();
@@ -106,8 +105,10 @@ test('the easing grid applies a curve to both Scale dimensions and preserves lin
   const point = await scaleKeyPoint(page, 3);
   await page.mouse.click(point.x, point.y, { button: 'right' });
   const grid = page.locator('[role="menu"].curve-grid');
-  await expect(grid.locator('.curve-option')).toHaveCount(8);
-  await expect(grid.locator('.curve-line')).toHaveCount(8);
+  for (const name of ['Linear', 'Ease in', 'Ease out', 'Easy ease']) {
+    await expect(grid.getByRole('menuitem', { name, exact: true })).toBeVisible();
+  }
+  await expect(grid.locator('.curve-line')).toHaveCount(await grid.locator('.curve-option').count());
   const boxes = await grid.locator('.curve-option').evaluateAll(elements => elements.map(el => {
     const b = el.getBoundingClientRect(); return { x: b.x, y: b.y };
   }));
@@ -459,14 +460,13 @@ test('project rename is available from the tab menu and persists the live docume
   await session.openEditor();
   const { page } = session;
   await scaleFixture(page);
-  const tab = page.locator('#tabs .project-doc.on');
-  const id = await tab.getAttribute('data-tab-id');
-  await tab.click({ button: 'right' });
-  await page.getByRole('menuitem', { name: 'Rename project…' }).click();
+  const chip = page.locator('#tabs .project-doc.on');
+  const id = await chip.getAttribute('data-project-id');
+  await chooseNativeMenu(session, 'Rename Project…', () => chip.click({ button: 'right' }));
   const input = page.getByRole('textbox', { name: 'Rename project', exact: true });
   await input.fill('Renamed composition');
   await input.press('Enter');
-  await expect(tab).toContainText('Renamed composition');
+  await expect(chip).toContainText('Renamed composition');
   await page.evaluate(() => (window as any).PM.flushProject());
   expect(await page.evaluate((id) => (window as any).PM.Projects.get(id).name, id)).toBe('Renamed composition');
   await session.relaunch();
@@ -562,7 +562,7 @@ test('middle-button dragging pans the timeline viewport horizontally', async ({ 
   expect(session.diagnostics.pageErrors).toEqual([]);
 });
 
-test('Shift pressed during a playhead drag snaps live to clip edges and keyframes', async ({ session }) => {
+test('Shift pressed during a playhead drag latches when crossing clip edges and keyframes', async ({ session }) => {
   await session.openEditor();
   const { page } = session;
   await page.waitForFunction(() => { const PM = (window as any).PM; const timeline = PM.Kernel.services.get('timeline'); return Boolean(timeline?.cv); });
@@ -586,8 +586,9 @@ test('Shift pressed during a playhead drag snaps live to clip edges and keyframe
       x: box.x + timeline.gut + raw * timeline.pps,
       y: box.y + timeline.ruler - 6,
       target,
+      crossingX: box.x + timeline.gut + (target + .04) * timeline.pps,
     });
-    return [point(1.93, 2), point(3.33, 3.4), point(4.93, 5)];
+    return [point(1.93, 2), point(3.33, 3.4), point(4.93, 5 - 1 / 30)];
   });
 
   for (const point of points) {
@@ -597,10 +598,13 @@ test('Shift pressed during a playhead drag snaps live to clip edges and keyframe
     expect(Math.abs(raw - point.target)).toBeGreaterThan(0.02);
 
     await page.keyboard.down('Shift');
+    expect(await page.evaluate(() => (window as any).PM.time)).toBeCloseTo(raw, 6);
+    await page.mouse.move(point.crossingX, point.y);
     await expect.poll(() => page.evaluate(() => (window as any).PM.time)).toBeCloseTo(point.target, 6);
 
     await page.keyboard.up('Shift');
-    await expect.poll(() => page.evaluate(() => (window as any).PM.time)).toBeCloseTo(raw, 6);
+    await expect.poll(() => page.evaluate(() => (window as any).PM.Kernel.services.get('timeline').snapGuide)).toBeNull();
+    expect(await page.evaluate(() => (window as any).PM.time)).toBeGreaterThan(point.target);
     await page.mouse.up();
   }
   expect(session.diagnostics.pageErrors).toEqual([]);

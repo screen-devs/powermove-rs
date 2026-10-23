@@ -78,6 +78,19 @@ describe('timeline extension', () => {
     expect(value.api.transport.invalidate).toHaveBeenCalledWith('timeline');
   });
 
+  it('closes selected group hierarchies when M collapses their layer strips', () => {
+    const value = harness();
+    const group = { id: 'group-1', type: 'group', collapsed: false, groupCollapsed: false } as any;
+    value.state.project.layers = [group];
+    value.state.selection.layers = [group.id];
+
+    toggleLayerStrips(value.api);
+
+    expect(group.collapsed).toBe(true);
+    expect(group.groupCollapsed).toBe(true);
+    expect(value.api.uiState.setGroupCollapsed).toHaveBeenCalledWith(group, true);
+  });
+
   it('selects only the new right-hand segments after splitting', () => {
     const value = harness();
     const left = { id: 'left', type: 'solid', name: 'Left', from: 2, dur: 6, d: {}, p: { x: { v: 10, kf: [{ i: 'a', t: 0, v: 10 }, { i: 'b', t: 6, v: 70 }] } } } as any;
@@ -121,6 +134,28 @@ describe('timeline extension', () => {
     expect(vi.mocked(value.api.keybindings.bind).mock.calls[0]?.[0]).not.toHaveProperty('inFields');
   });
 
+  it('uses the M command to close and reopen nested groups with every strip', () => {
+    const value = harness();
+    const layers = [
+      { id: 'outer', type: 'group', collapsed: false, groupCollapsed: false },
+      { id: 'inner', type: 'group', group: 'outer', collapsed: false, groupCollapsed: false },
+      { id: 'child', type: 'solid', group: 'inner', collapsed: false },
+    ] as any[];
+    value.state.project.layers = layers;
+    value.state.selection.layers = [];
+    activate(value);
+    const command = vi.mocked(value.api.commands.register).mock.calls
+      .find(([definition]) => definition.id === 'toggleLayerStrips')![0];
+
+    command.run();
+    expect(layers.map(layer => layer.collapsed)).toEqual([true, true, true]);
+    expect(layers.slice(0, 2).map(layer => layer.groupCollapsed)).toEqual([true, true]);
+
+    command.run();
+    expect(layers.map(layer => layer.collapsed)).toEqual([false, false, false]);
+    expect(layers.slice(0, 2).map(layer => layer.groupCollapsed)).toEqual([false, false]);
+  });
+
   it('owns the property-reveal and adjacent-keyframe command ids', () => {
     const value = harness();
     const layer = { id: 'layer-1', type: 'solid', from: 0, dur: 10, collapsed: true, reveal: null, d: {}, p: { 'position.x': { v: 0, kf: [{ i: 'key-1', t: 2, v: 10 }] } } } as any;
@@ -150,10 +185,31 @@ describe('timeline extension', () => {
     expect(value.api.transport.setTime).toHaveBeenCalledWith(2);
   });
 
+  it.each([{ keys: [] }, { keys: ['selected-key'] }])('reopens a disclosed group while its child remains selected (keys: $keys)', ({ keys }) => {
+    const value = harness();
+    const group = { id: 'group', type: 'group', collapsed: true, groupCollapsed: false, from: 0, dur: 10, d: {}, p: {} };
+    const child = { id: 'child', type: 'solid', group: group.id, collapsed: true, from: 0, dur: 10, d: {}, p: {} };
+    value.state.project.layers = [group, child];
+    value.state.selection.layers = [child.id];
+    vi.mocked(value.api.groups.ancestors).mockImplementation((layer: any) => layer.id === child.id ? [group as any] : []);
+    activate(value);
+    const canvas = build(value).querySelector<HTMLCanvasElement>('#tl-canvas')!;
+    const timeline = value.state.timeline as any;
+    value.emit('selection', value.state.selection);
+    const click = () => pointer(canvas, 64, timeline.ruler + timeline.row / 2);
+    click();
+    expect(group.groupCollapsed).toBe(true);
+    value.state.selection.keys = keys;
+    click();
+    expect(group.groupCollapsed).toBe(false);
+    expect(value.state.selection.layers).toEqual([child.id]);
+    expect(value.state.selection.keys).toEqual([]);
+  });
+
   it('builds the exact canvas skeleton and rebinds the runtime to replacement hosts', () => {
     const value = activate();
     const first = build(value);
-    expect([...first.children].filter((element) => element.tagName !== 'STYLE').map((element) => element.id)).toEqual(['tl-head', 'tl-canvas-wrap']);
+    expect([...first.children].filter((element) => element.tagName !== 'STYLE').map((element) => element.id)).toEqual(['tl-comp-tabs', 'tl-head', 'tl-canvas-wrap']);
     expect(first.querySelector('#tl-canvas-wrap > #tl-canvas')).not.toBeNull();
     expect(value.state.timeline?.cv).toBe(first.querySelector('#tl-canvas'));
 
@@ -321,13 +377,85 @@ describe('timeline extension', () => {
     pointer(canvas, x, y);
     const edge = (): number => side === 'in' ? layer.from : layer.from + layer.dur;
     drag.move(95, 0, { shiftKey: true });
+    expect(edge()).toBeLessThan(value.state.time);
+    expect(timeline.snapGuide).toBeNull();
+    drag.move(102, 0, { shiftKey: true });
     expect(edge()).toBe(value.state.time);
-    drag.move(95, 0, { shiftKey: true });
+    expect(timeline.snapGuide).toBe(value.state.time);
+    drag.move(108, 0, { shiftKey: true });
     expect(edge()).toBe(value.state.time);
     drag.move(95, 0, { shiftKey: false });
     expect(edge()).toBeCloseTo(value.state.time - 1 / 30);
     drag.up();
+    expect(timeline.snapGuide).toBeNull();
     expect(value.api.edit.commit).toHaveBeenCalledExactlyOnceWith('Trim clip');
+  });
+
+  it('Shift-moving a strip snaps its edges to the playhead exactly and holds through the release radius', () => {
+    const value = harness();
+    const layer = { id: 'clip', type: 'solid', name: 'Clip', from: 2, dur: 3, d: {}, p: {} } as any;
+    value.state.project.layers = [layer];
+    value.state.selection.layers = [layer.id];
+    value.state.time = 6;
+    vi.mocked(value.api.edit.dispatch).mockImplementation((command: any) => {
+      if (command.patch.from !== undefined) layer.from = command.patch.from;
+      return { ok: true } as any;
+    });
+    let drag: any;
+    vi.mocked(value.api.ui.drag).mockImplementation((_event: any, handlers: any) => { drag = handlers; return { cancel: vi.fn() }; });
+    activate(value);
+    const canvas = build(value).querySelector<HTMLCanvasElement>('#tl-canvas')!;
+    const timeline = value.state.timeline as any;
+    timeline.pps = 100;
+    timeline.scrollT = 0;
+    timeline.rows = [{ kind: 'layer', L: layer }];
+    pointer(canvas, timeline.gut + 3.5 * timeline.pps, timeline.ruler + timeline.row / 2);
+    // Out edge (5) lands on the playhead (6); the exact delta is not frame-rounded.
+    drag.move(95, 0, { shiftKey: true });
+    expect(layer.from + layer.dur).toBeLessThan(6);
+    expect(timeline.snapGuide).toBeNull();
+    drag.move(102, 0, { shiftKey: true });
+    expect(layer.from + layer.dur).toBe(6);
+    expect(timeline.snapGuide).toBe(6);
+    drag.move(108, 0, { shiftKey: true });
+    expect(layer.from + layer.dur).toBe(6);
+    drag.move(120, 0, { shiftKey: true });
+    expect(layer.from + layer.dur).not.toBe(6);
+    expect(timeline.snapGuide).toBeNull();
+    // Without Shift the move is plain frame snapping.
+    drag.move(95, 0, { shiftKey: false });
+    expect(layer.from * 30).toBeCloseTo(Math.round(layer.from * 30));
+    expect(layer.from).not.toBe(3);
+    drag.up();
+    expect(value.api.edit.commit).toHaveBeenCalledExactlyOnceWith('Move clip');
+  });
+
+  it.each(['move', 'in', 'out'] as const)('expands the selection once for a large %s gesture while respecting locks', (gesture) => {
+    const value = harness();
+    const layers = Array.from({ length: 1000 }, (_, index) => ({
+      id: `clip-${index}`, type: 'solid', name: `Clip ${index}`, from: 2, dur: 3,
+      lock: index === 1, collapsed: true, p: {}, d: {},
+    }));
+    value.state.project.layers = layers;
+    value.state.selection.layers = [layers[0]!.id];
+    vi.mocked(value.api.groups.expand).mockImplementation(() => layers.map(layer => layer.id));
+    vi.mocked(value.api.groups.ancestors).mockImplementation((layer: any) => layer.id === 'clip-2' ? [{ lock: true } as any] : []);
+    activate(value);
+    const canvas = build(value).querySelector<HTMLCanvasElement>('#tl-canvas')!;
+    const timeline = value.state.timeline as any;
+    timeline.rows = [{ kind: 'layer', L: layers[0] }];
+    timeline.pps = 100;
+    timeline.scrollT = 0;
+    const x = timeline.gut + (gesture === 'in' ? 2 : gesture === 'out' ? 5 : 3) * timeline.pps;
+    pointer(canvas, x, timeline.ruler + timeline.row / 2);
+    const drag = vi.mocked(value.api.ui.drag).mock.calls.at(-1)![1];
+    drag.move!(100, 0, { shiftKey: false } as any);
+    const commands = vi.mocked(value.api.edit.dispatch).mock.calls.map(([command]) => command as any);
+    expect(commands.map(command => command.target)).toEqual(layers.filter(layer => !['clip-1', 'clip-2'].includes(layer.id)).map(layer => layer.id));
+    expect(commands[0].patch).toEqual(gesture === 'move' ? { from: 3 } : gesture === 'in' ? { from: 3, duration: 2 } : { duration: 4 });
+    drag.up!({} as any);
+    expect(value.api.edit.commit).toHaveBeenCalledExactlyOnceWith(gesture === 'move' ? 'Move clip' : 'Trim clip');
+    expect(value.api.groups.expand).toHaveBeenCalledTimes(1);
   });
 
   it('releases an external text field when the timeline starts a pointer gesture', () => {
@@ -348,5 +476,25 @@ describe('timeline extension', () => {
     pointer(canvas, timeline.gut + timeline.pps, timeline.ruler + timeline.row / 2, { cancelable: true });
     expect(document.activeElement).not.toBe(composer);
     expect(value.api.ui.drag).toHaveBeenCalledOnce();
+  });
+
+  it.each(['timecode', 'toolbar gutter'])('releases an external text field when the %s starts a pointer gesture', (area) => {
+    const value = harness();
+    vi.mocked(value.api.ui.drag).mockImplementation((event: PointerEvent) => {
+      event.preventDefault();
+      return { cancel: vi.fn() };
+    });
+    activate(value);
+    const body = build(value);
+    const composer = document.createElement('textarea');
+    document.body.append(composer);
+    composer.focus();
+
+    const target = area === 'timecode'
+      ? body.querySelector('#tl-time')!
+      : body.querySelector('#tl-head')!;
+    pointer(target, 0, 0, { bubbles: true, cancelable: true });
+
+    expect(document.activeElement).not.toBe(composer);
   });
 });

@@ -29,6 +29,7 @@ import type {
   ExtensionRecord,
   ExtensionsAPI,
   GroupsAPI,
+  KernelEvents,
   HistoryAPI,
   KeybindingDefinition,
   KeybindingsAPI,
@@ -65,13 +66,32 @@ import type {
 import type { EffectDefinition, EditCommand, EditMeta, EditResult, TransitionDefinition } from './api';
 import type { ExtensionLayerDefinition } from './api';
 import type { Component } from 'svelte';
+import { createSubscriber } from 'svelte/reactivity';
 import { chordOfEvent } from './keychord';
-import { runKernelCommand, type Kernel } from './registries';
+import { ASYNC_CONTRIBUTOR, runKernelCommand, settledWhen, withWhenCheck, type Kernel } from './registries';
 import { mountComponent } from './runtime-globals';
 import { performanceMonitor } from '../runtime/performance-monitor';
+import { extensionLoad } from '../runtime/extension-load';
+import { IMPORT_DEFAULTS_SERVICE, validatedImportDefaults } from './import-defaults';
+import { bridge as hostBridge } from './bridge';
+import { PANEL_FRAME, type PanelFrame } from './panel-frame';
+
+/* Extensions never see the raw bridge (bridge.ts); haptics is the one bit a
+   built-in (the viewer's snapping) needs, so it goes through the API. */
+const HOST_HAPTIC = Object.freeze({
+  alignment(): void {
+    try {
+      hostBridge()?.haptic?.alignment();
+    } catch {
+      // Haptics are a nicety; a missing or failing host changes nothing.
+    }
+  }
+});
 
 export interface PanelsBackend {
   open(id: string, dock?: PanelDock | PanelOpenOptions): void;
+  /** True when the user closed this panel and the workspace remembers it hidden. */
+  isHidden?(id: string): boolean;
   close(id: string): void;
   isOpen(id: string): boolean;
   refresh(id: string): void;
@@ -91,6 +111,7 @@ export interface HostDeps {
     controls: UIAPI['controls'];
     toast: UIAPI['toast'];
     confirm: UIAPI['confirm'];
+    openExternal: UIAPI['openExternal'];
     menu: UIAPI['menu'];
     modal: UIAPI['modal'];
     icon: UIAPI['icon'];
@@ -113,7 +134,7 @@ export interface HostDeps {
   space3d?: Space3DAPI;
   assets: AssetsAPI;
   storage(id: string): StorageAPI;
-  extensions: Omit<ExtensionsAPI, 'fork'> & Partial<Pick<ExtensionsAPI, 'fork'>>;
+  extensions: Omit<ExtensionsAPI, 'fork' | 'setUp'> & Partial<Pick<ExtensionsAPI, 'fork' | 'setUp'>>;
   panelsBackend: PanelsBackend;
   paletteOpen(query?: string): void;
   /** Called for every guarded callback that throws — the loader's error policy hook. */
@@ -125,15 +146,52 @@ export interface ExtensionHandle {
   readonly api: PowermoveAPI;
   /** Release every registration, event handler, and user disposer. */
   disposeAll(): void;
+  /** Marks the window during which activate(api) runs. */
+  setActivating(on: boolean): void;
+  /**
+   * Kernel-only (never on the extension API): register a panel whose body is
+   * docked by `frame` — the sandboxed extension's view iframe. Host chrome
+   * comes from `title`; `header`, `moveSlot`, `headless` and `library.render`
+   * do not exist for this variant.
+   */
+  registerFramePanel(def: FramePanelDefinition, frame: PanelFrame): Disposable;
 }
+
+export type FramePanelDefinition = Pick<PanelDefinition, 'id' | 'title' | 'icon' | 'size' | 'min' | 'flush' | 'noscroll'>;
+
+/* Callbacks the host polls on its own schedule (status text, `when`, menu and
+   palette items) may run inside the host's own $derived. Reactive reads there
+   stay plain, so an extension that never asked for reactivity cannot tie that
+   UI to per-frame events. Shared: one extension's callback may read another's API. */
+let polling = 0;
+const polled = <A extends unknown[], R>(fn: (...args: A) => R) => (...args: A): R => {
+  polling++;
+  try { return fn(...args); } finally { polling--; }
+};
 
 const FALLBACK_MANIFEST = (id: string): ExtensionManifest => ({ id, name: id, version: '0.0.0', apiVersion: 1 });
 
-export function createExtensionAPI(kernel: Kernel, record: ExtensionRecord, deps: HostDeps): ExtensionHandle {
+/** `api.vars` over a frozen copy of the values delivered for one activation. */
+export function createVarsAPI(values: Readonly<Record<string, string>> = {}): import('./api').VarsAPI {
+  const own = new Map(Object.entries(values).filter(([, value]) => typeof value === 'string'));
+  return Object.freeze({
+    get: (key: string) => own.get(key),
+    has: (key: string) => own.has(key),
+    keys: () => [...own.keys()]
+  });
+}
+
+export function createExtensionAPI(
+  kernel: Kernel,
+  record: ExtensionRecord,
+  deps: HostDeps,
+  vars: Readonly<Record<string, string>> = {}
+): ExtensionHandle {
   const id = record.id;
   const manifest = record.manifest ?? FALLBACK_MANIFEST(id);
   const disposers: Array<() => void> = [];
   let disposed = false;
+  let activating = false;
 
   const log = (level: 'info' | 'warn' | 'error', message: string, ...data: unknown[]): void => {
     const line = `[ext:${id}] ${message}`;
@@ -161,10 +219,23 @@ export function createExtensionAPI(kernel: Kernel, record: ExtensionRecord, deps
       } catch (error) {
         return fail(error);
       } finally {
-        if (record.scope !== 'builtin') performanceMonitor.record({ id: `extension:${id}`, name: `${manifest.name} · ${label}`, kind: 'extension' }, performance.now() - start);
+        if (record.scope !== 'builtin') {
+          const elapsed = performance.now() - start;
+          performanceMonitor.record({ id: `extension:${id}`, name: `${manifest.name} · ${label}`, kind: 'extension' }, elapsed);
+          extensionLoad.record(id, elapsed);
+        }
       }
     };
   }
+
+  /* What an extension says is that extension's notice, not the editor's. Stamp
+     its identity last so the toast can name the speaker and keep the message
+     out of the editor's error family, whatever the extension passed. */
+  const extensionUI = {
+    ...(deps.ui as UIAPI),
+    toast: (text: string, opts?: Parameters<UIAPI['toast']>[1]): void =>
+      deps.ui.toast(text, { ...opts, source: { id, name: manifest.name } } as Parameters<UIAPI['toast']>[1])
+  } as UIAPI;
 
   const collect = (disposable: Disposable): Disposable => {
     if (disposed) {
@@ -181,11 +252,24 @@ export function createExtensionAPI(kernel: Kernel, record: ExtensionRecord, deps
     return { dispose: release };
   };
 
+  /* Reactive reads: inside a template, $derived or $effect a read subscribes
+     its reader to the kernel event that changes the value (the first reader
+     subscribes, the last one's teardown unsubscribes); anywhere else it is the
+     plain call it always was. Unguarded on purpose: `time` fires every frame
+     and Svelte's update cannot throw. */
+  const tracked = (event: keyof KernelEvents) => createSubscriber(update => {
+    const off = kernel.events.on(event, update, id);
+    return () => off.dispose();
+  });
+  const reads = { time: tracked('time'), transport: tracked('transport'), selection: tracked('selection'), project: tracked('project:changed'), theme: tracked('theme:changed') };
+  const reactive = <T,>(track: () => void, value: () => T) => (): T => { if (!polling) track(); return value(); };
+
   const extensions: ExtensionsAPI = {
     ...deps.extensions,
     fork: deps.extensions.fork ?? (async () => {
       throw new Error('Forking built-in extensions is unavailable in this host.');
-    })
+    }),
+    setUp: deps.extensions.setUp ?? (() => undefined)
   };
 
   /* ── panels ────────────────────────────────────────────── */
@@ -241,11 +325,46 @@ export function createExtensionAPI(kernel: Kernel, record: ExtensionRecord, deps
     },
     /* The backend merges kernel ids with panels the legacy PM still owns. */
     list: () => deps.panelsBackend.list(),
-    open: (panelId, dock) => deps.panelsBackend.open(panelId, dock),
+    open: (panelId, dock) => {
+      /* Extensions habitually open their panel from activate(), which runs on
+         every launch. If the user closed that panel, their choice wins over the
+         extension's boot-time reveal; explicit opens later (commands, menus)
+         still bring it back. */
+      if (activating && deps.panelsBackend.isHidden?.(panelId)) return;
+      deps.panelsBackend.open(panelId, dock);
+    },
     close: (panelId) => deps.panelsBackend.close(panelId),
     isOpen: (panelId) => deps.panelsBackend.isOpen(panelId),
     refresh: (panelId) => deps.panelsBackend.refresh(panelId)
   };
+
+  function registerFramePanel(def: FramePanelDefinition, frame: PanelFrame): Disposable {
+    if (!def || typeof def.id !== 'string' || !def.id) throw new Error(`[ext:${id}] panels.register requires an id`);
+    /* One live view per panel id, like the component variant: a rebuild
+       (layout refresh, override swap) disposes the previous view first. */
+    let current: { dispose(): void } | null = null;
+    const release = (): void => {
+      const view = current;
+      current = null;
+      view?.dispose();
+    };
+    const panel: PanelDefinition = {
+      id: def.id,
+      title: typeof def.title === 'string' && def.title ? def.title : def.id,
+      ...(typeof def.icon === 'string' ? { icon: def.icon } : {}),
+      ...(typeof def.size === 'number' ? { size: def.size } : {}),
+      ...(typeof def.min === 'number' ? { min: def.min } : {}),
+      ...(def.flush ? { flush: true } : {}),
+      ...(def.noscroll ? { noscroll: true } : {}),
+      build: guard((body: HTMLElement, inst: { spec: Record<string, unknown> }) => {
+        release();
+        current = frame.mount(body, { spec: inst?.spec ?? {} });
+      }, `panel ${def.id} view`, undefined)
+    };
+    Object.defineProperty(panel, PANEL_FRAME, { value: { extensionId: id }, enumerable: true });
+    const registration = kernel.panels.register(id, panel);
+    return collect({ dispose() { registration.dispose(); release(); } });
+  }
 
   /* ── commands ──────────────────────────────────────────── */
 
@@ -255,16 +374,18 @@ export function createExtensionAPI(kernel: Kernel, record: ExtensionRecord, deps
       if (typeof def.run !== 'function') throw new Error(`[ext:${id}] command "${def.id}" requires run()`);
       const run = def.run;
       const when = def.when;
+      const settled = typeof when === 'function' ? settledWhen(guard(polled(() => when()), `command ${def.id} when`, false)) : null;
       const guarded: CommandDefinition = {
         ...def,
         run: guard((...args: unknown[]) => run(...args), `command ${def.id}`, undefined),
-        ...(typeof when === 'function' ? { when: guard(() => when(), `command ${def.id} when`, false) } : {})
+        ...(settled ? { when: settled.when } : {})
       };
-      return collect(kernel.commands.register(id, guarded));
+      return collect(kernel.commands.register(id, settled ? withWhenCheck(guarded, settled.check) : guarded));
     },
     run: (commandId, ...args) => runKernelCommand(kernel, commandId, args),
     has: (commandId) => kernel.commands.has(commandId),
-    list: () => kernel.commands.list()
+    // Every registration path leaves `when` synchronous (settledWhen above; legacy commands are).
+    list: () => kernel.commands.list() as ReturnType<CommandsAPI['list']>
   };
 
   /* ── keybindings ───────────────────────────────────────── */
@@ -307,9 +428,9 @@ export function createExtensionAPI(kernel: Kernel, record: ExtensionRecord, deps
       return collect(kernel.themes.register(id, def));
     },
     activate: (themeId) => kernel.activateTheme(themeId),
-    active: () => kernel.theme.activeId,
+    active: reactive(reads.theme, () => kernel.theme.activeId),
     list: () => kernel.themes.list(),
-    scheme: () => kernel.theme.scheme,
+    scheme: reactive(reads.theme, () => kernel.theme.scheme),
     setScheme: (mode) => kernel.setScheme(mode)
   };
 
@@ -318,19 +439,21 @@ export function createExtensionAPI(kernel: Kernel, record: ExtensionRecord, deps
   const palette: PaletteAPI = {
     registerProvider(provider: PaletteProvider) {
       if (typeof provider !== 'function') throw new Error(`[ext:${id}] palette.registerProvider requires a function`);
-      const guarded = guard((query: string): PaletteEntry[] => provider(query) ?? [], 'palette provider', [] as PaletteEntry[]);
+      const guarded = guard(polled((query: string) => provider(query) ?? []), 'palette provider', [] as PaletteEntry[]);
       return collect(kernel.registerPaletteProvider(id, guarded));
     },
     open: (query) => deps.paletteOpen(query)
   };
 
   const menus: MenusAPI = {
-    contribute(location: MenuLocation, items: (ctx: Record<string, unknown>) => MenuContribution[]) {
+    contribute(location: MenuLocation, items: (ctx: Record<string, unknown>) => MenuContribution[] | Promise<MenuContribution[]>) {
       if (typeof items !== 'function') throw new Error(`[ext:${id}] menus.contribute requires a function`);
-      const guarded = guard((ctx: Record<string, unknown>): MenuContribution[] => items(ctx) ?? [], `menu ${location}`, [] as MenuContribution[]);
-      return collect(kernel.contributeMenu(id, location, guarded));
+      const guarded = guard(polled((ctx: Record<string, unknown>) => items(ctx) ?? []), `menu ${location}`, [] as MenuContribution[]);
+      const async = (items as { [ASYNC_CONTRIBUTOR]?: boolean })[ASYNC_CONTRIBUTOR] === true;
+      return collect(kernel.contributeMenu(id, location, guarded, { async }));
     },
-    collect: (location, ctx) => kernel.collectMenu(location, ctx)
+    collect: (location, ctx) => kernel.collectMenu(location, ctx),
+    gather: async (location, ctx) => kernel.gatherMenu(location, ctx)
   };
 
   const status: StatusAPI = {
@@ -341,7 +464,7 @@ export function createExtensionAPI(kernel: Kernel, record: ExtensionRecord, deps
       const onClick = item.onClick;
       const guarded: StatusItem = {
         ...item,
-        text: guard((): string | null => text(), `status ${item.id}`, null),
+        text: guard(polled((): string | null => text()), `status ${item.id}`, null),
         ...(typeof onClick === 'function' ? { onClick: guard(() => onClick(), `status ${item.id} click`, undefined) } : {})
       };
       return collect(kernel.status.register(id, guarded));
@@ -353,9 +476,21 @@ export function createExtensionAPI(kernel: Kernel, record: ExtensionRecord, deps
 
   const project: ProjectAPI = {
     ...deps.project,
+    latest: reactive(reads.project, () => deps.project.latest()),
+    revision: reactive(reads.project, () => deps.project.revision()),
+    selection: reactive(reads.selection, () => deps.project.selection()),
+    time: reactive(reads.time, () => deps.project.time()),
+    playing: reactive(reads.transport, () => deps.project.playing()),
     apply: (input: EditCommand | EditCommand[], meta?: Omit<EditMeta, 'origin'>): EditResult =>
       deps.project.apply(input, { ...(meta ?? {}), origin: `ext:${id}` } as Omit<EditMeta, 'origin'>)
   };
+
+  /* Accessors (quality, perf, previewResolution) are copied as accessors. */
+  const transport = deps.transport && Object.defineProperties({}, {
+    ...Object.getOwnPropertyDescriptors(deps.transport),
+    time: { value: reactive(reads.time, () => deps.transport!.time()), enumerable: true },
+    playing: { value: reactive(reads.transport, () => deps.transport!.playing()), enumerable: true }
+  }) as TransportAPI;
 
   /* ── events ────────────────────────────────────────────── */
 
@@ -392,13 +527,61 @@ export function createExtensionAPI(kernel: Kernel, record: ExtensionRecord, deps
     model: deps.model as ModelAPI,
     selection: deps.selection as SelectionAPI,
     groups: deps.groups as GroupsAPI,
-    transport: deps.transport as TransportAPI,
+    transport: transport as TransportAPI,
     history: deps.history as HistoryAPI,
     edit: deps.edit as EditAPI,
-    media: deps.media as MediaAPI,
+    media: {
+      ...deps.media as MediaAPI,
+      get fonts() { return deps.media?.fonts as MediaAPI['fonts']; },
+      registerImportDefaults(defaults) {
+        return collect(kernel.services.register(IMPORT_DEFAULTS_SERVICE, validatedImportDefaults(defaults)));
+      },
+      getImportDefaults() {
+        const defaults = kernel.services.get<import('./api').ImportDefaults>(IMPORT_DEFAULTS_SERVICE);
+        return defaults ? validatedImportDefaults(defaults) : null;
+      }
+    },
+    inspector: {
+      registerSection(section) {
+        if (!section || typeof section.id !== 'string' || !section.id || typeof section.title !== 'string'
+          || typeof section.build !== 'function' || (section.when !== undefined && typeof section.when !== 'function')
+          || (section.after !== undefined && !['content', 'transform', 'effects'].includes(section.after))) {
+          throw new Error('inspector.registerSection requires id, title, build and a valid placement.');
+        }
+        const build = section.build;
+        const when = section.when;
+        const mounts = new Set<Disposable>();
+        const registration = kernel.inspectorSections.register(id, {
+          ...section,
+          after: section.after ?? 'transform',
+          ...(when ? { when: guard(polled(when), `inspector ${section.id} visibility`, false) } : {}),
+          build: guard((target, context) => {
+            let cleanup: ReturnType<typeof build>;
+            try { cleanup = build(target, context); }
+            catch (error) { target.replaceChildren(); throw error; }
+            const release = guard(() => {
+              try {
+                if (typeof cleanup === 'function') cleanup();
+                else cleanup?.dispose();
+              } finally { target.replaceChildren(); }
+            }, 'onDispose handler', undefined);
+            const mount = { dispose() {
+              if (mounts.delete(mount)) release();
+            } };
+            mounts.add(mount);
+            return mount;
+          }, `inspector ${section.id}`, undefined)
+        });
+        return collect({ dispose() {
+          registration.dispose();
+          for (const mount of [...mounts]) mount.dispose();
+        } });
+      },
+      sections: () => kernel.inspectorSections.list()
+    },
     render: deps.render as RenderAPI,
     uiState: deps.uiState as UIStateAPI,
-    ui: deps.ui as UIAPI,
+    ui: extensionUI,
     dnd: deps.dnd as DndAPI,
     workspace: deps.workspace as WorkspaceAPI,
     util: deps.util as UtilAPI,
@@ -408,10 +591,12 @@ export function createExtensionAPI(kernel: Kernel, record: ExtensionRecord, deps
     storage: deps.storage(id),
     events,
     extensions,
+    vars: createVarsAPI(vars),
     host: {
       pm: deps.pm,
       state: deps.state,
-      mount: mountComponent
+      mount: mountComponent,
+      haptic: HOST_HAPTIC
     },
     on: events.on,
     log,
@@ -424,6 +609,8 @@ export function createExtensionAPI(kernel: Kernel, record: ExtensionRecord, deps
   return {
     id,
     api,
+    setActivating(on: boolean) { activating = on; },
+    registerFramePanel,
     disposeAll() {
       if (disposed) return;
       disposed = true;

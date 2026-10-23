@@ -7,12 +7,22 @@
 
 export const STATIC_KEYS = [
   'projects',
+  // Projects with a tab in any editor window, in window then tab order, and
+  // each window's tabs for putting the windows back at launch. `openTabs` is
+  // the single-window key they migrate from; it stays registered so an older
+  // profile can still be read once.
+  'openWindows',
+  'windowTabs',
   'openTabs',
+  'restoreWindows',
+  'autoDownloadCloudMedia',
+  'previewMemoryMiB',
   'projectTrash',
   'takes',
   'workspaces',
   'workspace',
   'workspaceTrash',
+  'panelVisibility',
   'theme',
   'themeMode',
   'exportOpts',
@@ -24,18 +34,24 @@ export const STATIC_KEYS = [
   'projectsSort',
   'projectsView',
   'agentScope',
+  'agentPresentation',
+  'agentFloatingPosition',
+  'agentBubblePosition',
   'agentProvider',
   'agentModel',
   'agentReasoningEffort',
   'agentAccessMode',
   'agentAutoApplyPanels',
   'extensions',
-  'activeTheme'
+  'activeTheme',
+  // Powermove Cloud account. Design pass: a local record of the signed-in
+  // user, no credentials. Real sessions will belong in the keychain.
+  'cloudAccount'
 ] as const;
 
 export type StaticKey = (typeof STATIC_KEYS)[number];
 
-export const DYNAMIC_PREFIXES = ['project', 'projectJournal', 'projectState', 'projectMeta', 'projectHistory', 'projectWorkspace', 'agentThreads', 'agentModel', 'ext'] as const;
+export const DYNAMIC_PREFIXES = ['project', 'projectJournal', 'projectState', 'projectMeta', 'projectHistory', 'projectWorkspace', 'agentThreads', 'agentAttachment', 'agentModel', 'ext'] as const;
 export type DynamicPrefix = (typeof DYNAMIC_PREFIXES)[number];
 
 const ID = /^[A-Za-z0-9_-]{1,120}$/;

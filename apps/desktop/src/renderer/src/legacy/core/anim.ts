@@ -12,12 +12,14 @@ try { defaultHandles = Ease.handles('power') || defaultHandles; } catch (e) { }
 
 let version = 0;
 let parentIndexes = new WeakMap<object, any>();
+let staticTransforms = new WeakMap<object, { values: any[]; matrix: number[] }>();
 PM.touch = () => {
   version++;
   PM.ProjectIndex?.invalidateKeyframes?.();
   /* hierarchy memos must never outlive an edit */
   woMemo.clear(); wmMemo.clear(); lmMemo.clear(); memoT = null;
   parentIndexes = new WeakMap();
+  staticTransforms = new WeakMap();
 };
 PM.animVersion = () => version;
 let memoT: any = null;
@@ -36,16 +38,22 @@ function evalKfs(kf: any, t: any, interpolateColor = false) {
   temporalKeys(kf,version);
   const a = kf[lo], b = kf[hi];
   if (a.hold) return a.v;
-  const colors = interpolateColor && /^#[0-9a-f]{6}$/i.test(a.v) && /^#[0-9a-f]{6}$/i.test(b.v);
+  const hexColor = (v: any) => typeof v === 'string' && /^#[0-9a-f]{6}(?:[0-9a-f]{2})?$/i.test(v);
+  const colors = interpolateColor && hexColor(a.v) && hexColor(b.v);
   // Text and toggles remain discrete, including text that looks like a hex color.
   if (!colors && (typeof a.v !== 'number' || !Number.isFinite(a.v) ||
       typeof b.v !== 'number' || !Number.isFinite(b.v))) return a.v;
-  const mix = (amount: number) => colors
-    ? '#' + [1, 3, 5].map(index => {
-      const start = parseInt(a.v.slice(index, index + 2), 16), end = parseInt(b.v.slice(index, index + 2), 16);
-      return Math.round(clamp(start + (end - start) * amount, 0, 255)).toString(16).padStart(2, '0');
-    }).join('')
-    : a.v + (b.v - a.v) * amount;
+  // A key without alpha digits is opaque; alpha is written only while it is below FF.
+  const channel = (v: string, index: number) => index === 7 && v.length === 7 ? 255 : parseInt(v.slice(index, index + 2), 16);
+  const mix = (amount: number) => {
+    if (!colors) return a.v + (b.v - a.v) * amount;
+    const bytes = [1, 3, 5, 7].map(index => {
+      const start = channel(a.v, index), end = channel(b.v, index);
+      return Math.round(clamp(start + (end - start) * amount, 0, 255));
+    });
+    if (bytes[3] === 255) bytes.pop();
+    return '#' + bytes.map(byte => byte.toString(16).padStart(2, '0')).join('');
+  };
   const span = b.t - a.t;
   const u = span <= 0 ? 0 : (t - a.t) / span;
   if (a.spring) {
@@ -207,8 +215,23 @@ function mul(m: any, n: any) {
 }
 PM.mul = mul;
 
+const transformChannels = ['position.x', 'position.y', 'anchor.x', 'anchor.y', 'scale.x', 'scale.y', 'rotation', 'skew'];
 PM.localMatrix = (L: any, T: any) => {
   if (Object.is(memoT, T)) { const cached = lmMemo.get(L); if (cached) return cached; }
+  const previous = staticTransforms.get(L);
+  let isStatic = true, unchanged = !!previous;
+  // Static artwork does not need new trigonometry or matrix allocations every
+  // frame. Check actual values as well as animation flags so direct inspector
+  // writes and property replacement cannot reuse a stale transform.
+  for (let i = 0; i < transformChannels.length; i++) {
+    const prop = L.p[transformChannels[i]!];
+    if (prop?.expr || prop?.kf?.length) { isStatic = false; break; }
+    if (previous && !Object.is(previous.values[i], prop ? prop.v : 0)) unchanged = false;
+  }
+  if (isStatic && unchanged) {
+    if (Object.is(memoT, T)) lmMemo.set(L, previous!.matrix);
+    return previous!.matrix;
+  }
   const px = PM.ev(L, 'position.x', T), py = PM.ev(L, 'position.y', T);
   const ax = PM.ev(L, 'anchor.x', T), ay = PM.ev(L, 'anchor.y', T);
   const sx = PM.ev(L, 'scale.x', T) / 100, sy = PM.ev(L, 'scale.y', T) / 100;
@@ -218,6 +241,8 @@ PM.localMatrix = (L: any, T: any) => {
   // Compose the affine transform directly, without three intermediate matrices per layer.
   const a=c*sx,b=s*sx,cc=(c*sk-s)*sy,d=(s*sk+c)*sy;
   const matrix = [a,b,cc,d,px-a*ax-cc*ay,py-b*ax-d*ay];
+  if (isStatic) staticTransforms.set(L, { matrix, values: transformChannels.map(key => L.p[key] ? L.p[key].v : 0) });
+  else if (previous) staticTransforms.delete(L);
   if (Object.is(memoT, T)) lmMemo.set(L, matrix);
   return matrix;
 };
@@ -293,6 +318,11 @@ PM.transformParentMatrix = (L: any, T: any, parent = parentOf(L)) => {
 
 PM.worldMatrix = (L: any, T: any) => {
   if (Object.is(memoT, T)) { const c = wmMemo.get(L); if (c) return c; }
+  if (!L.parent && !L.group) {
+    const matrix = PM.localMatrix(L, T);
+    if (Object.is(memoT, T)) wmMemo.set(L, matrix);
+    return matrix;
+  }
   const chain: any[] = [];
   let cur = L, hit = false;
   while (cur && chain.length < 256) {
@@ -360,7 +390,11 @@ PM.removeKey = (p: any, k: any) => {
   // A single remaining key evaluates to its value everywhere. Keep that value
   // when its removal turns this channel back into a static property.
   if (p.kf.length && !remaining.length) p.v = p.kf[0].v;
-  p.kf = remaining; PM.touch();
+  p.kf = remaining;
+  // Legacy ease accessors resolve neighbours from the array they were built
+  // for; rebind them so the surviving keys see their new neighbours.
+  temporalKeys(p.kf);
+  PM.touch();
 };
 PM.hasKeyAt = (L: any, p: any, T: any) => p.kf.find((k: any) => Math.abs(k.t - (T - L.from)) < .5 / PM.proj.fps) || null;
 

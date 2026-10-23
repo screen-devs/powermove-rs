@@ -31,6 +31,16 @@ describe('inlineRuns', () => {
     expect(inlineRuns(`[Commons](${wiki}), CC BY`)).toEqual([{ text: 'Commons', href: wiki }, { text: ', CC BY' }]);
     expect(inlineRuns(`See ${wiki}.`)).toEqual([{ text: 'See ' }, { text: wiki, href: wiki }, { text: '.' }]);
   });
+
+  it('links autolinks, titled links, and images without stray markers', () => {
+    expect(inlineRuns('Docs: <https://x.y/a>.')).toEqual([{ text: 'Docs: ' }, { text: 'https://x.y/a', href: 'https://x.y/a' }, { text: '.' }]);
+    expect(inlineRuns('[Guide](https://x.y/g "The guide")')).toEqual([{ text: 'Guide', href: 'https://x.y/g' }]);
+    expect(inlineRuns('![Frame 12](https://x.y/f.png)')).toEqual([{ text: 'Frame 12', href: 'https://x.y/f.png' }]);
+    expect(inlineRuns('![](https://x.y/shots/f.png)')).toEqual([{ text: 'f.png', href: 'https://x.y/shots/f.png' }]);
+    // Targets main will not open (mail, local files) stay readable text.
+    expect(inlineRuns('[mail](mailto:a@b.c)')).toEqual([{ text: 'mail' }]);
+    expect(inlineRuns('[app.ts](/Users/me/app.ts:12)')).toEqual([{ text: 'app.ts' }]);
+  });
 });
 
 describe('blocksFromMarkdown', () => {
@@ -60,4 +70,22 @@ describe('wordsFromRuns', () => {
     const words = wordsFromRuns([{ text: 'a b' }, { text: 'x y', href: 'https://x.y' }]);
     expect(words.map((word) => [word.key, word.text])).toEqual([['0-0', 'a'], ['0-1', ' '], ['0-2', 'b'], ['1', 'x y']]);
   });
+});
+
+ it('keeps inline code in one element and handles escaped delimiters', () => {
+   expect(wordsFromRuns(inlineRuns('`bun run test`'))).toEqual([{text: 'bun run test', c: true, key: '0'}]);
+   expect(inlineRuns('``a `tick` here``')).toEqual([{text: 'a `tick` here', c: true}]);
+   expect(inlineRuns(String.raw`\*literal\*`)).toEqual([{text: '*literal*'}]);
+ });
+
+it('renders aligned tables with escaped pipes and ragged rows', () => {
+  const blocks = blocksFromMarkdown('| Name | Value |\n| :--- | ---: |\n| **Clip** | `ready` |\n| a\\|b |\n\nAfter');
+  expect(blocks[0]).toEqual({ kind: 'table', headers: [[{ text: 'Name' }], [{ text: 'Value' }]],
+    align: ['left', 'right'], rows: [[[{ text: 'Clip', b: true }], [{ text: 'ready', c: true }]], [[{ text: 'a|b' }], []]] });
+  expect(plainText(blocks)).toBe('Name | Value\nClip | ready\na|b | \nAfter');
+  expect(blocksFromMarkdown('a | b\nnot | a table').map(block => block.kind)).toEqual(['p']);
+});
+it('preserves dividers and formats strikethrough', () => {
+  expect(blocksFromMarkdown('Before\n\n---\n\nAfter').map(block => block.kind)).toEqual(['p', 'hr', 'p']);
+  expect(inlineRuns('~~old~~ and ~~**bold**~~')).toEqual([{ text: 'old', s: true }, { text: ' and ' }, { text: 'bold', b: true, s: true }]);
 });

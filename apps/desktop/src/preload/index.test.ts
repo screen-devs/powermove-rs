@@ -4,6 +4,7 @@ import { IPC, type CodexRunRequest, type PowermoveBridge } from '../shared/ipc';
 
 const electronMocks = vi.hoisted(() => ({
   bridge: undefined as PowermoveBridge | undefined,
+  configurable: false,
   invoke: vi.fn(),
   on: vi.fn(),
   removeListener: vi.fn(),
@@ -14,8 +15,13 @@ const electronMocks = vi.hoisted(() => ({
 
 vi.mock('electron', () => ({
   contextBridge: {
-    exposeInMainWorld: vi.fn((_name: string, bridge: PowermoveBridge) => {
-      electronMocks.bridge = bridge;
+    executeInMainWorld: vi.fn(({ func, args }: { func: (value: unknown) => void; args: [PowermoveBridge] }) => {
+      // The page gets a configurable global the renderer kernel can delete.
+      func(args[0]);
+      electronMocks.bridge = (globalThis as unknown as { powermove?: PowermoveBridge }).powermove;
+      const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'powermove');
+      electronMocks.configurable = descriptor?.configurable === true;
+      delete (globalThis as { powermove?: unknown }).powermove;
     })
   },
   ipcRenderer: {
@@ -58,12 +64,24 @@ beforeEach(() => {
 });
 
 describe('preload bridge', () => {
+  it('hands the page a configurable global so the kernel can take it away', () => {
+    expect(electronMocks.configurable).toBe(true);
+    expect(typeof bridge().extensionStore.trust).toBe('function');
+  });
+
   it('forwards built-in extension forks through the dedicated IPC channel', async () => {
     electronMocks.invoke.mockResolvedValue({ id: 'timeline-fork' });
 
     await expect(bridge().extensions.fork({ id: 'timeline' })).resolves.toEqual({ id: 'timeline-fork' });
 
     expect(electronMocks.invoke).toHaveBeenCalledExactlyOnceWith(IPC.extensionFork, { id: 'timeline' });
+  });
+
+  it('writes clipboard text through main and exposes no way to read it', async () => {
+    electronMocks.invoke.mockResolvedValue(undefined);
+    await bridge().clipboardWriteText!('hello');
+    expect(electronMocks.invoke).toHaveBeenCalledExactlyOnceWith(IPC.clipboardWriteText, 'hello');
+    expect(Object.keys(bridge()).filter(key => /clipboard/i.test(key))).toEqual(['clipboardWriteText']);
   });
 
   it('isolates progress and trace by request and removes its one listener after resolve', async () => {
@@ -109,6 +127,14 @@ describe('preload bridge', () => {
     const steering = { id: 'request-1234', prompt: 'Continue with softer edges', images: [] };
     await expect(bridge().codex.steer(steering)).resolves.toEqual({ accepted: true });
     expect(electronMocks.invoke).toHaveBeenCalledExactlyOnceWith(IPC.codexSteer, steering);
+  });
+
+  it('marks a steering replacement cancellation to preserve completed edits', async () => {
+    electronMocks.invoke.mockResolvedValue(undefined);
+    await bridge().codex.cancel('request-1234', true);
+    expect(electronMocks.invoke).toHaveBeenCalledExactlyOnceWith(IPC.codexCancel, {
+      id: 'request-1234', preserveChanges: true
+    });
   });
 
   it('requests a fork rebase prompt over its dedicated IPC channel', async () => {
@@ -187,7 +213,25 @@ describe('preload bridge', () => {
     await bridge().media.createImageSequence([file, file], 24);
     expect(electronMocks.invoke).toHaveBeenNthCalledWith(5, IPC.mediaSequenceCreate, {
       sourcePaths: ['/Users/editor/source.mov', '/Users/editor/source.mov'], fps: 24,
+      requestId: expect.stringMatching(/^sequence-/),
     });
+  });
+
+  it.each([false, true])('isolates image sequence progress and cleans listeners (failure: %s)', async (fails) => {
+    electronMocks.getPathForFile.mockReturnValue('/tmp/f1.png');
+    let resolve!: (value: unknown) => void, reject!: (error: Error) => void;
+    electronMocks.invoke.mockImplementation(() => new Promise((yes, no) => { resolve = yes; reject = no; }));
+    const onProgress = vi.fn();
+    const pending = bridge().media.createImageSequence([{ name: 'f1.png' } as File], 24, onProgress);
+    const requestId = electronMocks.invoke.mock.calls[0]![1].requestId;
+    const listener = electronMocks.on.mock.calls[0]![1];
+    listener({ sender: 'private' }, { requestId: 'another-request', completed: 99 });
+    listener({ sender: 'private' }, { requestId, completed: 1 });
+    expect(onProgress).toHaveBeenCalledExactlyOnceWith(1);
+    if (fails) { reject(new Error('conversion failed')); await expect(pending).rejects.toThrow('conversion failed'); }
+    else { resolve({ ok: true }); await pending; }
+    expect(electronMocks.removeListener).toHaveBeenCalledExactlyOnceWith(IPC.mediaSequenceProgress, listener);
+    electronMocks.invoke.mockReset();
   });
 
   it('sends bytes-only attachments to the dedicated reveal channel', async () => {
@@ -230,6 +274,8 @@ describe('preload bridge', () => {
     electronMocks.invoke.mockResolvedValue(connected);
     await expect(bridge().claude.status()).resolves.toEqual(connected);
     expect(electronMocks.invoke).toHaveBeenCalledWith(IPC.claudeStatus);
+    await expect(bridge().claude.models?.()).resolves.toEqual(connected);
+    expect(electronMocks.invoke).toHaveBeenCalledWith(IPC.claudeModels);
     await expect(bridge().claude.connect()).resolves.toEqual(connected);
     expect(electronMocks.invoke).toHaveBeenCalledWith(IPC.claudeConnect);
     await expect(bridge().claude.disconnect()).resolves.toEqual(connected);

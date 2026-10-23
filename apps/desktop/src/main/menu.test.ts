@@ -76,11 +76,20 @@ describe('application menu', () => {
       'Powermove',
       'File',
       'Edit',
+      'Composition',
       'View',
       'Window'
     ]);
+    // After Effects: ⌘N makes a composition, ⌥⌘N a project.
+    expect(submenu(topLevel(template, 'Composition')).map((item) => [item.label ?? item.type, item.accelerator, item.id])).toEqual([
+      ['New Composition…', 'CommandOrControl+N', 'newComposition'],
+      ['Composition Settings…', 'CommandOrControl+Alt+K', 'compositionSettings'],
+      ['separator', undefined, undefined],
+      ['Pre-compose…', 'CommandOrControl+Shift+C', 'precompose']
+    ]);
 
     const appItems = submenu(topLevel(template, 'Powermove'));
+    const fileItems = submenu(topLevel(template, 'File'));
     expect(appItems.filter((item) => item.role).map((item) => item.role)).toEqual([
       'about',
       'services',
@@ -93,34 +102,47 @@ describe('application menu', () => {
       'Command+Alt+H'
     );
     expect(appItems.find((item) => item.role === 'quit')?.accelerator).toBe('Command+Q');
+    expect(appItems.find((item) => item.id === 'settings')).toMatchObject({ label: 'Settings…', accelerator: 'CommandOrControl+,', registerAccelerator: false });
+    // ⌘W closes the tab; the window has ⇧⌘W.
+    expect(fileItems.find((item) => item.id === 'closeTab')?.accelerator).toBe('CommandOrControl+W');
+    expect(fileItems.find((item) => item.id === 'closeWindow')?.accelerator).toBe('CommandOrControl+Shift+W');
     const replay = appItems.find((item) => item.id === 'replayOnboarding');
     expect(replay).toBeUndefined();
 
-    const fileItems = submenu(topLevel(template, 'File'));
-    expect(fileItems.map((item) => item.label ?? item.type)).toEqual([
+    expect(fileItems.map((item) => item.label ?? item.role ?? item.type)).toEqual([
       'New Project',
+      'New Window',
       'Open Project…',
+      'separator',
+      'Close Tab',
+      'separator',
       'Save Project',
       'Save Project As…',
       'separator',
       'Import Media…',
       'Import Image Sequence…',
       'separator',
-      'Export…'
+      'Export…',
+      'separator',
+      'Close Window'
     ]);
     expect(fileItems.filter((item) => item.click).map((item) => item.accelerator)).toEqual([
-      'CommandOrControl+N',
+      'CommandOrControl+Alt+N',
+      'CommandOrControl+Shift+N',
       'CommandOrControl+O',
+      'CommandOrControl+W',
       'CommandOrControl+S',
       'CommandOrControl+Shift+S',
       'CommandOrControl+I',
       undefined,
-      'CommandOrControl+E'
+      'CommandOrControl+E',
+      'CommandOrControl+Shift+W'
     ]);
     for (const item of fileItems) {
       item.click?.({} as never, undefined, {} as never);
     }
-    expect(sent).toEqual(['newProject', 'open', 'save', 'saveAs', 'import', 'importSequence', 'export']);
+    // Making and closing windows is main's own work, so neither reaches the renderer.
+    expect(sent).toEqual(['newProject', 'open', 'closeTab', 'save', 'saveAs', 'import', 'importSequence', 'export']);
 
     const editItems = submenu(topLevel(template, 'Edit'));
     const undo = editItems.find((item) => item.label === 'Undo');
@@ -138,7 +160,7 @@ describe('application menu', () => {
     undo?.click?.({} as never, undefined, {} as never);
     redo?.click?.({} as never, undefined, {} as never);
     expect(sent).toEqual([
-      'newProject', 'open', 'save', 'saveAs', 'import', 'importSequence', 'export', 'contextUndo', 'contextRedo',
+      'newProject', 'open', 'closeTab', 'save', 'saveAs', 'import', 'importSequence', 'export', 'contextUndo', 'contextRedo',
     ]);
     expect(editItems.filter((item) => item.role)).toEqual([]);
     const contextCommands = editItems.slice(3, 7);
@@ -182,6 +204,43 @@ describe('application menu', () => {
     expect(topLevel(template, 'Window').role).toBe('window');
     expect(submenu(topLevel(template, 'Window')).filter((item) => item.role).map((item) => item.role))
       .toEqual(['minimize', 'zoom', 'front']);
+  });
+
+  it('makes and closes windows in main, and disables both without window actions', () => {
+    const windows = { newWindow: vi.fn(), closeWindow: vi.fn() };
+    const template = appMenuTemplate(() => undefined, windows);
+    const fileItems = submenu(topLevel(template, 'File'));
+    const windowItems = submenu(topLevel(template, 'Window'));
+
+    for (const item of [...fileItems, ...windowItems]) {
+      if (item.label === 'New Window' || item.label === 'Close Window') {
+        expect(item.enabled).toBe(true);
+        item.click?.({} as never, undefined, {} as never);
+      }
+    }
+    // Both File and Window carry New Window, the way macOS document apps do.
+    expect(windows.newWindow).toHaveBeenCalledTimes(2);
+    expect(windows.closeWindow).toHaveBeenCalledTimes(1);
+
+    const unwired = submenu(topLevel(appMenuTemplate(() => undefined), 'File'));
+    expect(unwired.find((item) => item.label === 'New Window')?.enabled).toBe(false);
+    expect(unwired.find((item) => item.label === 'Close Window')?.enabled).toBe(false);
+  });
+
+  it('walks and moves tabs from the Window menu through the renderer', () => {
+    const sent: string[] = [];
+    const template = appMenuTemplate((command) => sent.push(command), { newWindow: vi.fn(), closeWindow: vi.fn() });
+    const windowItems = submenu(topLevel(template, 'Window'));
+    const tabItems = windowItems.filter((item) => ['nextTab', 'previousTab', 'moveTabToNewWindow'].includes(String(item.id)));
+    expect(tabItems.map((item) => [item.label, item.accelerator])).toEqual([
+      ['Show Next Tab', 'Control+Tab'],
+      ['Show Previous Tab', 'Control+Shift+Tab'],
+      ['Move Tab to New Window', undefined]
+    ]);
+    for (const item of tabItems) item.click?.({} as never, undefined, {} as never);
+    expect(sent).toEqual(['nextTab', 'previousTab', 'moveTabToNewWindow']);
+    const unwired = submenu(topLevel(appMenuTemplate(() => undefined), 'Window'));
+    expect(unwired.find((item) => item.id === 'moveTabToNewWindow')?.enabled).toBe(false);
   });
 
   it('includes development view tools only in unpackaged builds', () => {

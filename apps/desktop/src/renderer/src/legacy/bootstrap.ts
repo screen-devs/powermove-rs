@@ -7,6 +7,9 @@ import { installShell } from '../shell/install';
 import { installSvelteLayout } from '../layout/install';
 import { installSvelteOverlays } from '../overlays/install';
 import { installForkUpdates } from '../shell/fork-updates';
+import { installExtensionUpdateNotices } from '../shell/extension-update-notices';
+import { installAppUpdates } from '../shell/app-updates';
+import { installWhatsNew } from '../shell/whats-new';
 
 import { BUILTIN_EXTENSIONS } from '../kernel/builtins';
 import { bootExtensions, installKernel } from '../kernel/install';
@@ -45,6 +48,9 @@ import { install as installSpatial } from './assistant/spatial';
 import { install as installProjectsUi } from './ui/projects';
 import { install as installApp } from './app';
 import { install as installSettingsUi } from '../settings/install';
+import { install as installStoreUi } from '../store/install';
+import { installCloudAccount } from '../cloud/account';
+import { installVars } from '../vars/setup';
 
 declare global {
   interface Window {
@@ -65,8 +71,9 @@ const INSTALLS: Array<[string, (PM: PMRegistry) => void]> = [
      for `PM.bus` and `PM.store`. */
   ['kernel', (PM) => void installKernel(PM)],
   ['core/ui-state', installUiState],
-  ['core/memory', installMemory],
   ['host/electron-shim', installElectronShim],
+  // Restore memory preferences from the native store before caches register.
+  ['core/memory', installMemory],
   ['core/fonts', installFonts],
   ['core/easing', installEasing],
   ['core/model', installModel],
@@ -100,14 +107,20 @@ const INSTALLS: Array<[string, (PM: PMRegistry) => void]> = [
   ['layout/svelte', installSvelteLayout],
   ['overlays/svelte', installSvelteOverlays],
   ['shell/fork-updates', (PM) => void installForkUpdates(PM)],
+  ['shell/app-updates', (PM) => void installAppUpdates(PM)],
+  ['shell/extension-update-notices', (PM) => void installExtensionUpdateNotices(PM)],
   ['runtime/bridge', installLegacyRuntime],
   ['panels/svelte', installSveltePanels],
   ['app', installApp],
   /* Settings reads PM.theme and PM.exportDefaults, which the app install owns. */
   ['ui/settings', installSettingsUi],
+  ['ui/store', installStoreUi],
+  ['cloud/account', installCloudAccount],
+  ['vars', installVars],
+  ['shell/whats-new', (PM) => void installWhatsNew(PM)],
   /* Extensions load last: every kernel registry is populated and the whole
      legacy UI is mounted, so an extension can override any of it. */
-  ['kernel/boot', (PM) => void bootExtensions(PM.Kernel, BUILTIN_EXTENSIONS).catch((error) => console.error('[kernel] boot failed', error))]
+  ['kernel/boot', (PM) => void bootExtensions(PM.Kernel, BUILTIN_EXTENSIONS).then(() => PM.Kernel.events.emit('extensions:ready', {})).catch((error) => console.error('[kernel] boot failed', error))]
 ];
 
 for (const [name, install] of INSTALLS) {

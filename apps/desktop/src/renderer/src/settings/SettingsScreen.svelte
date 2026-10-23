@@ -1,5 +1,6 @@
 <script lang="ts">
   import { tick } from 'svelte';
+  import { AGENT_FEATURES } from '../panels/agent-features';
   import Icon from '../panels/Icon.svelte';
   import { createChatGPTSettingsControl, createClaudeSettingsControl } from '../legacy/ui/chatgpt-settings';
   import { createCompatibleSettingsControl } from '../legacy/ui/compatible-settings';
@@ -7,6 +8,8 @@
   import { createProjectSettingsControl, type ProjectSettingsBridge } from '../legacy/ui/project-settings';
   import { mountSquircles } from './squircle';
   import { clearSettingsSearch, searchSettings } from './search';
+  import Avatar from '../cloud/Avatar.svelte';
+  import { applyAccount, cloudBridge, openSignIn, signOut, subscribeAccount, type CloudUser } from '../cloud/account';
 
   export type SettingsPage = 'general' | 'accounts' | 'extensions' | 'project';
 
@@ -21,17 +24,17 @@
 
   const NAV: NavGroup[] = [
     {
+      title: 'Project',
+      items: [
+        { id: 'project', label: 'Project', icon: 'frame' }
+      ]
+    },
+    {
       title: 'App',
       items: [
         { id: 'general', label: 'General', icon: 'gear' },
         { id: 'accounts', label: 'Accounts', icon: 'link' },
         { id: 'extensions', label: 'Extensions', icon: 'puzzle' }
-      ]
-    },
-    {
-      title: 'Project',
-      items: [
-        { id: 'project', label: 'Project', icon: 'frame' }
       ]
     }
   ];
@@ -56,6 +59,13 @@
   let searchText = $state('');
   const query = $derived(searchText.trim().toLowerCase());
   let themeMode = $state<string>('system');
+  let agentPresentation = $state<'floating' | 'docked'>('docked');
+  /* Reopening last session's windows is the default; the store only ever holds
+     the opt-out, so an untouched profile needs no migration. */
+  let restoreWindows = $state(true);
+  let autoDownloadCloudMedia = $state(false);
+  let previewMemoryMiB = $state(256);
+  const multiWindow = $derived(!!PM.windows?.supported);
   let controls = $state.raw<Controls | null>(null);
   let rootEl = $state<HTMLElement | null>(null);
   let scrollEl = $state<HTMLElement | null>(null);
@@ -63,6 +73,17 @@
   let matchedPages = $state<string[]>([]);
   let matchCount = $state(0);
   let lastFocus: HTMLElement | null = null;
+  let account = $state<CloudUser | null>(null);
+  let rememberInstalls = $state(true);
+  let accountBusy = $state(false);
+  $effect(() => subscribeAccount((user, me) => {
+    account = user;
+    rememberInstalls = me?.settings.rememberInstalls ?? true;
+  }));
+
+  $effect(() => PM.bus?.on?.('agent:presentation', () => {
+    agentPresentation = PM.AgentShell?.getPreference?.() ?? 'docked';
+  }));
 
   const hasProject = $derived(!!controls?.project);
   const groups = $derived(NAV
@@ -116,9 +137,11 @@
   export function open(target?: SettingsPage): void {
     build();
     themeMode = PM.theme?.mode ?? 'system';
-    /* Every entry point lands on the page it asked for; a plain open() starts
-       at General, the way the old dialog did. */
-    const wanted = target ?? 'general';
+    agentPresentation = PM.AgentShell?.getPreference?.() ?? 'docked';
+    restoreWindows = PM.store?.get?.('restoreWindows', true) !== false;
+    autoDownloadCloudMedia = PM.store?.get?.('autoDownloadCloudMedia', false) === true;
+    previewMemoryMiB = (PM.Memory?.budget?.('preview') ?? 256 * 1024 * 1024) / (1024 * 1024);
+    const wanted = target ?? (controls?.project ? 'project' : 'general');
     const destination = wanted === 'project' && !controls?.project ? 'general' : wanted;
     page = destination;
     searchText = '';
@@ -249,9 +272,58 @@
     PM.theme?.apply?.(value);
   }
 
+  function applyAgentPresentation(event: Event): void {
+    const next = (event.currentTarget as HTMLSelectElement).value;
+    if (next !== 'floating' && next !== 'docked') return;
+    agentPresentation = next;
+    PM.AgentShell?.setMode?.(next);
+  }
+
+  /* Account actions run in main; failures come back as results, never throws. */
+  async function toggleRememberInstalls(): Promise<void> {
+    const bridge = cloudBridge();
+    if (!bridge || accountBusy) return;
+    const next = !rememberInstalls;
+    rememberInstalls = next;
+    accountBusy = true;
+    try {
+      const result = await bridge.setRememberInstalls({ value: next });
+      if (result.ok) applyAccount(result.value);
+      else throw new Error(result.error.error);
+    } catch {
+      rememberInstalls = !next;
+      PM.toast?.('Unable to change this setting. Check your connection and try again.', 4000, { error: true });
+    } finally {
+      accountBusy = false;
+    }
+  }
+
+  async function deleteAccount(): Promise<void> {
+    const bridge = cloudBridge();
+    if (!bridge || accountBusy) return;
+    accountBusy = true;
+    try {
+      const result = await bridge.deleteAccount();
+      if (!result.ok) throw new Error(result.error.error);
+      if (result.value.deleted) {
+        applyAccount(null);
+        PM.toast?.('Your account was deleted.', 3000, { kind: 'status' });
+      }
+    } catch {
+      PM.toast?.('Unable to delete your account. Check your connection and try again.', 5000, { error: true });
+    } finally {
+      accountBusy = false;
+    }
+  }
+
+  function toggleRestoreWindows(): void {
+    restoreWindows = !restoreWindows;
+    PM.store?.set?.('restoreWindows', restoreWindows);
+  }
+
   function keydown(event: KeyboardEvent): void {
     event.stopPropagation();
-    if (event.key === 'Escape') {
+    if (event.key === 'Escape' || ((event.metaKey || event.ctrlKey) && event.key === ',' && !event.shiftKey && !event.altKey)) {
       event.preventDefault();
       close();
     }
@@ -325,6 +397,9 @@
   </aside>
 
   <main class="sg-main">
+    <div class="sg-actions">
+      <button class="btn" type="button" onclick={close}>Done</button>
+    </div>
     <div class="sg-scroll" bind:this={scrollEl} onscroll={syncSection}>
       {#if query}
         <p class="sg-search-results" role="status">
@@ -344,7 +419,7 @@
             {#if item.id === 'general'}
               <header class="sg-heading">
                 <h2>General</h2>
-                <p>How Powermove looks on this Mac.</p>
+                <p>How Powermove looks and works on this Mac.</p>
               </header>
               <section class="sg-section">
                 <h3 class="sg-section-title">Appearance</h3>
@@ -362,11 +437,135 @@
                   </div>
                 </div>
               </section>
+              <section class="sg-section">
+                <h3 class="sg-section-title">Playback</h3>
+                <div class="sg-group">
+                  <div class="settings-row">
+                    <div class="settings-copy">
+                      <b>Preview memory limit</b>
+                      <span>Remember played sections for smoother replay. A higher limit remembers more in this window.</span>
+                    </div>
+                    <select class="settings-select" aria-label="Preview memory limit" value={previewMemoryMiB}
+                      onchange={(event) => {
+                        previewMemoryMiB = Number(event.currentTarget.value);
+                        PM.Memory.setBudget('preview', previewMemoryMiB * 1024 * 1024);
+                        PM.store?.set?.('previewMemoryMiB', previewMemoryMiB);
+                      }}>
+                      <option value={0}>Off</option>
+                      <option value={128}>128 MB</option>
+                      <option value={256}>256 MB</option>
+                      <option value={512}>512 MB</option>
+                      <option value={1024}>1 GB</option>
+                      <option value={2048}>2 GB</option>
+                    </select>
+                  </div>
+                </div>
+              </section>
+              {#if AGENT_FEATURES.floating}
+              <section class="sg-section">
+                <h3 class="sg-section-title">Agent</h3>
+                <div class="sg-group">
+                  <div class="settings-row">
+                    <div class="settings-copy">
+                      <b>Agent presentation</b>
+                      <span>Keep the agent in a movable chat or in the editor dock.</span>
+                    </div>
+                    <select class="settings-select" aria-label="Agent presentation" value={agentPresentation} onchange={applyAgentPresentation}>
+                      <option value="floating">Floating</option>
+                      <option value="docked">Docked</option>
+                    </select>
+                  </div>
+                </div>
+              </section>
+              {/if}
+              <section class="sg-section">
+                <h3 class="sg-section-title">Media</h3>
+                <div class="sg-group">
+                  <div class="settings-row">
+                    <div class="settings-copy">
+                      <b>Automatically download cloud media</b>
+                      <span>Download offloaded files when opening a project.</span>
+                    </div>
+                    <button class="toggle" class:on={autoDownloadCloudMedia} type="button" aria-pressed={autoDownloadCloudMedia} aria-label="Automatically download cloud media"
+                      onclick={() => { autoDownloadCloudMedia = !autoDownloadCloudMedia; PM.store?.set?.('autoDownloadCloudMedia', autoDownloadCloudMedia); }}
+                    ><i aria-hidden="true"></i></button>
+                  </div>
+                </div>
+              </section>
+              {#if multiWindow}
+                <section class="sg-section">
+                  <h3 class="sg-section-title">Windows</h3>
+                  <div class="sg-group">
+                    <div class="settings-row">
+                      <div class="settings-copy">
+                        <b>Reopen windows on launch</b>
+                        <span>Start Powermove with the projects that had a window when you quit. Off, it opens one window.</span>
+                      </div>
+                      <button
+                        class="toggle"
+                        class:on={restoreWindows}
+                        type="button"
+                        aria-pressed={restoreWindows}
+                        aria-label="Reopen windows on launch"
+                        onclick={toggleRestoreWindows}
+                      ><i aria-hidden="true"></i></button>
+                    </div>
+                  </div>
+                </section>
+              {/if}
             {:else if item.id === 'accounts'}
               <header class="sg-heading">
                 <h2>Accounts</h2>
-                <p>Sign in with a subscription, or connect an API or local model.</p>
+                <p>Your Powermove account, and the models your agent works with.</p>
               </header>
+              <section class="sg-section">
+                <h3 class="sg-section-title">Powermove</h3>
+                <div class="sg-group">
+                  {#if account}
+                    <div class="settings-row acct-profile">
+                      <Avatar user={account} size={32} />
+                      <div class="settings-copy">
+                        <b>{account.handle ? `@${account.handle}` : account.email}</b>
+                        {#if account.handle}<span>{account.email}</span>{/if}
+                      </div>
+                      {#if !account.handle}
+                        <button class="btn" type="button" onclick={() => openSignIn()}>Choose Handle…</button>
+                      {/if}
+                      <button class="btn" type="button" onclick={() => void signOut()}>Sign Out</button>
+                    </div>
+                    <div class="settings-row">
+                      <div class="settings-copy">
+                        <b>Remember installs on this account</b>
+                        <span>Keep a list of the extensions you install from the Store. Turning this off deletes the list.</span>
+                      </div>
+                      <button
+                        class="toggle"
+                        class:on={rememberInstalls}
+                        type="button"
+                        aria-pressed={rememberInstalls}
+                        aria-label="Remember installs on this account"
+                        disabled={accountBusy}
+                        onclick={() => void toggleRememberInstalls()}
+                      ><i aria-hidden="true"></i></button>
+                    </div>
+                    <div class="settings-row">
+                      <div class="settings-copy">
+                        <b>Delete account</b>
+                        <span>Your published extensions stay on the Store under your handle.</span>
+                      </div>
+                      <button class="btn acct-delete" type="button" disabled={accountBusy} onclick={() => void deleteAccount()}>Delete Account…</button>
+                    </div>
+                  {:else}
+                    <div class="settings-row">
+                      <div class="settings-copy">
+                        <b>Powermove account</b>
+                        <span>Publish and manage your extensions on the Store.</span>
+                      </div>
+                      <button class="btn" type="button" onclick={() => openSignIn()}>Sign In…</button>
+                    </div>
+                  {/if}
+                </div>
+              </section>
               <section class="sg-section">
                 <h3 class="sg-section-title">Subscriptions</h3>
                 <div class="sg-group" use:host={[controls?.chatgpt.element, controls?.claude.element]}></div>

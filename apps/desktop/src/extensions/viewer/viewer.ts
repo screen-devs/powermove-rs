@@ -10,11 +10,11 @@ export function visualSelection(api: PowermoveAPI): any[] {
 export function selectionOutlineColor(project: any): string {
   const fill = project.backgroundFill;
   const color = fill?.type !== 'none' && fill?.stops?.[0]?.color || project.bg || '#000000';
-  const hex = /^#[0-9a-f]{6}$/i.test(color) ? color.slice(1) : '000000';
+  const hex = /^#[0-9a-f]{6}(?:[0-9a-f]{2})?$/i.test(color) ? color.slice(1, 7) : '000000';
   return '#' + [0, 2, 4].map(i => (255 - parseInt(hex.slice(i, i + 2), 16)).toString(16).padStart(2, '0')).join('');
 }
 
-import { editCanvasText } from './canvas-text';
+import { beginTextEdit, type TextEditOptions, type TextEditSession } from './text-editor';
 import { drawEditablePaths, startPathEdit } from './path-editing';
 /* Ported from js/ui/viewer.js — behavior-preserving. */
 export const viewerPanelOptions = {
@@ -32,6 +32,48 @@ export function previewRenderSize(width: number, height: number, zoom: number, d
     height: Math.max(2, Math.round(safeHeight * scale)),
     scale,
   };
+}
+
+/** Effects may use the cropped viewer only when their shader has opted into
+ * the viewport coordinate contract. Unknown effects stay on the full-frame
+ * path so extensions do not silently change their visual result. */
+export function effectViewportSafe(api: PowermoveAPI, layer: any, time: number): boolean {
+  for (const effect of layer?.fx || []) {
+    const enabled = effect?.on === false ? false
+      : effect?.on && typeof effect.on === 'object'
+        ? (api.anim.evP?.(layer, effect.on, time, `${effect.id}.$enabled`) ?? effect.on.v) !== false
+        : true;
+    if (!enabled) continue;
+    if (api.effects?.get?.(effect.type)?.viewportSafe !== true) return false;
+  }
+  return true;
+}
+
+/** Return the largest source radius required by viewport-safe effects, in
+ * effect parameter pixels. The viewer converts it to CSS pixels before
+ * adding it to the overscan. */
+export function effectViewportPadding(api: PowermoveAPI, project: any, time: number): number {
+  let padding = 0;
+  for (const layer of project?.layers || []) {
+    for (const effect of layer?.fx || []) {
+      const enabled = effect?.on === false ? false
+        : effect?.on && typeof effect.on === 'object'
+          ? (api.anim.evP?.(layer, effect.on, time, `${effect.id}.$enabled`) ?? effect.on.v) !== false
+          : true;
+      if (!enabled) continue;
+      const definition = api.effects?.get?.(effect.type);
+      if (!definition || definition.viewportSafe !== true) continue;
+      for (const key of definition.viewportPadding || []) {
+        const prop = effect.p?.[key];
+        const value = prop && typeof prop === 'object'
+          ? (api.anim.evP?.(layer, prop, time, `${effect.id}.${key}`) ?? prop.v)
+          : prop;
+        const numeric = Number(value);
+        if (Number.isFinite(numeric)) padding = Math.max(padding, Math.abs(numeric));
+      }
+    }
+  }
+  return padding;
 }
 
 export type PreviewViewport = {
@@ -269,8 +311,10 @@ const VIEWER_RUNTIME_TOKEN = Symbol('powermove.viewer.runtime');
 type ViewerRuntime = ViewerService & {
   dispose(): void;
   activePath: string | null;
-  finishCanvasText?: ((cancel?: boolean) => void) | null;
+  finishCanvasText?: (() => void) | null;
   textSelection?: { layer: string; start: number; end: number } | null;
+  textSession?: TextEditSession | null;
+  editText?(layer: any, options?: Omit<TextEditOptions, 'drag' | 'onFinish'>): TextEditSession | null;
   requestOverlay?(): void;
   inner: HTMLElement;
   _runtimeToken?: symbol | null;
@@ -603,6 +647,31 @@ export function layerContainsPoint(api: PowermoveAPI, L: any, x: number, y: numb
   return space3d.planeContains(L, T, x, y, b);
 }
 
+/** Figma-style click target. A hit inside groups selects the outermost group
+    the selection has not entered yet; once a member is selected its siblings
+    become directly selectable. Deep (Cmd/Ctrl) always targets the hit leaf. */
+export function resolvePickTarget(api: PowermoveAPI, hit: any, options: { deep?: boolean } = {}): any | null {
+  if (!hit || options.deep) return hit ?? null;
+  const entered = new Set<string>();
+  for (const layer of visualSelection(api)) {
+    for (const group of api.groups.ancestors(layer) || []) entered.add(group.id);
+  }
+  const outermostFirst = [...(api.groups.ancestors(hit) || [])].reverse();
+  return outermostFirst.find((group: any) => !entered.has(group.id)) ?? hit;
+}
+
+/** Double-click descends one level: the child of the deepest selected group
+    that contains the hit, or null when the selection is not above the hit. */
+export function drillTarget(api: PowermoveAPI, hit: any): any | null {
+  if (!hit) return null;
+  const chain = [...(api.groups.ancestors(hit) || [])].reverse();
+  chain.push(hit);
+  const selected = new Set(api.selection.layers());
+  let index = -1;
+  chain.forEach((layer: any, i: number) => { if (selected.has(layer.id)) index = i; });
+  return index >= 0 && index < chain.length - 1 ? chain[index + 1] : null;
+}
+
 /** Text editing follows the visible selection before the topmost pixel pick.
     This keeps a selected title editable even when a full-frame adjustment or
     overlay layer sits above it in the render stack. */
@@ -620,7 +689,12 @@ export function editableTextAtPoint(api: PowermoveAPI, x: number, y: number, T: 
 export function createViewerRuntime(api: PowermoveAPI, space3d: Space3DAPI = api.space3d): ViewerRuntime {
 const existing = api.services.get<ViewerRuntime>('viewer') ?? (retainedServices === api.services ? retainedRuntime : null);
 if (existing?._runtimeToken === VIEWER_RUNTIME_TOKEN) return existing;
-const existingStage = existing?.stage as HTMLElement | undefined;
+// Extension reload removes the service before activation, and a hot module
+// update also clears module-local retention. The renderer still owns its live
+// canvas: recover that surface instead of displaying a new, unrendered one.
+const renderingCanvas = api.render.gl.context?.canvas;
+const existingStage = (existing?.stage ??
+  (renderingCanvas && 'closest' in renderingCanvas ? renderingCanvas.closest('#stage') : null)) as HTMLElement | undefined;
 existing?._disposeRuntime?.();
 const clamp = api.util.clamp;
 
@@ -645,6 +719,8 @@ const refreshInspector = () => api.services.get<InspectorService>('inspector')?.
 const selectLayers = (ids: string | string[], add = false) => api.selection.select(Array.isArray(ids) ? ids : [ids], add);
 const invalidate = (what?: string) => { api.transport.invalidate(what); schedulePresentation(); };
 V.requestOverlay = schedulePresentation;
+V.hoverLayerId = () => hoverId;
+V.editText = (layer: any, options: Omit<TextEditOptions, 'drag' | 'onFinish'> = {}) => openTextEditor(layer, options);
 let disposed = false;
 let unbindStage: (() => void) | null = null;
 let resizeObserver: ResizeObserver | null = null;
@@ -655,16 +731,39 @@ let visibleRegion: { x: number; y: number; right: number; bottom: number } | nul
 let zoomGestureUntil = 0;
 let navigationUntil = 0;
 let presentationFrame = 0;
+let hoverId: string | null = null;
+let hoverPointer: { clientX: number; clientY: number; deep: boolean } | null = null;
+let hoverFrame = 0;
+let stageGeometry: DOMRect | null = null;
+let viewportPlan: { project: any; layers: any[]; count: number; version: number; time: number; safe: boolean; padding: number } | null = null;
+let pendingResize: { width: number; height: number; viewport: PreviewViewport | null } | null = null;
+/* Stage-relative geometry is owned by layout. Reading DOM bounds while the
+   playhead updates can force layout of the entire timeline every frame. */
+let overlayGeometry: { width: number; height: number; x: number; y: number } | null = null;
 V.isNavigating = () => !disposed && (!!activeDrag || window.performance.now() < navigationUntil);
-let presentation: { time: number; version: number | undefined; project: any; quality: number } | null = null;
-V.deferNavigationRender = (now: number) => {
-  if (disposed || now >= zoomGestureUntil || api.transport.playing() || !requestedViewport || !presentedViewport
-      || requestedViewport === presentedViewport || !visibleRegion || !presentation
-      || presentation.version === undefined || presentation.version !== api.anim.version()
-      || presentation.time !== api.transport.time() || presentation.project !== api.project.get() || presentation.quality !== api.transport.quality) return false;
+let presentation: { time: number; version: number | undefined; project: any; quality: number; width: number; height: number } | null = null;
+const presentationIsCurrent = () => {
+  const project = api.project.get();
+  return !!presentation && presentation.version !== undefined && presentation.version === api.anim.version()
+    && presentation.time === api.transport.time() && presentation.project === project
+    && presentation.width === project.w && presentation.height === project.h
+    && presentation.quality === api.transport.quality;
+};
+const canRetainNavigation = (now: number) => {
+  if (disposed || now >= zoomGestureUntil || api.transport.playing() || !visibleRegion || !presentationIsCurrent()) return false;
+  if (!presentedViewport) return true;
   return visibleRegion.x >= presentedViewport.x && visibleRegion.y >= presentedViewport.y
     && visibleRegion.right <= presentedViewport.x + presentedViewport.width
     && visibleRegion.bottom <= presentedViewport.y + presentedViewport.height;
+};
+const commitPendingResize = () => {
+  const pending = pendingResize; pendingResize = null;
+  if (pending) api.render.gl.resize(pending.width, pending.height, pending.viewport);
+};
+V.deferNavigationRender = (now: number) => {
+  if (pendingResize && canRetainNavigation(now)) return true;
+  commitPendingResize();
+  return false;
 };
 const displayViewport = (viewport: PreviewViewport, zoom = viewport.cssWidth / viewport.width) => {
   const gl = V.el as HTMLCanvasElement;
@@ -683,6 +782,9 @@ const disposeRuntime = () => {
   V.finishCanvasText?.();
   if (presentationFrame) window.cancelAnimationFrame(presentationFrame);
   presentationFrame = 0;
+  if (hoverFrame) window.cancelAnimationFrame(hoverFrame);
+  hoverFrame = 0; hoverId = null; hoverPointer = null;
+  pendingResize = null;
   eventOffs.splice(0).forEach((off) => off());
   window.removeEventListener('resize', onWindowResize);
   setStageCursor('');
@@ -747,13 +849,13 @@ V.attach = (stage: HTMLElement) => {
     zoomControl.dataset.globalSpaceShortcut = '';
     // Share the panel chrome row with its move handle, outside the clipped stage.
     zoomHost.append(zoomControl);
-    zoomControl.style.cssText = 'position:absolute;right:8px;top:7px;z-index:6;width:110px;height:24px;padding:0 26px 0 10px;border:0;border-radius:var(--r-sm);box-shadow:none;background-color:color-mix(in srgb,var(--tx) 5%,var(--bg-panel));color:var(--tx-2);font:var(--fs-md) var(--f-ui);cursor:pointer';
+    zoomControl.style.cssText = 'position:absolute;right:8px;top:7px;z-index:6;width:110px;height:24px;padding:0 26px 0 10px;border:0;border-radius:var(--r-sm);box-shadow:none;background-color:color-mix(in srgb,var(--tx) 5%,var(--bg-panel));color:var(--tx-2);font:var(--fs-md) var(--f-ui)';
     V.zoomControl = zoomControl;
     let preview=zoomHost.querySelector<HTMLElement>('#preview-controls');
     if(!preview){preview=document.createElement('div');preview.id='preview-controls';zoomHost.append(preview);}
     preview.style.cssText='position:absolute;right:124px;top:7px;z-index:6;display:flex;align-items:center';
     preview.replaceChildren();
-    const quality=document.createElement('select');quality.setAttribute('aria-label','Preview resolution');quality.style.cssText='width:82px;height:24px;padding:0 26px 0 10px;border:0;border-radius:var(--r-sm);box-shadow:none;background-color:color-mix(in srgb,var(--tx) 5%,var(--bg-panel));color:var(--tx-2);font:var(--fs-md) var(--f-ui);cursor:pointer';
+    const quality=document.createElement('select');quality.setAttribute('aria-label','Preview resolution');quality.style.cssText='width:82px;height:24px;padding:0 26px 0 10px;border:0;border-radius:var(--r-sm);box-shadow:none;background-color:color-mix(in srgb,var(--tx) 5%,var(--bg-panel));color:var(--tx-2);font:var(--fs-md) var(--f-ui)';
     for(const [value,label] of [['auto','Auto'],['1','Full'],['0.5','Half'],['0.25','Quarter']]){const option=document.createElement('option');option.value=value!;option.textContent=label!;quality.append(option);}
     quality.value=api.transport.perf.auto?'auto':String(api.transport.quality);quality.onchange=()=>{api.transport.perf.auto=quality.value==='auto';api.transport.quality=quality.value==='auto'?1:Number(quality.value);api.transport.previewResolution=quality.value;V.layout();};preview.append(quality);
     V.previewOff?.(); V.previewOff = undefined;
@@ -772,12 +874,14 @@ V.attach = (stage: HTMLElement) => {
 };
 
 /* ── layout / sizing ───────────────────────────────────── */
-V.layout = (panOnly = false) => {
-  if (panOnly === true) navigationUntil = window.performance.now() + 250;
+V.layout = (panOnly = false, gesture = panOnly === true) => {
+  const now = window.performance.now();
+  if (gesture) { navigationUntil = now + 250; zoomGestureUntil = now + 100; }
   if (!V.el || !V.stage) return;
   const gl = V.el as HTMLCanvasElement;
   const p = api.project.get();
-  const r = V.stage.getBoundingClientRect();
+  const r = gesture && stageGeometry ? stageGeometry : V.stage.getBoundingClientRect();
+  stageGeometry = r;
   if (r.width < 8 || r.height < 8) return;
   V._sw = r.width; V._sh = r.height;
   const pad = 8;
@@ -800,35 +904,48 @@ V.layout = (panOnly = false) => {
     { width: r.width, height: r.height }, { width: p.w, height: p.h }, z,
     { x: V.fit ? 0 : V.pan[0], y: V.fit ? 0 : V.pan[1] },
   );
+  overlayGeometry = { width: r.width, height: r.height, x: position.x, y: position.y };
   V.inner.style.left = position.x + 'px';
   V.inner.style.top = position.y + 'px';
   V.inner.style.transform = '';
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  /* Cropped high-zoom rendering is exact for ordinary 2D source layers. Keep
-     complex full-frame/3D pipelines on the established full-composition path
-     until their coordinate-dependent effects can consume a viewport origin. */
-  const viewportSafe = p.layers.every((layer: any) => !layer.threeD
-    && !(layer.fx || []).some((effect: any) => effect?.on !== false)
-    && !(layer.masks || []).length && !layer.matteSource && !layer.transitionIn && !layer.transitionOut
-    && !['adjustment', 'shader', 'extension', 'precomp'].includes(layer.type));
+  /* Cropped high-zoom rendering is exact for ordinary 2D source layers and
+     effects that opt into the viewport coordinate contract. Keep complex
+     full-frame/3D pipelines on the established full-composition path. */
+  const time = api.transport.time();
+  const version = api.anim.version();
+  if (!viewportPlan || viewportPlan.project !== p || viewportPlan.layers !== p.layers
+      || viewportPlan.count !== p.layers.length || viewportPlan.version !== version || viewportPlan.time !== time) {
+    const safe = p.layers.every((layer: any) => !layer.threeD
+      && effectViewportSafe(api, layer, time)
+      && !(layer.masks || []).length && !layer.matteSource && !layer.transitionIn && !layer.transitionOut
+      && !['adjustment', 'shader', 'extension', 'precomp'].includes(layer.type));
+    viewportPlan = { project: p, layers: p.layers, count: p.layers.length, version, time,
+      safe, padding: safe ? effectViewportPadding(api, p, time) : 0 };
+  }
+  const viewportSafe = viewportPlan.safe, effectPadding = viewportPlan.padding;
+  const renderDensity = Math.min(2, Math.max(1, dpr)) * Math.max(.25, Math.min(1, api.transport.quality));
   const viewport = viewportSafe
-    ? previewRenderViewport(p.w, p.h, z, r.width, r.height, position.x, position.y, dpr, api.transport.quality, 128, api.render.gl.previewViewport as PreviewViewport | null)
+    ? previewRenderViewport(p.w, p.h, z, r.width, r.height, position.x, position.y, dpr, api.transport.quality, 128 + effectPadding / renderDensity, api.render.gl.previewViewport as PreviewViewport | null)
     : null;
   requestedViewport = viewport;
-  visibleRegion = viewport ? { x: Math.max(0, -position.x) / z, y: Math.max(0, -position.y) / z,
-    right: Math.min(p.w, (r.width - position.x) / z), bottom: Math.min(p.h, (r.height - position.y) / z) } : null;
+  visibleRegion = { x: Math.max(0, -position.x) / z, y: Math.max(0, -position.y) / z,
+    right: Math.min(p.w, (r.width - position.x) / z), bottom: Math.min(p.h, (r.height - position.y) / z) };
+  let renderSize: { width: number; height: number };
   if (viewport) {
     // While a new crop is pending, keep the old pixels in their own source
     // coordinates. Commit the new CSS placement with its GL presentation.
     const retain = presentedViewport && presentedViewport.compWidth === p.w && presentedViewport.compHeight === p.h;
-    displayViewport(retain ? presentedViewport! : viewport, z);
-    api.render.gl.resize(viewport.renderWidth, viewport.renderHeight, viewport);
+    if (retain) displayViewport(presentedViewport!, z);
+    else if (!presentationIsCurrent()) displayViewport(viewport, z);
+    renderSize = { width: viewport.renderWidth, height: viewport.renderHeight };
   } else {
-    presentedViewport = null;
-    gl.style.position = ''; gl.style.left = ''; gl.style.top = ''; gl.style.width = '100%'; gl.style.height = '100%';
-    const renderSize = api.transport.previewResolution && api.transport.previewResolution!=='auto' ? {width:Math.max(2,Math.round(p.w*api.transport.quality)),height:Math.max(2,Math.round(p.h*api.transport.quality))} : previewRenderSize(p.w, p.h, z, dpr, api.transport.quality);
-    api.render.gl.resize(renderSize.width, renderSize.height, null);
+    if (presentedViewport && presentationIsCurrent()) displayViewport(presentedViewport, z);
+    else { gl.style.position = ''; gl.style.left = ''; gl.style.top = ''; gl.style.width = '100%'; gl.style.height = '100%'; }
+    renderSize = api.transport.previewResolution && api.transport.previewResolution!=='auto' ? {width:Math.max(2,Math.round(p.w*api.transport.quality)),height:Math.max(2,Math.round(p.h*api.transport.quality))} : previewRenderSize(p.w, p.h, z, dpr, api.transport.quality);
   }
+  pendingResize = { ...renderSize, viewport };
+  if (!gesture || !canRetainNavigation(now)) commitPendingResize();
   const overlayWidth = Math.round(r.width * dpr);
   const overlayHeight = Math.round(r.height * dpr);
   /* Assigning either canvas dimension clears the bitmap even when the value is
@@ -847,10 +964,9 @@ V.layout = (panOnly = false) => {
   // Do not submit the entire layer stack again. This is deliberately scoped
   // to pan input: independent draw requests (assets, fonts, edits, context
   // recovery, etc.) remain pending and are never swallowed here.
-  const reusePan = panOnly === true && !api.transport.playing() && viewport && viewport === presentedViewport
-    && presentation && presentation.version !== undefined && presentation.version === api.anim.version()
-    && presentation.time === api.transport.time() && presentation.project === p && presentation.quality === api.transport.quality;
-  if (!reusePan) invalidate('render');
+  const reusePan = panOnly === true && !api.transport.playing() && viewport === presentedViewport && presentationIsCurrent();
+  if (reusePan) pendingResize = null;
+  else invalidate('render');
   schedulePresentation();
 };
 V.setZoom = (zoom: number) => {
@@ -867,8 +983,10 @@ V.returnToComposition = () => {
 V.updateRecovery = () => {
   if (!V.recovery || !V.stage || !V.inner) return false;
   const hiddenBySourcePreview = !!V.preview?.activeId;
+  const geometry = overlayGeometry, p = api.project.get();
   const out = !V.fit && !hiddenBySourcePreview
-    && compositionIsOutOfView(V.stage.getBoundingClientRect(), V.inner.getBoundingClientRect());
+    && !!geometry && (geometry.x + p.w * V.shown <= 0 || geometry.x >= geometry.width
+      || geometry.y + p.h * V.shown <= 0 || geometry.y >= geometry.height);
   V.recovery.hidden = !out;
   return out;
 };
@@ -878,29 +996,35 @@ const listen = <K extends Parameters<PowermoveAPI['events']['on']>[0]>(event: K,
   const disposable = api.events.on(event, handler);
   eventOffs.push(() => disposable.dispose());
 };
-listen('project:changed', () => V.layout());
+listen('project:changed', () => { viewportPlan = null; V.layout(); });
+listen('extensions:changed', () => { viewportPlan = null; V.layout(); });
 listen('layout', () => V.layout());
-listen('selection', () => { invalidate('render'); drawOverlay(); });
+listen('selection', () => { invalidate('render'); drawOverlay(); scheduleHover(); });
 let observedQuality = api.transport.quality;
 listen('time', () => {
   if (observedQuality !== api.transport.quality) { observedQuality = api.transport.quality; V.layout(); }
   schedulePresentation();
 });
-listen('transport', () => schedulePresentation());
+listen('transport', () => { if (api.transport.playing()) commitPendingResize(); schedulePresentation(); });
 
 /* comp px <-> screen px */
 const toComp = (e: any): [number, number] => {
+  if (stageGeometry && overlayGeometry && window.performance.now() < navigationUntil) {
+    return [(e.clientX - stageGeometry.left - overlayGeometry.x) / V.shown,
+      (e.clientY - stageGeometry.top - overlayGeometry.y) / V.shown];
+  }
   const r = V.inner.getBoundingClientRect();
   return [(e.clientX - r.left) / V.shown, (e.clientY - r.top) / V.shown];
 };
 
 const stagePoint = (e: any): Point => {
-  const r = V.stage.getBoundingClientRect();
+  const r = stageGeometry && window.performance.now() < navigationUntil ? stageGeometry : V.stage.getBoundingClientRect();
   return { x: e.clientX - r.left, y: e.clientY - r.top };
 };
 
 function setZoomAtPoint(compositionPoint: Point, pointer: Point, zoom: number): void {
-  const stage = V.stage.getBoundingClientRect();
+  const gesture = window.performance.now() < zoomGestureUntil;
+  const stage = gesture && stageGeometry ? stageGeometry : V.stage.getBoundingClientRect();
   V.fit = false;
   V.zoom = clamp(zoom, .05, 8);
   const pan = zoomPanForPoint(
@@ -908,7 +1032,7 @@ function setZoomAtPoint(compositionPoint: Point, pointer: Point, zoom: number): 
     { width: api.project.get().w, height: api.project.get().h }, V.zoom,
   );
   V.pan = [pan.x, pan.y];
-  V.layout();
+  V.layout(false, gesture);
 }
 
 function zoomAtEvent(e: any, factor: number): void {
@@ -936,27 +1060,28 @@ function schedulePresentation(): void {
    drawn into the viewport we requested counts as presented; a reused frame
    during navigation must not, or deferral and pan-refresh math break. */
 listen('frame:rendered', (frame: { viewport: PreviewViewport | null; time: number; version: number | undefined; quality: number }) => {
-  if (frame.viewport && frame.viewport === requestedViewport && V.el) {
+  if (frame.viewport === requestedViewport && V.el) {
     presentedViewport = frame.viewport;
-    presentation = { time: frame.time, version: frame.version, project: api.project.get(), quality: frame.quality };
-    displayViewport(frame.viewport);
+    const project = api.project.get();
+    presentation = { time: frame.time, version: frame.version, project, quality: frame.quality, width: project.w, height: project.h };
+    if (frame.viewport) displayViewport(frame.viewport);
+    else { V.el.style.position = ''; V.el.style.left = ''; V.el.style.top = ''; V.el.style.width = '100%'; V.el.style.height = '100%'; }
   }
 });
 listen('overlay', () => drawOverlay());
 
 function drawOverlay() {
+  /* The compositor paints synchronously at the end of its frame. Consume the
+     fallback requested by the time event instead of repainting it next RAF.
+     Paused edits still use that fallback when no compositor frame is needed. */
+  if (presentationFrame) window.cancelAnimationFrame(presentationFrame);
+  presentationFrame = 0;
   const c = V.octx; if (!c) return;
-  /* Self-heal after layout rebuilds: if the stage no longer matches the size
-     V.layout() last computed, re-run layout before drawing overlays. */
-  if (V.stage) {
-    const r = V.stage.getBoundingClientRect();
-    if (r.width >= 8 && r.height >= 8 &&
-        (Math.abs(r.width - (V._sw || 0)) > .5 || Math.abs(r.height - (V._sh || 0)) > .5)) {
-      V.layout();
-    }
-  }
+  /* ResizeObserver, window resize and panel layout events refresh this before
+     paint. Pan/zoom call layout directly, so their controls remain immediate. */
+  if (!overlayGeometry) return;
   const selectionInk = selectionOutlineColor(api.project.get());
-  const p = api.project.get(), dpr = V.ov.width / V.stage.getBoundingClientRect().width;
+  const p = api.project.get(), dpr = V.ov.width / overlayGeometry.width;
   c.setTransform(1, 0, 0, 1, 0, 0);
   c.clearRect(0, 0, V.ov.width, V.ov.height);
   if (V.zoomRect) {
@@ -972,8 +1097,7 @@ function drawOverlay() {
     c.restore();
   }
   const S = V.shown * dpr;
-  const frame = V.inner.getBoundingClientRect(), stage = V.stage.getBoundingClientRect();
-  c.save(); c.translate((frame.left - stage.left) * dpr, (frame.top - stage.top) * dpr); c.scale(S, S);
+  c.save(); c.translate(overlayGeometry.x * dpr, overlayGeometry.y * dpr); c.scale(S, S);
   c.lineWidth = 1 / S;
 
   drawSnapLines(c);
@@ -997,11 +1121,27 @@ function drawOverlay() {
     c.restore();
   }
 
+  V.textSession?.draw(c, S, selectionInk);
+
   /* Command+Shift+H is After Effects' Show Layer Controls toggle. Drawing and
      tool feedback remain live; only selection boxes, handles, and paths hide. */
   if (V.showControls === false) {
     c.restore();
     return;
+  }
+
+  const hovered = hoverId ? api.model.layer(hoverId) : null;
+  if (hovered && api.anim.active(hovered, api.transport.time()) && hovered.id !== V.canvasTextEditing) {
+    const geometry = resolveSelectionGeometry(api, [hovered], api.transport.time(), space3d);
+    if (geometry) {
+      c.strokeStyle = selectionInk;
+      c.lineWidth = 1.5 / Math.max(.02, V.shown);
+      c.beginPath();
+      c.moveTo(geometry.corners[0]!.x, geometry.corners[0]!.y);
+      geometry.corners.slice(1).forEach((point) => c.lineTo(point.x, point.y));
+      c.closePath();
+      c.stroke();
+    }
   }
 
   const sels = visualSelection(api).filter((L: any) => api.anim.active(L, api.transport.time()) && L.id !== V.canvasTextEditing);
@@ -1345,13 +1485,14 @@ function bindStage(stage: any, inner: any): () => void {
   }) as EventListener;
   const capture = undefined;
   listen(stage, 'contextmenu', guarded((event: MouseEvent) => {
+    // Right-clicking edited text gets the native text services menu.
+    if ((event.target as Element)?.closest?.('.canvas-text-input')) return;
     event.preventDefault();
     const point = pointerComp(event);
     const layer = api.render.gl.pick(point.x, point.y, api.transport.time(), { includeLocked: true });
     if (layer) api.ui.showLayerMenu(layer, event, 'viewer');
     else {
-      const items = api.menus.collect('viewer:context', { layerId: null, time: api.transport.time() });
-      if (items.length) api.ui.menu({ x: event.clientX, y: event.clientY }, items);
+      api.ui.menu({ x: event.clientX, y: event.clientY }, api.menus.gather('viewer:context', { layerId: null, time: api.transport.time() }));
     }
   }), capture);
   V.layerAtPoint = (clientX: number, clientY: number) => {
@@ -1361,9 +1502,13 @@ function bindStage(stage: any, inner: any): () => void {
     return api.render.gl.pick(point.x, point.y, api.transport.time());
   };
   listen(stage, 'pointerdown', guarded(onDown), capture);
-  listen(stage, 'pointermove', guarded(updateStageCursor), capture);
+  listen(stage, 'pointermove', guarded((e: any) => {
+    updateStageCursor(e);
+    hoverPointer = { clientX: e.clientX, clientY: e.clientY, deep: e.metaKey || e.ctrlKey };
+    scheduleHover();
+  }), capture);
   listen(stage, 'pointerenter', guarded(() => { V.pointerOver = true; }), capture);
-  listen(stage, 'pointerleave', guarded(() => { V.pointerOver = false; setStageCursor(''); }), capture);
+  listen(stage, 'pointerleave', guarded(() => { V.pointerOver = false; hoverPointer = null; setHover(null); setStageCursor(''); }), capture);
   listen(stage, 'wheel', guarded((e: any) => {
     e.preventDefault();
     if (viewerWheelMode(e) === 'zoom') {
@@ -1398,6 +1543,13 @@ function bindStage(stage: any, inner: any): () => void {
     V.temporaryTool = 'hand';
     setStageCursor('grab');
   }) as EventListener, true);
+  const modifierChanged = ((e: any) => {
+    if (!hoverPointer || (e.key !== 'Meta' && e.key !== 'Control')) return;
+    hoverPointer = { ...hoverPointer, deep: e.metaKey || e.ctrlKey };
+    scheduleHover();
+  }) as EventListener;
+  listen(window, 'keydown', modifierChanged);
+  listen(window, 'keyup', modifierChanged);
   listen(window, 'keyup', ((e: any) => {
     if (e.code !== 'Space' || V.temporaryTool !== 'hand' || e.target?.closest?.('input,textarea,[contenteditable]')) return;
     e.preventDefault();
@@ -1413,6 +1565,7 @@ function bindStage(stage: any, inner: any): () => void {
       e.preventDefault();e.stopPropagation();return;
     }
     const [x, y] = toComp(e);
+    if (V.textSession) { e.preventDefault(); e.stopPropagation(); return; }
     let L = editableTextAtPoint(api, x, y, api.transport.time(), space3d);
     const remembered = V.textDoubleClickCandidate;
     if (!L && remembered && Date.now() - remembered.at < 700) {
@@ -1425,18 +1578,28 @@ function bindStage(stage: any, inner: any): () => void {
     if (L) {
       e.preventDefault();
       e.stopPropagation();
-      editCanvasText(api, V, L, undefined, true);
+      openTextEditor(L, { selectAll: true });
+      return;
+    }
+    /* AE: double-clicking a precomp layer in the viewer opens its composition. */
+    const hit: any = api.render.gl.pick(x, y, api.transport.time());
+    if (hit?.type === 'precomp' && hit.d?.comp) {
+      e.preventDefault();
+      e.stopPropagation();
+      api.commands.run('openComposition', hit.d.comp);
     }
   }), capture);
   /* FX browser drops (effects / transitions). Non-fx drags (OS files) are left
      untouched so the window-level import handler keeps working. */
   const setDropOver = (on: boolean) => stage.classList.toggle('fx-drop-over', on);
+  /* A composition dragged from the Project panel nests here, as in AE. */
+  const compDrag = (e: any) => !!api.dnd?.hasAssetDrag(e.dataTransfer) && api.dnd.mediaDrag?.kind === 'comp';
   listen(stage, 'dragenter', (e: any) => {
-    if (!api.dnd?.hasFxDrag(e.dataTransfer)) return;
+    if (!api.dnd?.hasFxDrag(e.dataTransfer) && !compDrag(e)) return;
     e.preventDefault(); setDropOver(true);
   });
   listen(stage, 'dragover', (e: any) => {
-    if (!api.dnd?.hasFxDrag(e.dataTransfer)) return;
+    if (!api.dnd?.hasFxDrag(e.dataTransfer) && !compDrag(e)) return;
     e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; setDropOver(true);
   });
   listen(stage, 'dragleave', (e: any) => {
@@ -1446,6 +1609,12 @@ function bindStage(stage: any, inner: any): () => void {
   listen(stage, 'drop', (e: any) => {
     const payload = api.dnd?.readFxDrag(e.dataTransfer);
     setDropOver(false);
+    const asset = !payload ? api.dnd?.readAssetDrag(e.dataTransfer) : null;
+    if (asset?.kind === 'comp') {
+      e.preventDefault(); e.stopPropagation();
+      api.commands.run('addCompositionToTimeline', asset.id, { position: toComp(e) });
+      return;
+    }
     if (!payload) return;
     e.preventDefault(); e.stopPropagation();
     const [x, y] = toComp(e);
@@ -1459,6 +1628,33 @@ function bindStage(stage: any, inner: any): () => void {
   };
 }
 
+function setHover(id: string | null): void {
+  if (hoverId === id) return;
+  hoverId = id;
+  schedulePresentation();
+}
+
+function scheduleHover(): void {
+  if (hoverFrame || disposed) return;
+  hoverFrame = window.requestAnimationFrame(() => {
+    hoverFrame = 0;
+    setHover(hoverTargetId());
+  });
+}
+
+/** The layer a plain click at the last pointer position would select. */
+function hoverTargetId(): string | null {
+  if (!hoverPointer || !V.pointerOver || activeDrag || V.textSession || !V.stage) return null;
+  if ((V.temporaryTool || toolService()?.tool || 'select') !== 'select') return null;
+  const T = api.transport.time();
+  const point = pointerComp(hoverPointer);
+  const selection = resolveSelectionGeometry(api, visualSelection(api), T, space3d);
+  if (selection?.transformable && handleAt(selection, point.x, point.y)) return null;
+  const target = resolvePickTarget(api, api.render.gl.pick(point.x, point.y, T), { deep: hoverPointer.deep });
+  if (!target || visualSelection(api).some((layer: any) => layer.id === target.id)) return null;
+  return target.id;
+}
+
 function setStageCursor(cursor: string) {
   if (V.stage) V.stage.style.cursor = cursor;
   if (V.inner) V.inner.style.cursor = cursor;
@@ -1470,8 +1666,11 @@ function cursorForHit(selection: SelectionGeometry, hit: any) {
 }
 
 function updateStageCursor(e: any) {
-  if (!V.inner) return;
+  // A drag owns its cursor until release; hover geometry would repeat the
+  // selection evaluation and force layout after each manipulation write.
+  if (!V.inner || activeDrag) return;
   const tool = V.temporaryTool || toolService()?.tool;
+  if (V.textSession && tool !== 'hand' && tool !== 'zoom') { setStageCursor(V.textSession.contains(pointerComp(e)) ? 'text' : 'default'); return; }
   if (tool === 'hand') { setStageCursor('grab'); return; }
   if (tool === 'zoom') { setStageCursor(e.altKey ? 'zoom-out' : 'zoom-in'); return; }
   if (tool === 'rotate') { setStageCursor(ROTATE_CURSOR); return; }
@@ -1505,6 +1704,16 @@ function startPan(e: any) {
 function onDown(e: any) {
   if (e.button === 1) return startPan(e);
   if (e.button !== 0) return;
+  setHover(null);
+
+  /* An active text edit owns clicks on its own text (caret, drag-select,
+     word and paragraph selection). Any other click commits the edit first,
+     then falls through as an ordinary Select-tool click: clicking away
+     selects or deselects, and never plants another text layer. */
+  if (V.textSession && !V.temporaryTool) {
+    if (V.textSession.pointerDown(e, pointerComp(e))) { e.stopPropagation(); return; }
+    V.textSession.finish();
+  }
 
   /* The first click of a double-click may legitimately select a full-frame
      layer above the text. Remember the selected text hit briefly so the
@@ -1518,7 +1727,22 @@ function onDown(e: any) {
         V.textDoubleClickCandidate = null;
         e.preventDefault();
         e.stopPropagation();
-        editCanvasText(api, V, layer, undefined, true);
+        openTextEditor(layer, { selectAll: true });
+        return;
+      }
+    }
+    /* Double-click descends into the selected group, one level per click. */
+    const previousPress = V.lastSelectPress;
+    V.lastSelectPress = { at: Date.now(), clientX: e.clientX, clientY: e.clientY };
+    if (previousPress && V.lastSelectPress.at - previousPress.at < 500
+      && Math.hypot(e.clientX - previousPress.clientX, e.clientY - previousPress.clientY) < 6) {
+      const [hx, hy] = toComp(e);
+      const drill = drillTarget(api, api.render.gl.pick(hx, hy, api.transport.time()));
+      if (drill) {
+        V.lastSelectPress = null;
+        e.preventDefault();
+        e.stopPropagation();
+        selectLayers(drill.id);
         return;
       }
     }
@@ -1557,7 +1781,7 @@ function onDown(e: any) {
     e.preventDefault();
     return;
   }
-  const L = api.render.gl.pick(x, y, T);
+  const L = resolvePickTarget(api, api.render.gl.pick(x, y, T), { deep: e.metaKey || e.ctrlKey });
   if (selection?.transformable && pointInSelection(selection, x, y)) {
     const selectedIds = new Set(selection.layers.map((layer: any) => layer.id));
     return startMove(e, selection.roots, T, {
@@ -1582,7 +1806,7 @@ function onDown(e: any) {
 
 function clearToolRect(): void {
   V.toolRect = null;
-  invalidate('render');
+  schedulePresentation();
 }
 
 function startZoom(e: any): void {
@@ -1596,7 +1820,7 @@ function startZoom(e: any): void {
       V.zoomRect = moved && !ev.altKey
         ? shapeBoxFromDrag(startScreen, stagePoint(ev))
         : null;
-      invalidate('render');
+      schedulePresentation();
     },
     up: (_dx: number, _dy: number, ev: any) => {
       const box = V.zoomRect as DragBox | null;
@@ -1617,7 +1841,7 @@ function startZoom(e: any): void {
         { x: stage.width / 2, y: stage.height / 2 }, zoom,
       );
     },
-    cancel: () => { V.zoomRect = null; invalidate('render'); },
+    cancel: () => { V.zoomRect = null; schedulePresentation(); },
   });
 }
 
@@ -1631,7 +1855,7 @@ function startSelectionMarquee(e: any): void {
       if (!passedMoveDragThreshold(dx, dy)) return;
       moved = true;
       V.toolRect = { kind: 'selection', box: shapeBoxFromDrag(start, pointerComp(ev)) };
-      invalidate('render');
+      schedulePresentation();
     },
     up: () => {
       const box = V.toolRect?.box as DragBox | undefined;
@@ -1668,7 +1892,7 @@ function startShape(e: any): void {
         kind: 'shape',
         box: shapeBoxFromDrag(start, pointerComp(ev), { fromCenter: ev.altKey, constrain: ev.shiftKey }),
       };
-      invalidate('render');
+      schedulePresentation();
     },
     up: (_dx: number, _dy: number, ev: any) => {
       const box = moved
@@ -1733,11 +1957,26 @@ function createShape(box: DragBox): void {
   refreshInspector();
 }
 
+function openTextEditor(layer: any, options: Omit<TextEditOptions, 'drag' | 'onFinish'> = {}): TextEditSession | null {
+  const session = beginTextEdit(api, V, layer, {
+    ...options,
+    drag: (event, dragOptions) => { beginDrag(event, dragOptions); },
+    onFinish: () => { if (V.textSession === session) V.textSession = null; invalidate(); refreshInspector(); },
+  });
+  V.textSession = session;
+  return session;
+}
+
+/** Text tool. A click on existing text edits it with the caret at the
+    pointer. A click on empty canvas creates point text; a drag creates a
+    fixed-width paragraph whose height follows its lines. The new layer is
+    created inside the editing transaction, so an empty result leaves no
+    layer and no history entry, and Undo removes text and layer together. */
 function startText(e: any): void {
   const [hitX, hitY] = toComp(e);
   const hit = api.render.gl.pick(hitX, hitY, api.transport.time());
-  if (hit?.type === 'text' && !e.shiftKey) {
-    editCanvasText(api,V,hit,e);
+  if (hit?.type === 'text' && !hit.lock && !e.shiftKey) {
+    openTextEditor(hit, { caretAt: { x: hitX, y: hitY } });
     return;
   }
   const start = pointerComp(e);
@@ -1748,24 +1987,32 @@ function startText(e: any): void {
       if (!passedMoveDragThreshold(dx, dy)) return;
       moved = true;
       V.toolRect = { kind: 'text', box: shapeBoxFromDrag(start, pointerComp(ev), { fromCenter: ev.altKey }) };
-      invalidate('render');
+      schedulePresentation();
     },
     up: (_dx: number, _dy: number, ev: any) => {
       const box = moved ? shapeBoxFromDrag(start, pointerComp(ev), { fromCenter: ev.altKey }) : null;
       clearToolRect();
-      const position = box ? { x: box.x0, y: box.y0 } : start;
-      const result = api.edit.apply({
+      const paragraph = !!box && box.w >= 8;
+      const position = paragraph ? { x: box.x0, y: box.y0 } : start;
+      const project = api.project.get();
+      const texts = project.layers.filter((layer: any) => layer.type === 'text');
+      const alignSource = visualSelection(api).find((layer: any) => layer.type === 'text') ?? texts[texts.length - 1];
+      const chosenAlign = alignSource ? resolvedContent(api, alignSource, api.transport.time()).align : null;
+      const align = chosenAlign === 'center' || chosenAlign === 'right' ? chosenAlign : 'left';
+      api.edit.begin('Add text', { origin: 'canvas' });
+      const result = api.edit.dispatch({
         type: 'add_layer', layerType: 'text', name: 'Text',
-        from: api.util.snapF(api.transport.time(), api.project.get().fps), duration: Math.max(1 / api.project.get().fps, api.project.get().dur - api.transport.time()),
+        from: api.util.snapF(api.transport.time(), project.fps), duration: Math.max(1 / project.fps, project.dur - api.transport.time()),
         content: {
-          text: '', align: 'left',
-          boxWidth: api.model.P(box?.w || 0), boxHeight: api.model.P(box?.h || 0),
+          text: '', align,
+          boxWidth: api.model.P(paragraph ? api.util.round(box.w, 3) : 0), boxHeight: api.model.P(0),
         } as unknown as Extract<EditCommand, { type: 'add_layer' }>['content'],
         properties: { 'position.x': position.x, 'position.y': position.y },
         select: true,
-      }, { label: box ? 'New paragraph text' : 'New point text', origin: 'canvas' });
+      });
       const layer = result?.ok && result.data?.results?.[0]?.data?.layer;
-      if (layer) editCanvasText(api,V,layer);
+      if (!layer) { api.edit.cancel(); invalidate(); return; }
+      openTextEditor(layer, { fresh: true });
       invalidate();
     },
     cancel: clearToolRect,
@@ -1924,7 +2171,7 @@ function startMove(e: any, layers: any, T: any, options: any = {}) {
       });
       const nextLines = snap.lines.length ? snap.lines : null;
       if (snapLinesChanged(V.snapLines, nextLines)) {
-        window.powermove?.haptic.alignment();
+        api.host.haptic.alignment();
       }
       V.snapLines = nextLines;
       invalidate();
@@ -1986,6 +2233,8 @@ function startSingleTransform(e: any, selection: SelectionGeometry, hit: any, T:
   };
   const textContent0 = L.type === 'text' ? resolvedContent(api, L, T) : null;
   const textPadding = textContent0 ? api.util.clamp(Number(textContent0.size) * .055, 3, 12) * 2 : 0;
+  const shapeContent0 = L.type === 'shape' && !L.d?.paths?.length ? resolvedContent(api, L, T) : null;
+  const shapeStroke = shapeContent0 ? Math.max(0, Number(shapeContent0.stroke) || 0) : 0;
   const m = [...api.anim.worldMatrix(L, T)] as [number, number, number, number, number, number];
   const pivotWorld = selection.pivotWorld;
   const pointerStart = pointerComp(e);
@@ -1997,14 +2246,14 @@ function startSingleTransform(e: any, selection: SelectionGeometry, hit: any, T:
     : { x: 0, y: 0 };
   const applied = {
     sx: s0.sx, sy: s0.sy, x: s0.x, y: s0.y,
-    width: Number(textContent0?.boxWidth) || 0, height: Number(textContent0?.boxHeight) || 0,
+    width: Number(textContent0?.boxWidth ?? shapeContent0?.w) || 0, height: Number(textContent0?.boxHeight ?? shapeContent0?.h) || 0,
   };
   const applyValue = (path: string, value: number, key: keyof typeof applied) => {
     if (Math.abs(value - applied[key]) < .0005) return;
     setOrKey(L, path, value, T);
     applied[key] = value;
   };
-  api.edit.begin(hit.rotate ? 'Rotate layer' : textContent0 == null ? 'Scale layer' : 'Resize text', { origin: 'canvas' });
+  api.edit.begin(hit.rotate ? 'Rotate layer' : shapeContent0 ? 'Resize shape' : textContent0 == null ? 'Scale layer' : 'Resize text', { origin: 'canvas' });
   let moved = false;
   beginDrag(e, {
     cursor: cursorForHit(selection, hit),
@@ -2023,9 +2272,9 @@ function startSingleTransform(e: any, selection: SelectionGeometry, hit: any, T:
         const pointerLocal = invertPoint(m, pointerWorld);
         if (!pointerLocal) return;
         const next = calculateResize(b, hit.corner, pointerLocal, grabOffset,
-          { x: textContent0 ? 1 : s0.sx, y: textContent0 ? 1 : s0.sy }, {
+          { x: textContent0 || shapeContent0 ? 1 : s0.sx, y: textContent0 || shapeContent0 ? 1 : s0.sy }, {
             fromCenter: ev.altKey,
-            minScale: textContent0 ? .001 : undefined,
+            minScale: textContent0 || shapeContent0 ? .001 : undefined,
             lockAspect: resizeLocksAspect(L.type, ev.shiftKey),
           });
         // Width-only paragraph resizing grows downward as lines wrap.
@@ -2044,6 +2293,18 @@ function startSingleTransform(e: any, selection: SelectionGeometry, hit: any, T:
           } else {
             applyValue('c.boxHeight', Number(textContent0.boxHeight) || 0, 'height');
           }
+          const resizedBounds = layerBounds(api, L, T);
+          if (resizedBounds) {
+            const pivotRatio: Corner = [
+              b.w ? (next.pivotLocal.x - b.x0) / b.w : .5,
+              b.h ? (next.pivotLocal.y - b.y0) / b.h : .5,
+            ];
+            renderedPivotLocal = pointInBounds(resizedBounds, pivotRatio);
+          }
+        } else if (shapeContent0) {
+          // Selection bounds include half the stroke on each side.
+          applyValue('c.w', api.util.round(Math.max(1, b.w * next.scaleX - shapeStroke), 3), 'width');
+          applyValue('c.h', api.util.round(Math.max(1, b.h * next.scaleY - shapeStroke), 3), 'height');
           const resizedBounds = layerBounds(api, L, T);
           if (resizedBounds) {
             const pivotRatio: Corner = [
@@ -2102,6 +2363,11 @@ function startCommonTransform(e: any, selection: SelectionGeometry, hit: any, T:
       return [matrix[0], matrix[1], matrix[2], matrix[3]] as LinearMatrix;
     })(),
     textSize: L.type === 'text' ? Math.max(4, Number(resolvedContent(api, L, api.transport.time()).size) || 4) : null,
+    shape: (() => {
+      if (L.type !== 'shape' || L.d?.paths?.length) return null;
+      const c = resolvedContent(api, L, T);
+      return { w: Number(c.w) || 0, h: Number(c.h) || 0, stroke: Math.max(0, Number(c.stroke) || 0) };
+    })(),
     textOwnsDescendants: L.type === 'text' && api.project.get().layers.some((layer: any) => layer.parent === L.id),
   }));
   if (!snapshots.length) return;
@@ -2159,6 +2425,10 @@ function startCommonTransform(e: any, selection: SelectionGeometry, hit: any, T:
               type: 'set_content', target: snapshot.L.id,
               patch: { size: api.util.round(Math.max(4, snapshot.textSize * scaleX), 2) },
             });
+          } else if (snapshot.shape) {
+            const { w, h, stroke } = snapshot.shape;
+            setOrKey(snapshot.L, 'c.w', api.util.round(Math.max(1, (w + stroke) * scaleX - stroke), 3), T);
+            setOrKey(snapshot.L, 'c.h', api.util.round(Math.max(1, (h + stroke) * scaleY - stroke), 3), T);
           } else {
             setOrKey(snapshot.L, 'scale.x', api.util.round(snapshot.sx * scaleX, 3), T);
             setOrKey(snapshot.L, 'scale.y', api.util.round(snapshot.sy * scaleY, 3), T);

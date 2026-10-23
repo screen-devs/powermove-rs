@@ -1,40 +1,68 @@
 /* Ported from js/ui/projects.js — behavior-preserving. */
 import type { PMRegistry } from '../registry';
 import { subscribeForkUpdates, updateAll, type ForkUpdate } from '../../shell/fork-updates';
+import { installUpdate, subscribeAppUpdates } from '../../shell/app-updates';
+import type { AppUpdateState } from '../../../../shared/ipc';
+import { mount, unmount } from 'svelte';
+import AccountButton from '../../cloud/AccountButton.svelte';
+import { rollText } from '../../controls/roll-text.svelte';
+import { playPageIn } from '../../controls/page-motion';
 
 export function install(PM: PMRegistry): void {
 const h = PM.h;
+const PAGE_SIZE = 60;
 const wasOpen = !!PM.ProjectsScreen?.isOpen;
 const previousSection = PM.ProjectsScreen?.section;
 PM.__disposeProjectsScreen?.();
+const storedSection = PM.store.get('projectsSection', 'recents');
 const S: any = {
   el: null, nav: null, grid: null, title: null, count: null, search: null,
-  section: PM.store.get('projectsSection', 'recents'),
+  // Projects used to be a separate sidebar tab. Keep the section available
+  // for callers that open it directly, but make old saved selections land on
+  // the remaining default tab after the navigation entry is removed.
+  section: storedSection === 'projects' ? 'recents' : storedSection,
   view: PM.store.get('projectsView', 'grid'),
   sort: PM.store.get('projectsSort', 'recent'),
+  page: 0, queryKey: '',
 };
 if (!['recents', 'projects', 'trash'].includes(S.section)) S.section = 'recents';
+const SECTIONS = ['recents', 'projects', 'trash', 'store'];
 
 PM.ProjectsScreen = {
   get isOpen() { return !!S.el && S.el.classList.contains('on'); },
   get section() { return S.section; },
   show(section: any) {
     ensure();
-    if (section && ['recents', 'projects', 'trash'].includes(section)) S.section = section;
+    if (section && SECTIONS.includes(section)) selectSection(section, false);
     paint(); S.el.classList.add('on'); PM.bus.emit('projects:screen');
   },
   hide() {
-    if (!PM.Projects?.tabs?.().length) return;
+    // Nothing to fall back to: this window has no composition behind the screen.
+    if (!PM.proj?.id || PM.isHomeProject?.()) return;
+    if (S.section === 'store') (PM as any).StoreUI?.setActive?.(false);
     if (S.el) S.el.classList.remove('on');
     PM.bus.emit('projects:screen');
   },
   toggle() { this.isOpen ? this.hide() : this.show(); },
+  clearSearch() { if (S.search?.value) { S.search.value = ''; paint(); } },
 };
+
+/* The Store is one more section; it has its own search, so this field always
+   searches projects and typing in it from the Store goes back to them. */
+function selectSection(section: string, persist = true) {
+  if (section === S.section) return;
+  if (section === 'store' && S.search) S.search.value = '';
+  S.section = section;
+  if (persist && section !== 'store') PM.store.set('projectsSection', section);
+}
 
 function ensure() {
   if (S.el) return;
   S.search = h('input', { type: 'search', placeholder: 'Search projects', 'aria-label': 'Search projects' });
-  S.search.addEventListener('input', paint);
+  S.search.addEventListener('input', () => {
+    if (S.section === 'store' && S.search.value) selectSection('recents');
+    paint();
+  });
   S.nav = h('div.ps-nav');
   /* Forked built-ins that fell behind the shipped version. The agent does the
      merge; this block only says how many and offers the one action. */
@@ -50,10 +78,30 @@ function ensure() {
       h('button.btn', { onclick: () => { updateAll(); PM.ProjectsScreen.hide(); } }, 'Update with agent'));
   };
   S.offUpdates = subscribeForkUpdates(paintUpdates);
-  const sidebar = h('aside.ps-sidebar', h('label.ps-search', PM.icon('search'), S.search), S.nav, S.updates,
-    h('div.ps-sidefoot', 'Local recovery is automatic. Use Save to update a .pmv file you can move, copy, or back up.'));
+  /* A new app version staged by the background updater. Installing is a
+     normal quit (session saved) followed by a relaunch. */
+  S.appUpdate = h('div.ps-updates', { hidden: true });
+  const paintAppUpdate = (state: AppUpdateState | null) => {
+    S.appUpdate.textContent = '';
+    S.appUpdate.hidden = state?.status !== 'ready';
+    if (state?.status !== 'ready') return;
+    S.appUpdate.append(
+      h('b', state.version ? `Powermove ${state.version} is ready` : 'A Powermove update is ready'),
+      h('span', `You’re on ${state.current}. Restarting saves your session, installs the update, and reopens Powermove.`),
+      h('button.btn', { onclick: installUpdate }, 'Restart to update'));
+  };
+  S.offAppUpdate = subscribeAppUpdates(paintAppUpdate);
+  S.storeBtn = h('button.ps-navbtn', { onclick: () => { selectSection('store'); paint(); } }, PM.icon('basket'), h('span', 'Store'));
+  const store = h('div.ps-nav', S.storeBtn);
+  const nav = h('div.ps-navs', S.nav, store);
+  /* Who you are on Powermove Cloud, pinned to the foot of the sidebar. */
+  S.account = h('div.ps-account');
+  S.accountButton = mount(AccountButton, { target: S.account, props: { PM } });
+  const sidebar = h('aside.ps-sidebar', h('label.ps-search', PM.icon('search'), S.search), nav, S.appUpdate, S.updates, S.account);
 
   S.title = h('b'); S.count = h('span');
+  /* The section name and its count roll like the Store's title. */
+  S.titleRoll = rollText(S.title); S.countRoll = rollText(S.count);
   const view = h('div.ps-view', { role: 'group', 'aria-label': 'Project layout' },
     viewButton('grid', 'Grid view', 'grid'), viewButton('list', 'List view', 'list'));
   const sort = h('select.ps-sort', { 'aria-label': 'Sort projects' },
@@ -61,14 +109,19 @@ function ensure() {
   sort.value = S.sort;
   sort.onchange = () => { S.sort = sort.value; PM.store.set('projectsSort', S.sort); paint(); };
   const top = h('div.ps-top', h('div.ps-title', S.title, S.count), view, sort,
-    h('button.btn', { onclick: openProjectFromDisk }, 'Open Project…'),
+    h('button.btn', { title: 'Open a project, or start one from media', onclick: () => PM.openFiles?.() }, 'Open…'),
     h('button.btn.pri', { onclick: () => { PM.ProjectsScreen.hide(); PM.newProject(); } }, PM.icon('plus'), 'New Project'));
   S.grid = h('div.ps-grid');
-  S.el = h('div#projects-screen', sidebar, h('main.ps-main', top, h('div.ps-content', S.grid)));
+  S.pager = h('nav.ps-pagination', { 'aria-label': 'Project pages', hidden: true });
+  S.content = h('div.ps-content', S.grid, S.pager);
+  S.top = top;
+  S.storeHost = h('div.ps-store', { hidden: true });
+  S.el = h('div#projects-screen', sidebar, h('main.ps-main', top, S.content, S.storeHost));
   document.body.appendChild(S.el);
+  /* Only Escape is the home's; app shortcuts such as ⌘, keep working over it. */
   S.el.addEventListener('keydown', (e: any) => {
-    e.stopPropagation();
-    if (e.key === 'Escape') { e.preventDefault(); PM.ProjectsScreen.hide(); }
+    if (e.key !== 'Escape') return;
+    e.stopPropagation(); e.preventDefault(); PM.ProjectsScreen.hide();
   });
   S.el.addEventListener('dragover', (e: any) => { if ([...e.dataTransfer.types].includes('Files')) e.preventDefault(); });
   S.el.addEventListener('drop', async (e: any) => {
@@ -90,40 +143,73 @@ function viewButton(value: any, label: any, icon: any) {
 }
 function navButton(section: any, label: any, icon: any, count: any) {
   return h('button.ps-navbtn' + (S.section === section ? '.on' : ''), {
-    onclick: () => { S.section = section; PM.store.set('projectsSection', section); paint(); },
+    onclick: () => { selectSection(section); paint(); },
   }, PM.icon(icon), h('span', label), h('span.count', String(count)));
 }
 
 function paint() {
   if (!S.el) return;
+  const inStore = S.section === 'store';
+  const storeUI = (PM as any).StoreUI;
+  if (inStore) storeUI?.attach?.(S.storeHost);
+  S.top.hidden = inStore;
+  S.content.hidden = inStore;
+  S.storeHost.hidden = !inStore;
+  S.storeBtn.classList.toggle('on', inStore);
+  storeUI?.setActive?.(inStore);
   const live = [...PM.Projects.list()], trash = [...PM.Projects.trashList()];
   S.nav.textContent = '';
   S.nav.append(navButton('recents', 'Recents', 'clock', Math.min(12, live.length)),
-    navButton('projects', 'All Projects', 'project', live.length), navButton('trash', 'Trash', 'trash', trash.length));
+    navButton('trash', 'Trash', 'trash', trash.length));
   const labels: any = { recents: 'Recents', projects: 'Projects', trash: 'Trash' };
   let metas = S.section === 'trash' ? trash : live;
   if (S.sort === 'name') metas.sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)));
   else metas.sort((a: any, b: any) => (b.at || b.deletedAt || 0) - (a.at || a.deletedAt || 0));
-  if (S.section === 'recents') metas = metas.slice(0, 12);
   const q = S.search.value.trim().toLowerCase();
   if (q) metas = metas.filter((m: any) => String(m.name || '').toLowerCase().includes(q));
-  S.title.textContent = labels[S.section];
-  S.count.textContent = `${metas.length} ${metas.length === 1 ? 'project' : 'projects'}`;
+  else if (S.section === 'recents') metas = metas.slice(0, 12);
+  const queryKey = JSON.stringify([S.section, S.sort, S.view, q]);
+  if (queryKey !== S.queryKey) { S.page = 0; S.queryKey = queryKey; S.content.scrollTop = 0; }
+  const pages = Math.max(1, Math.ceil(metas.length / PAGE_SIZE));
+  S.page = Math.min(S.page, pages - 1);
+  S.titleRoll.set(labels[S.section]);
+  S.countRoll.set(`${metas.length} ${metas.length === 1 ? 'project' : 'projects'}`);
   S.el.querySelectorAll('.ps-view button').forEach((b: any) => b.classList.toggle('on', b.dataset.view === S.view));
   S.grid.className = 'ps-grid' + (S.view === 'list' ? ' list' : '') + (!metas.length ? ' empty' : '');
   S.grid.textContent = '';
-  metas.forEach((m: any) => S.grid.appendChild(card(m, S.section === 'trash')));
+  const openIds = new Set<string>([...PM.Projects.openProjects(), ...(PM.Tabs?.list?.() ?? [])]);
+  metas.slice(S.page * PAGE_SIZE, (S.page + 1) * PAGE_SIZE)
+    .forEach((m: any) => S.grid.appendChild(card(m, S.section === 'trash', openIds)));
   if (!metas.length) S.grid.appendChild(emptyState(q));
+  /* Another section arrives the way another Store page does. */
+  if (S.paintedSection && S.paintedSection !== S.section) playPageIn(S.grid, 0);
+  S.paintedSection = S.section;
+  S.pager.textContent = '';
+  S.pager.hidden = pages === 1;
+  if (pages > 1) {
+    const turnPage = (delta: number) => {
+      S.page += delta;
+      paint();
+      S.content.scrollTop = 0;
+      S.pager.querySelector('button:not(:disabled)')?.focus();
+    };
+    S.pager.append(
+      h('button.btn', { disabled: S.page === 0, onclick: () => turnPage(-1) }, 'Previous page'),
+      h('span', { 'aria-live': 'polite' }, `Page ${S.page + 1} of ${pages}`),
+      h('button.btn', { disabled: S.page === pages - 1, onclick: () => turnPage(1) }, 'Next page'));
+  }
 }
 
-function card(m: any, trashed: any) {
-  const open = !trashed && PM.Projects.tabs().includes(m.id);
-  const active = open && m.id === PM.proj.id;
-  const file = !trashed ? PM.projectFileState?.(m.id) : null;
-  const raw = PM.Projects.get(m.id);
+function card(m: any, trashed: any, openIds: Set<string>) {
+  const active = !trashed && m.id === PM.proj.id;
+  /* "Open" is a tab somewhere, in this window or another. */
+  const open = !trashed && (active || openIds.has(m.id));
+  const file = !trashed ? PM.projectFileState?.(m.id, { initialize: false }) : null;
+  // Dimensions belong in the index; cards must never clone whole compositions.
+  const raw = m;
   const inner = h('div.ps-thumb-inner');
   const dims = raw && raw.w && raw.h ? `${raw.w}×${raw.h}` : '';
-  if (m.thumb) inner.appendChild(h('img', { src: m.thumb, alt: '' }));
+  if (m.thumb) inner.appendChild(h('img', { src: m.thumb, alt: '', loading: 'lazy', decoding: 'async' }));
   /* An unrendered project shows its canvas size in the frame instead of a blank slab. */
   const thumb = h('div.ps-thumb', inner, !m.thumb && dims ? h('div.ps-thumb-empty', dims) : null);
   const more = h('button.ps-more', { title: 'Project actions', 'aria-label': 'Project actions' }, PM.icon('more'));
@@ -162,6 +248,9 @@ function projectMenu(anchor: any, m: any, trashed: any, x?: any, y?: any) {
     '-', { label: 'Delete Forever…', run: () => destroyDialog(m) },
   ] : [
     { label: 'Open', disabled: m.id === PM.proj.id, run: () => openLocalProject(m) },
+    ...(PM.windows?.supported
+      ? [{ label: 'Open in New Window', disabled: m.id === PM.proj.id && (PM.Tabs?.list?.().length ?? 1) < 2, run: () => openInNewWindow(m) }]
+      : []),
     { label: 'Save', run: () => save(m, false) },
     { label: 'Save As…', run: () => save(m, true) },
     '-',
@@ -171,19 +260,21 @@ function projectMenu(anchor: any, m: any, trashed: any, x?: any, y?: any) {
   PM.menu(anchor, items, x == null ? {} : { x, y });
 }
 
-async function openProjectFromDisk() {
-  const before = PM.proj.id;
-  await PM.openProject?.();
-  if (PM.proj.id !== before) PM.ProjectsScreen.hide();
-}
+/* A click opens the project as a tab of this window, or shows the tab it
+   already has. A document lives in one window at a time, so one open elsewhere
+   brings its own window forward instead and this window keeps what it had. */
 function openLocalProject(m: any) {
-  const project = PM.Projects.get(m.id);
-  if (!project) return PM.toast('Could not open this project because its local data is missing.');
-  if (project.id === PM.proj.id) {
-    PM.Projects.markOpen?.(project.id);
-    PM.bus.emit('projects:tabs');
-  } else window.dispatchEvent(new window.CustomEvent('pm-open-project', { detail: project }));
-  PM.ProjectsScreen.hide();
+  if (m.id === PM.proj.id) {
+    PM.ProjectsScreen.hide();
+    return;
+  }
+  void Promise.resolve(PM.openProjectHere?.(m.id) ?? false).then((opened: boolean) => {
+    if (opened) PM.ProjectsScreen.hide();
+    else paint();
+  });
+}
+function openInNewWindow(m: any) {
+  void Promise.resolve(PM.openProjectInNewWindow?.(m.id) ?? false).then(() => paint());
 }
 async function save(m: any, saveAs: boolean) {
   if (!PM.Projects.get(m.id)) return PM.toast('Could not save this project because its local data is missing.');
@@ -192,7 +283,7 @@ async function save(m: any, saveAs: boolean) {
 }
 function restore(m: any) {
   if (!PM.Projects.restore(m.id)) return PM.toast('Could not restore this project because its local data is missing.');
-  paint(); PM.bus.emit('projects:tabs'); PM.toast('Project restored');
+  paint(); PM.bus.emit('projects:open'); PM.toast('Project restored');
 }
 
 function emptyState(searching: any) {
@@ -211,7 +302,7 @@ function renameDialog(m: any) {
     { label: 'Cancel' }, { label: 'Rename', pri: true, run: () => {
       try {
         if (!PM.Projects.rename(m.id, name.value)) throw new Error('Project data is missing');
-        paint(); PM.bus.emit('projects:tabs'); PM.bus.emit('project');
+        paint(); PM.bus.emit('projects:open'); PM.bus.emit('project');
       } catch (error: any) { PM.toast('Could not rename project: ' + (error.message || 'Unknown error')); }
     } },
   ] });
@@ -230,26 +321,37 @@ function duplicate(m: any) {
       delete copiedState.file;
       PM.Projects.putState(raw.id, copiedState);
     }
-    paint(); PM.bus.emit('projects:tabs'); PM.toast('Duplicated “' + m.name + '”');
+    paint(); PM.bus.emit('projects:open'); PM.toast('Duplicated “' + m.name + '”', 2200, { error: false });
   } catch (error: any) { PM.toast('Could not duplicate project: ' + (error.message || 'Unknown error')); }
 }
-function trashDialog(m: any) {
-  PM.modal({ title: 'Move “' + m.name + '” to Trash?', body: h('div', { style: { color: 'var(--tx-2)', fontSize: '12.5px', lineHeight: 1.6 } },
-    'You can restore this project from Trash.'), width: 420, actions: [
-    { label: 'Cancel' }, { label: 'Move to Trash', pri: true, run: () => {
-      if (!PM.Projects.trash(m.id)) return PM.toast('Could not move this project to Trash.');
-      if (m.id === PM.proj.id) switchUnderlying(); paint(); PM.bus.emit('projects:tabs');
-    } },
-  ] });
+function trashDialog(m: any): Promise<void> {
+  return PM.confirm({ message: 'Move “' + m.name + '” to Trash?', detail: 'You can restore this project from Trash.', confirmLabel: 'Move to Trash' }).then(async (ok: boolean) => {
+    if (!ok) return;
+    if (m.id === PM.proj.id) {
+      try {
+        // Save the live document and its Undo/session state before removing
+        // its registry entry. The following project switch must not put it back.
+        await PM.flushProject();
+      } catch (error: any) {
+        PM.toast('Could not move this project to Trash: ' + (error?.message || 'Project storage is unavailable'));
+        return;
+      }
+    }
+    if (!PM.Projects.trash(m.id)) return PM.toast('Could not move this project to Trash.');
+    if (PM.Tabs?.list?.().includes(m.id)) await PM.Tabs.forget(m.id);
+    else if (m.id === PM.proj.id) switchUnderlying();
+    paint(); PM.bus.emit('projects:open');
+  });
 }
-function destroyDialog(m: any) {
-  PM.modal({ title: 'Delete “' + m.name + '” forever?', body: h('div', { style: { color: 'var(--tx-2)', fontSize: '12.5px', lineHeight: 1.6 } },
-    'This permanently removes the local project. This cannot be undone.'), width: 420, actions: [
-    { label: 'Cancel' }, { label: 'Delete Forever', pri: true, run: () => { PM.Projects.destroy(m.id); paint(); } },
-  ] });
+function destroyDialog(m: any): Promise<void> {
+  return PM.confirm({ message: 'Delete “' + m.name + '” forever?', detail: 'This permanently removes the local project. This cannot be undone.', confirmLabel: 'Delete Forever', destructive: true })
+    .then((ok: boolean) => { if (ok) { PM.Projects.destroy(m.id); paint(); } });
 }
+/* Trashing the composition this window is editing leaves it with nothing, so it
+   falls back to another project that no other window holds, or a blank one. */
 function switchUnderlying() {
-  const id = PM.Projects.tabs()[0] || (PM.Projects.list()[0] || {}).id;
+  const taken = new Set(PM.Projects.openProjects().filter((id: string) => id !== PM.proj.id));
+  const id = PM.Projects.list().map((m: any) => m.id).find((candidate: string) => !taken.has(candidate));
   const p = id && PM.Projects.get(id);
   window.dispatchEvent(new window.CustomEvent('pm-open-project', { detail: p || PM.mkProject({ name: 'Untitled', dur: 10, w: 1920, h: 1080, fps: 30, bg: '#09090A' }) }));
 }
@@ -260,12 +362,15 @@ function ago(t: any) {
   return new Date(t).toLocaleDateString();
 }
 
-const offTabs = PM.bus.on('projects:tabs', () => { if (PM.ProjectsScreen.isOpen) paint(); });
+const offOpen = PM.bus.on('projects:open', () => { if (PM.ProjectsScreen.isOpen) paint(); });
 PM.__disposeProjectsScreen = () => {
   S.offUpdates?.(); S.offUpdates = null;
-  offTabs?.();
+  S.offAppUpdate?.(); S.offAppUpdate = null;
+  if (S.accountButton) void unmount(S.accountButton); S.accountButton = null;
+  S.titleRoll?.dispose(); S.countRoll?.dispose();
+  offOpen?.();
   S.el?.remove?.();
   S.el = null;
 };
-if (wasOpen) window.queueMicrotask(() => PM.ProjectsScreen.show(previousSection));
+if (wasOpen) window.queueMicrotask(() => PM.ProjectsScreen.show(previousSection === 'projects' ? 'recents' : previousSection));
 }

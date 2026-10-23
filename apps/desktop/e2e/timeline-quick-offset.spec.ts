@@ -37,7 +37,9 @@ test.describe('@timeline Quick Offset', () => {
         bubbles: true, cancelable: true, button: 0, buttons: type === 'pointerup' ? 0 : 1,
         clientX, clientY: y, pointerId: 71, metaKey: true, altKey: true,
       });
-      PM.Kernel.services.get('timeline').cv.dispatchEvent(event('pointerdown', x));
+      const down = event('pointerdown', x);
+      Object.defineProperties(down, { offsetX: { value: x - rect.left }, offsetY: { value: y - rect.top } });
+      PM.Kernel.services.get('timeline').cv.dispatchEvent(down);
       window.dispatchEvent(event('pointermove', x + 125));
       const overlay = { ...PM.Kernel.services.get('timeline').quickOffset };
       window.dispatchEvent(event('pointerup', x + 125));
@@ -90,7 +92,9 @@ test.describe('@timeline Quick Offset', () => {
         bubbles: true, cancelable: true, button: 0, buttons: type === 'pointerup' ? 0 : 1,
         clientX, clientY: y, pointerId: 72, metaKey: true, altKey: true,
       });
-      PM.Kernel.services.get('timeline').cv.dispatchEvent(event('pointerdown', x));
+      const down = event('pointerdown', x);
+      Object.defineProperties(down, { offsetX: { value: x - rect.left }, offsetY: { value: y - rect.top } });
+      PM.Kernel.services.get('timeline').cv.dispatchEvent(down);
       window.dispatchEvent(event('pointermove', x + 125));
       window.dispatchEvent(event('pointerup', x + 125));
     });
@@ -127,10 +131,13 @@ test('one Graph Editor handle adjusts selected same-property keyframes across la
     return layers.map(layer => layer.id);
   });
   await page.evaluate(() => (document.querySelector('button[title="Graph editor (Shift+F3)"]') as HTMLButtonElement).click());
-  await page.waitForFunction((layerIds: string[]) => {
-    const PM = (window as any).PM;
-    return layerIds.every(id => PM.UIState.getKeyHandles(PM.L(id).p.opacity.kf[0])?.ho);
-  }, ids);
+  // The same property selected on both layers draws as a single editable curve.
+  await page.waitForFunction(() => {
+    const graph = (window as any).PM.Kernel.services.get('timeline')._graph;
+    return graph?.series?.length === 1 && graph.linked?.length === 2
+      && (window as any).PM.UIState.getKeyHandles(graph.series[0].prop.kf[0])?.ho;
+  });
+  const drawn = await page.evaluate(() => (window as any).PM.Kernel.services.get('timeline')._graph.series[0].L.id);
   await page.evaluate((id: string) => {
     const PM = (window as any).PM, rect = PM.Kernel.services.get('timeline').cv.getBoundingClientRect();
     const handle = PM.UIState.getKeyHandles(PM.L(id).p.opacity.kf[0]).ho;
@@ -139,10 +146,12 @@ test('one Graph Editor handle adjusts selected same-property keyframes across la
       bubbles: true, cancelable: true, button: 0, buttons: type === 'pointerup' ? 0 : 1,
       clientX, clientY, pointerId: 73,
     });
-    PM.Kernel.services.get('timeline').cv.dispatchEvent(event('pointerdown', x, y));
+    const down = event('pointerdown', x, y);
+    Object.defineProperties(down, { offsetX: { value: x - rect.left }, offsetY: { value: y - rect.top } });
+    PM.Kernel.services.get('timeline').cv.dispatchEvent(down);
     window.dispatchEvent(event('pointermove', x + 16, y - 14));
     window.dispatchEvent(event('pointerup', x + 16, y - 14));
-  }, ids[0]);
+  }, drawn);
 
   const handles = await page.evaluate((layerIds: string[]) => layerIds.map(id =>
     (window as any).PM.L(id).p.opacity.kf[0].eo), ids);

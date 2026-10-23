@@ -11,9 +11,9 @@ import { IPC, type MenuCommand } from '../shared/ipc';
 
 const RENDERER_MENU_CHORDS = new Set([
   'KeyZ', 'shift+KeyZ',
-  'KeyX', 'KeyC', 'KeyV', 'KeyA', 'KeyD', 'shift+KeyD', 'KeyB', 'shift+KeyH',
+  'KeyX', 'KeyC', 'shift+KeyC', 'KeyV', 'KeyA', 'KeyD', 'shift+KeyD', 'KeyB', 'shift+KeyH',
   'BracketRight', 'BracketLeft', 'shift+BracketRight', 'shift+BracketLeft',
-  'Equal', 'shift+Equal', 'Minus', 'Digit0', 'Digit1',
+  'Equal', 'shift+Equal', 'Minus', 'Digit0', 'Digit1', 'Comma',
 ]);
 
 export function isRendererOwnedMenuInput(input: Partial<Input>): boolean {
@@ -54,8 +54,16 @@ const commandItem = (
   click: () => send(command)
 });
 
+/** Window-level actions main performs itself: no renderer is involved in
+ *  making a window or in asking one to close. */
+export interface WindowActions {
+  newWindow(): void;
+  closeWindow(): void;
+}
+
 export function appMenuTemplate(
-  send: (command: MenuCommand) => void
+  send: (command: MenuCommand) => void,
+  windows?: WindowActions
 ): MenuItemConstructorOptions[] {
   const viewItems: MenuItemConstructorOptions[] = [
     commandItem('Zoom In', 'CommandOrControl+=', 'zoomIn', send, false),
@@ -80,6 +88,8 @@ export function appMenuTemplate(
       submenu: [
         { role: 'about' },
         { type: 'separator' },
+        commandItem('Settings…', 'CommandOrControl+,', 'settings', send, false),
+        { type: 'separator' },
         { role: 'services' },
         { type: 'separator' },
         { role: 'hide', accelerator: 'Command+H' },
@@ -91,15 +101,33 @@ export function appMenuTemplate(
     {
       label: 'File',
       submenu: [
-        commandItem('New Project', 'CommandOrControl+N', 'newProject', send),
+        commandItem('New Project', 'CommandOrControl+Alt+N', 'newProject', send),
+        {
+          id: 'newWindow',
+          label: 'New Window',
+          accelerator: 'CommandOrControl+Shift+N',
+          enabled: !!windows,
+          click: () => windows?.newWindow()
+        },
         commandItem('Open Project…', 'CommandOrControl+O', 'open', send),
+        { type: 'separator' },
+        commandItem('Close Tab', 'CommandOrControl+W', 'closeTab', send),
+        { type: 'separator' },
         commandItem('Save Project', 'CommandOrControl+S', 'save', send),
         commandItem('Save Project As…', 'CommandOrControl+Shift+S', 'saveAs', send),
         { type: 'separator' },
         commandItem('Import Media…', 'CommandOrControl+I', 'import', send),
         { id: 'importSequence', label: 'Import Image Sequence…', click: () => send('importSequence') },
         { type: 'separator' },
-        commandItem('Export…', 'CommandOrControl+E', 'export', send)
+        commandItem('Export…', 'CommandOrControl+E', 'export', send),
+        { type: 'separator' },
+        {
+          id: 'closeWindow',
+          label: 'Close Window',
+          accelerator: 'CommandOrControl+Shift+W',
+          enabled: !!windows,
+          click: () => windows?.closeWindow()
+        }
       ]
     },
     {
@@ -122,6 +150,15 @@ export function appMenuTemplate(
         commandItem('Send to Back', 'CommandOrControl+Shift+[', 'sendToBack', send, false)
       ]
     },
+    {
+      label: 'Composition',
+      submenu: [
+        commandItem('New Composition…', 'CommandOrControl+N', 'newComposition', send),
+        commandItem('Composition Settings…', 'CommandOrControl+Alt+K', 'compositionSettings', send),
+        { type: 'separator' },
+        commandItem('Pre-compose…', 'CommandOrControl+Shift+C', 'precompose', send, false)
+      ]
+    },
     { label: 'View', submenu: viewItems },
     {
       label: 'Window',
@@ -130,6 +167,22 @@ export function appMenuTemplate(
         { role: 'minimize' },
         { role: 'zoom' },
         { type: 'separator' },
+        commandItem('Show Next Tab', 'Control+Tab', 'nextTab', send),
+        commandItem('Show Previous Tab', 'Control+Shift+Tab', 'previousTab', send),
+        {
+          id: 'moveTabToNewWindow',
+          label: 'Move Tab to New Window',
+          enabled: !!windows,
+          click: () => send('moveTabToNewWindow')
+        },
+        { type: 'separator' },
+        {
+          id: 'windowNewWindow',
+          label: 'New Window',
+          enabled: !!windows,
+          click: () => windows?.newWindow()
+        },
+        { type: 'separator' },
         { role: 'front' }
       ]
     }
@@ -137,13 +190,15 @@ export function appMenuTemplate(
 }
 
 export function buildAppMenu(
-  send: (command: MenuCommand) => void
+  send: (command: MenuCommand) => void,
+  windows?: WindowActions
 ): Menu {
-  return Menu.buildFromTemplate(appMenuTemplate(send));
+  return Menu.buildFromTemplate(appMenuTemplate(send, windows));
 }
 
 export function installMenu(
-  getWindow: () => BrowserWindowType | null
+  getWindow: () => BrowserWindowType | null,
+  windows?: WindowActions
 ): Menu {
   const menu = buildAppMenu((command) => {
     const focusedWindow = BrowserWindow.getFocusedWindow();
@@ -151,7 +206,7 @@ export function installMenu(
     const target = command.startsWith('context') ? (focusedWindow ?? editorWindow) : editorWindow;
     if (!target || target.isDestroyed() || target.webContents.isDestroyed()) return;
     target.webContents.send(IPC.menuCommand, command);
-  });
+  }, windows);
   Menu.setApplicationMenu(menu);
   return menu;
 }

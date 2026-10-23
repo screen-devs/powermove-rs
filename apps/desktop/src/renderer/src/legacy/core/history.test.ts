@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createServicesRegistry } from '../../kernel/services';
 import type { PMRegistry } from '../registry';
 import { install } from './history';
+import { install as installMemory } from './memory';
 
 function historyRegistry(): PMRegistry {
   let nextId = 0;
@@ -23,6 +24,46 @@ function historyRegistry(): PMRegistry {
 }
 
 describe('legacy history install', () => {
+  it('retains the complete undo and redo chain under memory pressure', () => {
+    const previous = (globalThis as any).window;
+    (globalThis as any).window = { addEventListener: vi.fn() };
+    try {
+      const PM = historyRegistry();
+      installMemory(PM);
+      PM.Memory.setBudget('history', 1024 * 1024);
+      install(PM);
+      for (let i = 0; i < 4; i++) PM.hist.do(`Edit ${i}`, () => { PM.proj.text = String(i).repeat(100_000); });
+      PM.hist.undo();
+      const saved = PM.hist.export();
+      PM.Memory.pressure('critical');
+      expect(PM.hist.export()).toEqual(saved);
+      expect(PM.hist.redo()).toBe(true);
+      expect(PM.proj.text).toBe('3'.repeat(100_000));
+    } finally { (globalThis as any).window = previous; }
+  });
+  it('parks a background tab\'s undo stack and resumes it untouched', () => {
+    const PM = historyRegistry();
+    const cleanup = vi.fn();
+    PM.hist.do('Set value', () => { PM.proj.value = 2; });
+    // A runtime-only entry, the kind export() cannot carry across a reload.
+    PM.hist.external('Replace media', vi.fn(), vi.fn(), { bytes: 1, cleanup });
+
+    const parked = PM.hist.suspend();
+    expect(PM.hist.list()).toEqual([]);
+    expect(PM.hist.canUndo()).toBe(false);
+    // Another tab's edits live on their own stack meanwhile.
+    PM.hist.do('Other tab', () => { PM.proj.value = 9; });
+
+    expect(PM.hist.resume(parked)).toBe(true);
+    expect(PM.hist.list()).toEqual(['Set value', 'Replace media']);
+    expect(PM.hist.label()).toBe('Replace media');
+    // Parking and resuming is not closing: nothing was cleaned up.
+    expect(cleanup).not.toHaveBeenCalled();
+
+    PM.hist.discard(PM.hist.suspend());
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
   it('records one source transaction and reverses and reapplies it', () => {
     const PM = historyRegistry();
 
@@ -46,6 +87,25 @@ describe('legacy history install', () => {
     expect(stats.entries).toBe(1);
     expect(stats.bytes).toBeLessThan(1_000);
     expect(stats.maxBytes).toBe(256 * 1024 * 1024);
+  });
+
+  it('counts scoped Unicode, added and removed patches with the unchanged serialized budget', () => {
+    const PM = historyRegistry();
+    PM.proj.old = 'remove me';
+    PM.hist.beginScoped('Several scopes');
+    PM.hist.track([['value'], ['old'], ['new'], ['layers']]);
+    PM.proj.value = '東京 🎬';
+    delete PM.proj.old;
+    PM.proj.new = 'added';
+    PM.hist.commit();
+    const entry = PM.hist.export().entries[0];
+    const encoder = new TextEncoder();
+    expect(PM.hist.stats().bytes).toBe(encoder.encode(JSON.stringify(entry.forward)).byteLength
+      + encoder.encode(JSON.stringify(entry.backward)).byteLength);
+    PM.hist.undo();
+    expect(PM.proj).toEqual({ value: 1, old: 'remove me', layers: [] });
+    PM.hist.redo();
+    expect(PM.proj).toEqual({ value: '東京 🎬', new: 'added', layers: [] });
   });
 
   it('publishes whether a project patch came from the agent or the interface', () => {
@@ -77,6 +137,28 @@ describe('legacy history install', () => {
 });
 
 describe('selection history', () => {
+  it('preserves multiple redo steps through selection but replaces them on a new edit', () => {
+    const PM = historyRegistry();
+    PM.proj.layers = [{ id: 'a' }, { id: 'b' }];
+    PM.sel = { layers: ['a'], keys: [], chan: null };
+    PM.hist.do('First edit', () => { PM.proj.value = 2; });
+    PM.hist.do('Second edit', () => { PM.proj.value = 3; });
+    PM.hist.undo();
+    PM.hist.undo();
+    const before = structuredClone(PM.sel);
+    PM.sel.layers = ['b'];
+    PM.hist.selection(before, PM.sel);
+    expect(PM.hist.redo()).toBe(true);
+    expect(PM.proj.value).toBe(2);
+    expect(PM.hist.redo()).toBe(true);
+    expect(PM.proj.value).toBe(3);
+    PM.hist.undo();
+    PM.hist.do('New edit', () => { PM.proj.value = 4; });
+    expect(PM.hist.canRedo()).toBe(false);
+    PM.hist.undo();
+    expect(PM.proj.value).toBe(2);
+  });
+
   it('restores selection when no timeline service is registered', () => {
     const PM = historyRegistry();
     PM.proj.layers = [{ id: 'a' }, { id: 'b' }];

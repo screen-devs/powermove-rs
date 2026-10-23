@@ -4,6 +4,7 @@ import { openPanelMenu } from './menu';
 import { dismissedMenu } from '../overlays/dismissal';
 import { applyPanelSize, findPanel, panelMinHeight, setPanelCollapsed, type DockSpec, type PanelSpec, type Workspace } from './model';
 import { movePreservingFocus, parkPanel, stagePanelMove } from './portal';
+import { panelFrameOf } from '../kernel/panel-frame';
 
 function makeElement<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string): HTMLElementTagNameMap[K] {
   const element = document.createElement(tag);
@@ -50,7 +51,10 @@ export function syncPanelMoveHandle(PM: PMRegistry, id: string): HTMLButtonEleme
       const current = (PM.Layout.ws && findPanel(PM.Layout.ws as Workspace, id))
         || { spec: inst.spec, dock: inst.dock };
       if (!current?.dock || !current.spec) return;
-      openPanelMenu(PM, event, current.spec, current.dock, handle!);
+      openPanelMenu(PM, current.spec, current.dock, handle!, {
+        x: event.clientX,
+        y: event.clientY
+      });
     });
     inst.moveHandle = handle;
   }
@@ -91,7 +95,9 @@ export function ensurePanel(PM: PMRegistry, spec: PanelSpec, dock: DockSpec): HT
     'panel',
     def.flush ? 'flush' : '',
     def.noscroll ? 'noscroll' : '',
-    headless ? 'headless' : ''
+    headless ? 'headless' : '',
+    // A sandboxed extension's view iframe fills the body; it scrolls itself.
+    panelFrameOf(def) ? 'frame' : ''
   ].filter(Boolean).join(' '));
   element.id = `panel-${spec.id}`;
   element.dataset.panel = spec.id;
@@ -154,29 +160,26 @@ export function ensurePanel(PM: PMRegistry, spec: PanelSpec, dock: DockSpec): HT
     if ((event.target as Element | null)?.closest('button')) return;
     setPanelCollapsed(PM, spec.id, element.dataset.collapsed !== '1');
   });
-  let openMenu: HTMLElement | null = null;
-  let dismissedByPress = false;
   const showMenu = (event: MouseEvent): void => {
     event.preventDefault();
     event.stopPropagation();
     const current = liveLocation();
-    if (current?.dock && current.spec) openMenu = openPanelMenu(PM, event, current.spec, current.dock, options);
+    if (!current?.dock || !current.spec) return;
+    openPanelMenu(PM, current.spec, current.dock, header, {
+      x: event.clientX,
+      y: event.clientY
+    });
   };
-  /* The menu's outside-pointerdown handler already closes it when the options
-     button is pressed again; remember that so the following click toggles the
-     menu shut instead of immediately reopening it. */
-  options.addEventListener('pointerdown', () => {
-    dismissedByPress = Boolean(openMenu?.isConnected);
-  });
   options.addEventListener('click', (event) => {
-    if (dismissedByPress) {
-      dismissedByPress = false;
-      openMenu = null;
-      event.preventDefault();
-      event.stopPropagation();
-      return;
-    }
-    showMenu(event);
+    event.preventDefault();
+    event.stopPropagation();
+    const current = liveLocation();
+    if (!current?.dock || !current.spec) return;
+    const rect = options.getBoundingClientRect();
+    openPanelMenu(PM, current.spec, current.dock, options, {
+      x: rect.left,
+      y: rect.bottom
+    });
   });
   header.addEventListener('contextmenu', showMenu);
   syncPanelMoveHandle(PM, spec.id);

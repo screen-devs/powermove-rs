@@ -2,6 +2,8 @@
   import { doc } from '../state/document.svelte';
   import Icon from './Icon.svelte';
   import type { PanelProps } from './registerSveltePanel';
+  import { bridge } from '../kernel/bridge';
+  import { createCompThumbnails } from './comp-thumbnails.svelte';
 
   interface Asset {
     id: string;
@@ -18,9 +20,27 @@
     path?: string;
   }
 
+  interface CompItem {
+    id: string;
+    name: string;
+    w: number;
+    h: number;
+    fps: number;
+    dur: number;
+    bg: string;
+    open: boolean;
+    uses: number;
+  }
+
   let { panelId }: PanelProps = $props();
 
   const PM = window.PM as Record<string, any>;
+  /* Compositions are project items, listed with the footage like AE's Project panel. */
+  const comps = $derived((doc.tick.project, doc.tick.structure, doc.tick.history, doc.proj,
+    (PM.Comps?.list?.() ?? []) as CompItem[]));
+  let selectedCompId = $state<string | null>(null);
+  const compThumbs = createCompThumbnails(PM);
+  let draggingCompId = $state<string | null>(null);
   const assets = $derived((doc.tick.assets, doc.proj, Object.values(doc.proj?.assets ?? {}) as Asset[]));
   let selectedAssetId = $state<string | null>(null);
   const activeAssetId = $derived(
@@ -38,9 +58,16 @@
     return () => {
       host?.classList.remove('assets-panel-body');
       window.removeEventListener('pointerdown', handleWindowPointerDown, true);
-      PM.Viewer?.preview?.clear?.();
+      PM.Kernel?.services.get('viewer')?.preview?.clear?.();
     };
   });
+
+  /* Re-render composition thumbnails once the project settles after any change. */
+  $effect(() => {
+    const { values, structure, project, assets: media, history } = doc.tick;
+    compThumbs.refresh(`${doc.generation}:${values}:${structure}:${project}:${media}:${history}`);
+  });
+  $effect(() => () => compThumbs.dispose());
 
   /* Project tabs can also change through the keyboard or commands, without a
      pointer event. A source preview belongs only to the project that selected
@@ -70,6 +97,8 @@
   function mediaDetails(asset: Asset): string {
     const parts: string[] = [];
     if (asset.format === 'svg' || /\.svg$/i.test(asset.name)) parts.push('SVG');
+    // An animated image becomes a clip, so name the container it came from.
+    else if (asset.format && asset.kind !== 'model') parts.push(asset.format.toUpperCase());
     if (asset.kind !== 'audio' && asset.w && asset.h) parts.push(`${asset.w}×${asset.h}`);
     if (asset.dur) parts.push(mediaDuration(asset.dur));
     if (asset.kind === 'model' && asset.triangles) parts.push(`${asset.triangles.toLocaleString()} tris`);
@@ -85,54 +114,34 @@
     return PM.assets.get(asset.id);
   }
 
+  /* A cached still captured at import. It survives the source bytes going
+     missing, so an offline card can still show what the media looked like. */
+  function posterUrl(asset: Asset): string {
+    return String(PM.assets.poster?.(asset.id) || '');
+  }
+
+  function isLoading(asset: Asset): boolean {
+    if (liveAsset(asset)) return false;
+    return !!PM.assets.loading?.has(asset.id) || (PM.assetsRestoring || 0) > 0 || PM.MediaStore?.pending?.(asset) === true;
+  }
+
+  /* Only completed restoration can establish that media is offline. */
+  function isOffline(asset: Asset): boolean {
+    return !liveAsset(asset) && !isLoading(asset);
+  }
+
+  function offlineDetail(asset: Asset): string {
+    const source = finderPath(asset);
+    const cloud = PM.assets.cloud?.get(asset.id);
+    if (cloud) return cloud.state === 'downloading' ? `Downloading from ${cloud.provider}…`
+      : cloud.state === 'error' ? `Download failed · ${cloud.error}` : `Stored in ${cloud.provider} · ${source}`;
+    const error = PM.assets.errors?.get(asset.id);
+    if (error) return `Could not load · ${error}`;
+    return source ? `Missing · ${source}` : 'Missing · locate the file to relink it';
+  }
+
   function finderPath(asset: Asset): string {
     return asset.sourcePath || asset.path || '';
-  }
-
-  function replacementAccept(kind: string): string {
-    if (kind === 'image') return 'image/*,.svg';
-    if (kind === 'video') return 'video/*,.mp4,.mov,.m4v,.webm';
-    if (kind === 'audio') return 'audio/*';
-    if (kind === 'model') return '.obj,model/obj,text/plain+obj';
-    return '';
-  }
-
-  function pickReplacement(asset: Asset): void {
-    const targetProject = PM.proj;
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = replacementAccept(asset.kind);
-    input.style.cssText = 'position:fixed;width:1px;height:1px;opacity:0;pointer-events:none';
-    input.setAttribute('aria-label', `Replace ${asset.name}`);
-    const cleanup = () => {
-      input.onchange = null;
-      input.remove();
-    };
-    input.onchange = async () => {
-      const file = input.files?.[0];
-      cleanup();
-      if (!file) return;
-      if (PM.proj !== targetProject || !targetProject.assets?.[asset.id]) {
-        const message = 'Replacement stopped because you switched projects';
-        status = message;
-        PM.toast(message);
-        return;
-      }
-      status = `Replacing ${asset.name}…`;
-      try {
-        await PM.assets.replace(asset.id, file);
-        const message = `Replaced ${asset.name} with ${file.name}`;
-        status = message;
-        PM.toast(message);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : `Could not replace ${asset.name}`;
-        status = message;
-        PM.toast(message, 5000);
-      }
-    };
-    input.addEventListener('cancel', cleanup, { once: true });
-    document.body.appendChild(input);
-    input.click();
   }
 
   function showAssetMenu(event: MouseEvent, asset: Asset): void {
@@ -140,10 +149,16 @@
     event.stopPropagation();
     selectAsset(asset.id, event.currentTarget as HTMLElement);
     const sourcePath = finderPath(asset);
+    if (isLoading(asset)) return;
+    const offline = isOffline(asset);
     PM.menu(event.currentTarget, [
       { header: asset.name },
-      { label: 'Add to timeline', run: () => PM.cmd('addFromAsset', asset.id) },
-      { label: 'Replace File…', run: () => pickReplacement(asset) },
+      ...(offline && PM.assets.cloud?.get(asset.id) ? [{ label: 'Download from cloud', run: () => PM.assets.cloud.download(asset.id) }] : []),
+      ...(offline ? [] : [
+        { label: 'Add to timeline', run: () => PM.cmd('addFromAsset', asset.id) },
+        ...(asset.kind === 'audio' || asset.kind === 'model' ? [] : [{ label: 'New Comp from Selection', run: () => PM.cmd('newCompFromMedia', asset.id) }]),
+      ]),
+      { label: offline ? 'Locate File…' : 'Replace File…', run: () => PM.pickFiles(false, { replaceAssetId: asset.id }) },
       ...(sourcePath ? [{ label: 'Reveal in Finder', run: () => revealAssetSource(asset) }] : []),
       '-',
       { label: 'Delete media…', run: () => requestDelete(asset) },
@@ -209,6 +224,7 @@
   }
 
   function selectAsset(id: string, row?: HTMLElement): void {
+    selectedCompId = null;
     selectedAssetId = id;
     row?.focus();
     status = `Selected ${assets.find((asset) => asset.id === id)?.name ?? 'media'}`;
@@ -216,6 +232,15 @@
 
   function addAsset(event: MouseEvent | KeyboardEvent, asset: Asset): void {
     event.stopPropagation();
+    if (isLoading(asset)) return;
+    /* Offline media has nothing to put on the timeline; the primary action
+       becomes locating the file, the same way a broken tile works in an NLE. */
+    if (isOffline(asset)) {
+      selectAsset(asset.id);
+      if (PM.assets.cloud?.get(asset.id)) { void PM.assets.cloud.download(asset.id); return; }
+      PM.pickFiles(false, { replaceAssetId: asset.id });
+      return;
+    }
     PM.cmd('addFromAsset', asset.id);
     status = `Added ${asset.name} to the timeline`;
   }
@@ -230,7 +255,7 @@
     const sourcePath = finderPath(asset);
     if (!sourcePath) return;
     try {
-      await window.powermove.media.revealSource(sourcePath);
+      await bridge()!.media.revealSource(sourcePath);
       status = `Revealed ${asset.name} in Finder`;
     } catch {
       status = `Could not reveal ${asset.name} in Finder`;
@@ -238,7 +263,12 @@
     }
   }
 
-  function deleteAsset(asset: Asset): void {
+  function deleteAsset(asset: Asset, project = PM.proj): void {
+    if (PM.proj !== project) {
+      status = 'Deletion stopped because you switched projects';
+      PM.toast(status);
+      return;
+    }
     const result = PM.hist.do('Delete media', () => PM.MediaImport.removeAsset(PM.proj, asset.id));
     selectedAssetId = null;
     PM.sel.layers = PM.sel.layers.filter((id: string) => !result.removedLayerIds.includes(id));
@@ -254,24 +284,17 @@
   }
 
   function requestDelete(asset: Asset): void {
-    const references = PM.MediaImport.referenceCount(PM.proj, asset.id);
+    const project = PM.proj;
+    const references = PM.MediaImport.referenceCount(project, asset.id);
     if (!references) {
       deleteAsset(asset);
       return;
     }
-    PM.modal({
-      title: `Delete “${asset.name}”?`,
-      width: 420,
-      body: PM.h(
-        'div',
-        { style: { color: 'var(--tx-2)', fontSize: '12.5px', lineHeight: 1.6 } },
-        `This also removes ${references} ${references === 1 ? 'layer that uses' : 'layers that use'} this media. You can undo this.`
-      ),
-      actions: [
-        { label: 'Cancel' },
-        { label: 'Delete', pri: true, run: () => deleteAsset(asset) }
-      ]
-    });
+    void PM.confirm({
+      message: `Delete “${asset.name}”?`,
+      detail: `This also removes ${references} ${references === 1 ? 'layer that uses' : 'layers that use'} this media. You can undo this.`,
+      confirmLabel: 'Delete'
+    }).then((ok: boolean) => { if (ok) deleteAsset(asset, project); });
     status = `Confirm deletion of ${asset.name}`;
   }
 
@@ -337,9 +360,10 @@
   }
 
   function clearSelection(): void {
-    const preview = PM.Viewer?.preview;
+    const preview = PM.Kernel?.services.get('viewer')?.preview;
     const shouldClearPreview = selectedAssetId !== null || !!preview?.activeId;
     selectedAssetId = null;
+    selectedCompId = null;
     status = '';
     if (shouldClearPreview) preview?.clear?.();
     (document.activeElement as HTMLElement | null)?.blur?.();
@@ -347,10 +371,15 @@
 
   /* Selection is temporary ownership: preserve it only while the next press
      is inside the currently selected card. Capture runs before timeline drags
-     and project-tab handlers, so the preview disappears at pointerdown.
+     and titlebar handlers, so the preview disappears at pointerdown.
      The source monitor itself is part of that ownership — its transport and
      close button must survive the press that reaches them. */
   function handleWindowPointerDown(event: PointerEvent): void {
+    if (selectedCompId) {
+      const card = event.target instanceof Element ? event.target.closest<HTMLElement>('.asset-card[data-comp-id]') : null;
+      if (card?.dataset.compId !== selectedCompId) selectedCompId = null;
+      return;
+    }
     if (!selectedAssetId) return;
     const target = event.target;
     if (!(target instanceof Element)) { clearSelection(); return; }
@@ -368,16 +397,25 @@
 
   function previewToggle(asset: Asset): void {
     if (asset.kind === 'model') { status = `${asset.name} is a 3D model`; return; }
-    const preview = PM.Viewer?.preview;
+    const preview = PM.Kernel?.services.get('viewer')?.preview;
     if (!preview) { status = 'Source preview is unavailable'; return; }
     preview.toggle(asset.id);
     status = preview.playing ? `Playing ${asset.name}` : `Paused ${asset.name}`;
   }
 
   function handleRowDoubleClick(event: MouseEvent, asset: Asset): void {
+    if (isLoading(asset)) return;
     if ((event.target as Element).closest('button')) return;
-    PM.cmd('addFromAsset', asset.id);
-    status = `Added ${asset.name} to the timeline`;
+    event.preventDefault();
+    event.stopPropagation();
+    selectAsset(asset.id, event.currentTarget as HTMLElement);
+    if (isOffline(asset)) {
+      if (PM.assets.cloud?.get(asset.id)) { void PM.assets.cloud.download(asset.id); return; }
+      PM.pickFiles(false, { replaceAssetId: asset.id });
+      return;
+    }
+    status = PM.Kernel?.services.get('viewer')?.preview?.show(asset.id)
+      ? `Previewing ${asset.name}` : `Preview unavailable for ${asset.name}`;
   }
 
   function focusAsset(index: number): void {
@@ -403,6 +441,14 @@
   }
 
   function handleRowKeydown(event: KeyboardEvent, asset: Asset, index: number): void {
+    // Nested buttons own their keys, including native Enter/Space activation.
+    if (event.target !== event.currentTarget) {
+      if (!event.metaKey && !event.ctrlKey && !event.altKey
+        && ['Enter', ' ', 'ArrowDown', 'ArrowRight', 'ArrowUp', 'ArrowLeft', 'Home', 'End', 'Delete', 'Backspace', 'Escape'].includes(event.key)) {
+        event.stopPropagation();
+      }
+      return;
+    }
     if (moveSelection(event, index)) return;
     if (event.key === 'Delete' || event.key === 'Backspace') {
       event.preventDefault();
@@ -423,6 +469,81 @@
     }
   }
 
+  /* ── compositions ── */
+  function showProjectMenu(event: MouseEvent): void {
+    if ((event.target as Element).closest('.asset-card')) return;
+    event.preventDefault();
+    event.stopPropagation();
+    PM.menu(event.currentTarget, [
+      { label: 'New Composition…', kb: '⌘N', run: () => PM.cmd('newComposition') },
+      { label: 'Import Media…', kb: '⌘I', run: () => PM.pickFiles() },
+    ], { x: event.clientX, y: event.clientY });
+  }
+
+  function compDetails(comp: CompItem): string {
+    const fps = Math.round(comp.fps * 100) / 100;
+    return `${comp.w}×${comp.h} · ${fps} fps · ${mediaDuration(comp.dur) || `${comp.dur}s`}`;
+  }
+
+  function selectComp(id: string, row?: HTMLElement): void {
+    selectedAssetId = null;
+    PM.Kernel?.services.get('viewer')?.preview?.clear?.();
+    selectedCompId = id;
+    row?.focus();
+    status = `Selected ${comps.find((comp) => comp.id === id)?.name ?? 'composition'}`;
+  }
+
+  function openComp(comp: CompItem): void {
+    PM.cmd('openComposition', comp.id);
+    status = `Opened ${comp.name}`;
+  }
+
+  function nestComp(comp: CompItem): void {
+    if (PM.cmd('addCompositionToTimeline', comp.id)) status = `Added ${comp.name} to ${PM.proj.compName}`;
+  }
+
+  function showCompMenu(event: MouseEvent, comp: CompItem): void {
+    event.preventDefault();
+    event.stopPropagation();
+    selectComp(comp.id, event.currentTarget as HTMLElement);
+    const nestable = PM.Comps.canNest(comp.id);
+    PM.menu(event.currentTarget, [
+      { header: comp.name },
+      { label: 'New Composition…', kb: '⌘N', run: () => PM.cmd('newComposition') },
+      { label: 'Open in Timeline', disabled: comp.open, run: () => openComp(comp) },
+      { label: 'Add to timeline', disabled: !nestable, run: () => nestComp(comp) },
+      '-',
+      { label: 'Composition Settings…', run: () => PM.cmd('compositionSettings', comp.id) },
+      { label: 'Duplicate', run: () => { const id = PM.cmd('duplicateComposition', comp.id); if (id) selectedCompId = id; } },
+      '-',
+      { label: 'Delete composition…', disabled: comps.length <= 1, run: () => PM.cmd('deleteComposition', comp.id) },
+    ], { x: event.clientX, y: event.clientY });
+  }
+
+  function handleCompDragStart(event: DragEvent, comp: CompItem): void {
+    if ((event.target as Element).closest('button')) { event.preventDefault(); return; }
+    const dt = event.dataTransfer;
+    if (!dt) return;
+    const payload = { id: comp.id, name: comp.name, kind: 'comp', dur: comp.dur };
+    dt.setData('application/x-powermove-asset', JSON.stringify(payload));
+    dt.effectAllowed = 'copy';
+    const tile = (event.currentTarget as HTMLElement).querySelector<HTMLElement>('.asset-preview');
+    if (tile) dt.setDragImage(tile, tile.offsetWidth / 2, tile.offsetHeight / 2);
+    draggingCompId = comp.id;
+    selectedCompId = comp.id;
+    PM.mediaDrag = payload;
+  }
+  function handleCompDragEnd(): void { draggingCompId = null; PM.mediaDrag = null; }
+
+  function handleCompKeydown(event: KeyboardEvent, comp: CompItem): void {
+    if (event.target !== event.currentTarget) return;
+    if (event.key === 'Enter') { event.preventDefault(); openComp(comp); }
+    else if (event.key === 'Delete' || event.key === 'Backspace') {
+      event.preventDefault(); event.stopPropagation();
+      PM.cmd('deleteComposition', comp.id);
+    } else if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); clearSelection(); }
+  }
+
 </script>
 
 <div
@@ -437,21 +558,72 @@
   ondragover={handleDragOver}
   ondragleave={handleDragLeave}
   ondrop={handleDrop}
+  oncontextmenu={showProjectMenu}
 >
   <div class="asset-list" role="listbox" tabindex="-1" aria-label="Project media" bind:this={listElement} onpointerdown={handleListPointerDown}>
+    {#each comps as comp (comp.id)}
+      <div
+        class="asset-card is-comp"
+        class:is-dragging={draggingCompId === comp.id}
+        class:is-open={comp.open}
+        role="option"
+        tabindex="-1"
+        aria-selected={selectedCompId === comp.id}
+        aria-current={comp.open ? 'true' : undefined}
+        data-comp-id={comp.id}
+        draggable="true"
+        title={`${comp.name} · double-click to open, or drag into a timeline`}
+        ondragstart={(event) => handleCompDragStart(event, comp)}
+        ondragend={handleCompDragEnd}
+        onpointerdown={(event) => { if (event.button === 0 && !(event.target as Element).closest('button')) selectComp(comp.id, event.currentTarget as HTMLElement); }}
+        oncontextmenu={(event) => showCompMenu(event, comp)}
+        ondblclick={(event) => { if ((event.target as Element).closest('button')) return; event.preventDefault(); openComp(comp); }}
+        onkeydown={(event) => handleCompKeydown(event, comp)}
+      >
+        <span class="asset-preview comp" style={`--comp-bg:${comp.bg || '#000000'};--comp-ratio:${comp.w}/${comp.h}`}>
+          <span class="comp-frame" aria-hidden="true">
+            {#if compThumbs.urls[comp.id]}<img class="comp-thumb" src={compThumbs.urls[comp.id]} alt="" />{/if}
+          </span>
+          {#if !compThumbs.urls[comp.id]}<Icon {PM} name="layers" />{/if}
+          <span class="asset-badge">{mediaDuration(comp.dur) || `${comp.dur}s`}</span>
+          {#if comp.open}<span class="comp-open" role="img" aria-label="Open in the timeline"></span>{/if}
+          <span class="asset-actions">
+            <button class="asset-add" type="button" title="Add to timeline" aria-label={`Add ${comp.name} to timeline`} disabled={!(doc.tick.structure, PM.Comps.canNest(comp.id))}
+              onclick={(event) => { event.stopPropagation(); nestComp(comp); }}>
+              <Icon {PM} name="plus" />
+            </button>
+          </span>
+        </span>
+        <span class="asset-copy">
+          <b title={comp.name}>{comp.name}</b>
+          <small title={compDetails(comp)}>{compDetails(comp)}</small>
+        </span>
+      </div>
+    {/each}
     {#each assets as asset, index (asset.id)}
-      {@const currentAsset = liveAsset(asset)}
+      {@const currentAsset = (doc.tick.assets, liveAsset(asset))}
+      {@const posterSrc = (doc.tick.assets, posterUrl(asset))}
+      {@const loading = (doc.tick.assets, isLoading(asset))}
+      {@const offline = !currentAsset && !loading}
+      {@const cloud = (doc.tick.assets, offline ? PM.assets.cloud?.get(asset.id) : undefined)}
+      {@const loadError = (doc.tick.assets, offline ? PM.assets.errors?.get(asset.id) : undefined)}
+      {@const downloading = cloud?.state === 'downloading'}
+      {@const detail = (doc.tick.assets, offlineDetail(asset))}
       <div
         class="asset-card"
         class:is-dragging={draggingId === asset.id}
+        class:is-offline={offline}
+        class:is-loading={loading}
+        class:is-cloud={!!cloud}
         role="option"
-        draggable="true"
+        aria-busy={loading || downloading}
+        draggable={!offline && !loading}
         ondragstart={(event) => handleDragStart(event, asset)}
         ondragend={handleDragEnd}
         tabindex={activeAssetId ? (activeAssetId === asset.id ? 0 : -1) : (index === 0 ? 0 : -1)}
         aria-selected={activeAssetId === asset.id}
         data-asset-id={asset.id}
-        title="Select media · double-click to add, or drag onto the timeline"
+        title={loading ? 'Loading media…' : offline ? detail : 'Select media · double-click to preview, or drag onto the timeline'}
         onpointerdown={(event) => handleRowPointerDown(event, asset)}
         oncontextmenu={(event) => showAssetMenu(event, asset)}
         ondblclick={(event) => handleRowDoubleClick(event, asset)}
@@ -464,22 +636,41 @@
             </span>
           {:else}
             <Icon {PM} name={assetIcon(asset.kind)} />
-            {#if asset.kind === 'image' && currentAsset?.url}
+            {#if posterSrc}
+              <img class="asset-poster" src={posterSrc} alt="" />
+            {:else if asset.kind === 'image' && currentAsset?.url}
               <img src={currentAsset.url} alt="" />
             {:else if asset.kind === 'video' && videoSource(currentAsset)}
               <video src={videoSource(currentAsset)} muted playsinline preload="auto" use:poster></video>
             {/if}
           {/if}
-          {#if asset.dur}<span class="asset-badge">{mediaDuration(asset.dur)}</span>{/if}
+          {#if loading}
+            <span class="asset-loading" role="status" aria-label="Loading media">Loading…</span>
+          {:else if offline}
+            <span class="asset-offline" role="img" aria-label={cloud ? 'Media in cloud' : loadError ? 'Media unavailable' : 'Media offline'}>
+              <Icon {PM} name={cloud ? 'download' : 'missing'} />
+              {downloading ? 'Downloading…' : cloud ? 'In cloud' : loadError ? 'Media unavailable' : 'Media offline'}
+            </span>
+          {:else if asset.dur}<span class="asset-badge">{mediaDuration(asset.dur)}</span>{/if}
           <span class="asset-actions">
             {#if finderPath(asset)}
               <button class="asset-reveal" type="button" title="Reveal in Finder" aria-label={`Reveal ${asset.name} in Finder`} onclick={(event) => revealAsset(event, asset)}>
                 <Icon {PM} name="project" />
               </button>
             {/if}
-            <button class="asset-add" type="button" title="Add to timeline" aria-label={`Add ${asset.name} to timeline`} onclick={(event) => addAsset(event, asset)}>
-              <Icon {PM} name="plus" />
-            </button>
+            {#if cloud}
+              <button class="asset-download" type="button" disabled={downloading} title={downloading ? 'Downloading…' : cloud.state === 'error' ? 'Retry download' : 'Download from cloud'} aria-label={`Download ${asset.name} from cloud`} onclick={(event) => addAsset(event, asset)}>
+                <Icon {PM} name="download" />
+              </button>
+            {:else if offline}
+              <button class="asset-locate" type="button" title="Locate file" aria-label={`Locate ${asset.name}`} onclick={(event) => addAsset(event, asset)}>
+                <Icon {PM} name="link" />
+              </button>
+            {:else}
+              <button class="asset-add" type="button" disabled={loading} title="Add to timeline" aria-label={`Add ${asset.name} to timeline`} onclick={(event) => addAsset(event, asset)}>
+                <Icon {PM} name="plus" />
+              </button>
+            {/if}
             <button
               class="asset-delete"
               type="button"
@@ -497,7 +688,13 @@
         </span>
         <span class="asset-copy">
           <b title={asset.name}>{asset.name}</b>
-          <small title={mediaDetails(asset)}>{mediaDetails(asset)}</small>
+          {#if loading}
+            <small>Loading media…</small>
+          {:else if offline}
+            <small class="asset-missing" title={detail}>{detail}</small>
+          {:else}
+            <small title={mediaDetails(asset)}>{mediaDetails(asset)}</small>
+          {/if}
         </span>
       </div>
     {:else}

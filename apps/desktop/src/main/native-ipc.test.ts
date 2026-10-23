@@ -8,6 +8,7 @@ import type { IpcMain, IpcMainEvent, IpcMainInvokeEvent } from 'electron';
 const electronMocks = vi.hoisted(() => ({
   browserWindowFromWebContents: vi.fn(),
   dialogShowSave: vi.fn(),
+  dialogShowOpen: vi.fn(),
   nativeTheme: { shouldUseDarkColors: false, themeSource: 'system' },
   shellOpenExternal: vi.fn(),
   shellShowItemInFolder: vi.fn()
@@ -17,7 +18,7 @@ vi.mock('electron', () => ({
   BrowserWindow: {
     fromWebContents: electronMocks.browserWindowFromWebContents
   },
-  dialog: { showSaveDialog: electronMocks.dialogShowSave },
+  dialog: { showSaveDialog: electronMocks.dialogShowSave, showOpenDialog: electronMocks.dialogShowOpen },
   nativeTheme: electronMocks.nativeTheme,
   shell: { openExternal: electronMocks.shellOpenExternal, showItemInFolder: electronMocks.shellShowItemInFolder }
 }));
@@ -27,6 +28,7 @@ import { registerLogIpc } from './log';
 import { MIN_HAPTIC_INTERVAL_MS, registerHapticsIpc } from './haptics';
 import {
   MAX_SAVE_NAME_CHARS,
+  registerProjectOpenPathIpc,
   registerSaveIpc,
   sanitizeSaveName,
   saveFiltersForName
@@ -39,6 +41,8 @@ import {
   registerThemeIpc
 } from './theme';
 import { IPC, LIMITS, type FileSaveResult } from '../shared/ipc';
+import { ProjectFiles } from './project-files';
+import { decodeProjectContainer } from '../shared/project-container';
 
 type InvokeHandler = (event: IpcMainInvokeEvent, ...args: unknown[]) => unknown;
 type OnHandler = (event: IpcMainEvent, ...args: unknown[]) => void;
@@ -72,6 +76,71 @@ afterEach(() => {
 });
 
 describe('save IPC', () => {
+  it('owns incremental transactions per sender and never publishes an incomplete upload', async () => {
+    const folder = await mkdtemp(path.join(tmpdir(), 'pm-save-ipc-'));
+    const output = path.join(folder, 'Project.pmv');
+    const projects = new ProjectFiles(path.join(folder, 'registry.json'), path.join(folder, 'backups'));
+    const { ipcMain, invokes } = fakeIpcMain();
+    const sender = { once: vi.fn(), isDestroyed: () => false }, other = { once: vi.fn(), isDestroyed: () => false };
+    const call = (channel: string, payload: unknown, owner = sender): Promise<any> => Promise.resolve(invokes.get(channel)!(invokeEvent(owner), payload));
+    electronMocks.browserWindowFromWebContents.mockReturnValue({ isDestroyed: () => false });
+    registerSaveIpc(ipcMain, { isTrustedSender: () => true, projects,
+      dialogs: { showSave: async () => ({ canceled: false, filePath: output }) } });
+    const json = Buffer.from(JSON.stringify({ proj: { w: 100, h: 100, layers: [] } }));
+    const request = { name: 'Project.pmv', projectId: 'one', documentBytes: json.length, media: [] };
+    try {
+      const first = await call(IPC.projectSaveBegin, request);
+      expect(first.ok).toBe(true);
+      await expect(call(IPC.projectSaveChunk, { token: first.token, assetId: null, data: json }, other)).rejects.toThrow('Invalid');
+      await expect(call(IPC.projectSaveFinish, first.token, other)).rejects.toThrow('token');
+      await expect(call(IPC.fileSaveUpload, 3)).rejects.toThrow('already');
+      expect(await call(IPC.projectSaveFinish, first.token)).toMatchObject({ ok: false, cancelled: false });
+      await expect(readFile(output)).rejects.toMatchObject({ code: 'ENOENT' });
+      const retry = await call(IPC.projectSaveBegin, request);
+      await call(IPC.projectSaveChunk, { token: retry.token, assetId: null, data: json });
+      expect(await call(IPC.projectSaveFinish, retry.token)).toEqual({ ok: true, path: output });
+      expect(decodeProjectContainer(await readFile(output)).document.proj.w).toBe(100);
+      const aborted = await call(IPC.projectSaveBegin, request);
+      await call(IPC.projectSaveAbort, aborted.token, other);
+      await call(IPC.projectSaveChunk, { token: aborted.token, assetId: null, data: json });
+      await call(IPC.projectSaveAbort, aborted.token);
+      expect((await readdir(folder)).some(name => name.endsWith('.tmp'))).toBe(false);
+    } finally { await rm(folder, { recursive: true, force: true }); }
+  });
+  it.each([false, true])('writes to a previously selected export destination (directory: %s)', async directory => {
+    const folder = await mkdtemp(path.join(tmpdir(), 'powermove-export-test-'));
+    const output = path.join(folder, 'chosen.png');
+    const showSave = vi.fn(async () => ({ canceled: false, filePath: output }));
+    electronMocks.dialogShowOpen.mockResolvedValue({ canceled: false, filePaths: [folder] });
+    electronMocks.browserWindowFromWebContents.mockReturnValue({ isDestroyed: () => false });
+    const { ipcMain, invokes } = fakeIpcMain();
+    registerSaveIpc(ipcMain, { isTrustedSender: () => true, dialogs: { showSave } });
+    const sender = { once: vi.fn() };
+    const call = (channel: string, payload: unknown, owner = sender) => invokes.get(channel)!(invokeEvent(owner), payload);
+    try {
+      const token = await call(IPC.exportChoose, { name: 'chosen.png', directory });
+      expect(await readdir(folder)).toEqual([]);
+      await expect(call(IPC.fileSave, { name: 'chosen.png', data: new Uint8Array([7]), destinationToken: token }, { once: vi.fn() })).rejects.toThrow('Unknown export destination');
+      if (directory) await expect(call(IPC.fileSave, { name: '../escape.png', data: new Uint8Array([7]), destinationToken: token })).rejects.toThrow('Invalid export frame name');
+      expect(await call(IPC.fileSave, { name: 'chosen.png', data: new Uint8Array([7]), destinationToken: token })).toEqual({ ok: true, path: output });
+      expect([...await readFile(output)]).toEqual([7]);
+      expect(showSave).toHaveBeenCalledTimes(directory ? 0 : 1);
+      await call(IPC.exportRelease, token);
+      await expect(call(IPC.fileSave, { name: 'chosen.png', data: new Uint8Array([7]), destinationToken: token })).rejects.toThrow('Unknown export destination');
+    } finally { await rm(folder, { recursive: true, force: true }); }
+  });
+
+  it('cancels destination selection without writing and permits retry', async () => {
+    electronMocks.browserWindowFromWebContents.mockReturnValue({ isDestroyed: () => false });
+    const showSave = vi.fn(async () => ({ canceled: true, filePath: '' }));
+    const { ipcMain, invokes } = fakeIpcMain();
+    registerSaveIpc(ipcMain, { isTrustedSender: () => true, dialogs: { showSave } });
+    const event = invokeEvent({ once: vi.fn() });
+    expect(await invokes.get(IPC.exportChoose)!(event, { name: 'export.webm' })).toBeNull();
+    expect(await invokes.get(IPC.exportChoose)!(event, { name: 'export.webm' })).toBeNull();
+    expect(showSave).toHaveBeenCalledTimes(2);
+  });
+
   it('reduces suggestions to a bounded basename and maps its extension', () => {
     expect(sanitizeSaveName('../folder\\project\0.pmv')).toBe('project.pmv');
     expect(sanitizeSaveName(`${'x'.repeat(250)}/project.pmv`)).toBe('project.pmv');
@@ -132,10 +201,10 @@ describe('save IPC', () => {
     try {
       for (let i = 0; i < 12; i++) {
         const uploadId = await call(IPC.fileSaveUpload, 3);
-        expect(() => call(IPC.fileSaveChunk, { uploadId, data: new Uint8Array([1]) }, other)).toThrow('Invalid save chunk');
+        await expect(call(IPC.fileSaveChunk, { uploadId, data: new Uint8Array([1]) }, other)).rejects.toThrow('Invalid save chunk');
         await expect(call(IPC.fileSave, { uploadId, name: 'chunks.pmv' })).rejects.toThrow('incomplete');
-        call(IPC.fileSaveChunk, { uploadId, data: new Uint8Array([1, 2]) });
-        call(IPC.fileSaveChunk, { uploadId, data: new Uint8Array([3]) });
+        await call(IPC.fileSaveChunk, { uploadId, data: new Uint8Array([1, 2]) });
+        await call(IPC.fileSaveChunk, { uploadId, data: new Uint8Array([3]) });
         expect(await call(IPC.fileSave, { uploadId, name: 'chunks.pmv' })).toMatchObject({ ok: true });
       }
       expect([...await readFile(destination)]).toEqual([1, 2, 3]);
@@ -146,6 +215,44 @@ describe('save IPC', () => {
       expect(finalUpload).toBeTypeOf('string');
       await call(IPC.fileSaveAbort, finalUpload);
     } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it('restricts project reads to the opener and closes handles on finish and window destruction', async () => {
+    const { EventEmitter } = await import('node:events');
+    const sender = Object.assign(new EventEmitter(), { isDestroyed: () => false }), other = new EventEmitter();
+    electronMocks.browserWindowFromWebContents.mockReturnValue({ isDestroyed: () => false });
+    electronMocks.dialogShowOpen.mockResolvedValue({ canceled: false, filePaths: ['/chosen.pmv'] });
+    const projects = { open: vi.fn(async () => ({ token: 'read-token', document: {}, media: [], size: 4 })),
+      read: vi.fn(async () => new Uint8Array([1, 2])), close: vi.fn(async () => undefined) };
+    const { ipcMain, invokes } = fakeIpcMain();
+    registerSaveIpc(ipcMain, { isTrustedSender: () => true, projects: projects as any });
+    const call = (channel: string, payload?: unknown, owner = sender) => invokes.get(channel)!(invokeEvent(owner), payload);
+    await call(IPC.projectOpen);
+    await expect(call(IPC.projectRead, { token: 'read-token', offset: 0, length: 2 }, other as any)).rejects.toThrow('token');
+    await expect(call(IPC.projectReadClose, 'read-token', other as any)).rejects.toThrow('token');
+    expect(projects.read).not.toHaveBeenCalled();
+    expect(await call(IPC.projectRead, { token: 'read-token', offset: 0, length: 2 })).toEqual(new Uint8Array([1, 2]));
+    await call(IPC.projectReadClose, 'read-token');
+    expect(projects.close).toHaveBeenCalledWith('read-token', true);
+    await expect(call(IPC.projectRead, { token: 'read-token', offset: 0, length: 2 })).rejects.toThrow('token');
+    await call(IPC.projectOpen);
+    sender.emit('destroyed');
+    expect(projects.close).toHaveBeenLastCalledWith('read-token', false);
+  });
+
+  it('opens a picked project by path and refuses anything else', async () => {
+    const { EventEmitter } = await import('node:events');
+    const sender = Object.assign(new EventEmitter(), { isDestroyed: () => false });
+    const projects = { open: vi.fn(async () => ({ token: 'read-token', document: {}, media: [], size: 4 })), close: vi.fn() };
+    const { ipcMain, invokes } = fakeIpcMain();
+    registerProjectOpenPathIpc(ipcMain, { isTrustedSender: () => true, projects: projects as any });
+    const call = (payload: unknown) => invokes.get(IPC.projectOpenPath)!(invokeEvent(sender), payload);
+    expect(await call('/chosen.pmv')).toMatchObject({ ok: true, token: 'read-token' });
+    expect(projects.open).toHaveBeenCalledWith('/chosen.pmv');
+    await expect(call('relative.pmv')).rejects.toThrow('invalid project path');
+    await expect(call('/etc/passwd')).rejects.toThrow('invalid project path');
+    await expect(call(42)).rejects.toThrow('invalid project path');
+    expect(projects.open).toHaveBeenCalledOnce();
   });
 
   it('returns the streaming-export error before opening a sheet', async () => {
@@ -366,6 +473,40 @@ describe('external URL IPC', () => {
     ).rejects.toThrow('shell:open-external: expected an http(s) URL');
   });
 
+  it('opens an extension URL only when it is https, credential-free and at most 2 KB', async () => {
+    electronMocks.shellOpenExternal.mockClear().mockResolvedValue(undefined);
+    const { ipcMain, invokes } = fakeIpcMain();
+    registerShellIpc(ipcMain, { isTrustedSender: () => true, windowFor: () => ({ isDestroyed: () => false, isFocused: () => true }) });
+    await invokes.get(IPC.extensionOpenExternal)?.(invokeEvent(), 'https://replicate.com/account/api-tokens');
+    expect(electronMocks.shellOpenExternal).toHaveBeenCalledWith('https://replicate.com/account/api-tokens');
+    for (const url of ['http://example.com', 'https://user:pass@example.com', `https://example.com/${'a'.repeat(2048)}`, 'file:///etc/passwd', 42]) {
+      await expect(invokes.get(IPC.extensionOpenExternal)?.(invokeEvent(), url)).rejects.toThrow(IPC.extensionOpenExternal);
+    }
+    expect(electronMocks.shellOpenExternal).toHaveBeenCalledTimes(1);
+
+    const untrusted = fakeIpcMain();
+    registerShellIpc(untrusted.ipcMain, { isTrustedSender: () => false });
+    await expect(untrusted.invokes.get(IPC.extensionOpenExternal)?.(invokeEvent(), 'https://example.com')).rejects.toThrow('Unauthorized IPC sender');
+    expect(electronMocks.shellOpenExternal).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens an extension URL only from the focused window, never from the background', async () => {
+    electronMocks.shellOpenExternal.mockClear().mockResolvedValue(undefined);
+    const focused = { isDestroyed: () => false, isFocused: () => false };
+    const sender = {};
+    electronMocks.browserWindowFromWebContents.mockImplementation((contents: unknown) => contents === sender ? focused : null);
+    const { ipcMain, invokes } = fakeIpcMain();
+    registerShellIpc(ipcMain, { isTrustedSender: () => true });
+    const open = (from: object) => invokes.get(IPC.extensionOpenExternal)!(invokeEvent(from), 'https://replicate.com/');
+    await expect(open(sender)).rejects.toThrow('focused window');
+    await expect(open({})).rejects.toThrow('focused window');
+    expect(electronMocks.shellOpenExternal).not.toHaveBeenCalled();
+    focused.isFocused = () => true;
+    await open(sender);
+    expect(electronMocks.shellOpenExternal).toHaveBeenCalledWith('https://replicate.com/');
+    electronMocks.browserWindowFromWebContents.mockReset();
+  });
+
   it('rejects an untrusted sender before opening an external URL', async () => {
     const { ipcMain, invokes } = fakeIpcMain();
     registerShellIpc(ipcMain, { isTrustedSender: () => false });
@@ -386,7 +527,7 @@ describe('external URL IPC', () => {
       .toThrow('media:reveal-source: expected an absolute file path');
   });
 
-  it('materializes bounded attachment bytes under app-owned cache storage before revealing', async () => {
+  it('materializes attachment bytes under app-owned cache storage before revealing', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'powermove-attachment-test-'));
     const { ipcMain, invokes } = fakeIpcMain();
     registerShellIpc(ipcMain, { isTrustedSender: () => true, attachmentCacheDirectory: directory });
@@ -396,6 +537,13 @@ describe('external URL IPC', () => {
       expect(path.relative(directory, revealed)).not.toMatch(/^\.\./);
       expect(path.basename(revealed)).toBe('brief.pdf');
       expect([...await readFile(revealed)]).toEqual([1, 2, 3]);
+      const large = new Uint8Array(64 * 1024 * 1024 + 1);
+      large[large.length - 1] = 123;
+      await invokes.get(IPC.attachmentReveal)?.(invokeEvent(), { name: 'large.pdf', data: large });
+      const largePath = electronMocks.shellShowItemInFolder.mock.calls.at(-1)?.[0] as string;
+      const stored = await readFile(largePath);
+      expect(stored.length).toBe(large.length);
+      expect(stored.at(-1)).toBe(123);
       await expect(invokes.get(IPC.attachmentReveal)?.(invokeEvent(), { name: '../secret', data: new Uint8Array() }))
         .rejects.toThrow('attachment:reveal: expected a safe name');
     } finally {

@@ -44,6 +44,7 @@ import type {
   WorkspaceAPI
 } from './api';
 import type { ExtensionsBridge } from '../../../shared/extensions';
+import type { VarsBridge } from '../../../shared/vars-ipc';
 import type { PowermoveExtensionsBridge } from '../../../shared/ipc';
 import { createExtensionAPI, type ExtensionHandle, type HostDeps, type PanelsBackend } from './host';
 import { createLoader, type BuiltinFactory, type Loader } from './loader';
@@ -66,6 +67,7 @@ import { doc } from '../state/document.svelte';
 import { sel } from '../state/selection.svelte';
 import { perf, transport } from '../state/transport.svelte';
 import { EditGesture, type EditBinding } from '../controls/gesture';
+import { confirm as confirmPrompt } from '../overlays/confirm';
 import {
   CHANNELS_3D,
   inversePlane,
@@ -99,6 +101,9 @@ import {
   restorePanel,
   type Workspace as LayoutWorkspace
 } from '../layout/model';
+import { bridge as hostBridge } from './bridge';
+import { parseExtensionUrl } from '../../../shared/extension-url';
+import { fetchRemoteMedia, type AdmitDownload, type ImportUrl } from './remote-media';
 
 type LegacyPM = Record<string, any>;
 type ExtensionsHostBridge = ExtensionsBridge & Partial<Pick<PowermoveExtensionsBridge, 'fork'>>;
@@ -156,6 +161,7 @@ function makeProject(PM: LegacyPM): ProjectAPI {
   });
   return {
     get: () => PM?.proj as Project,
+    latest: () => PM?.proj as Project | undefined,
     revision: () => Number(PM?.proj?.revision ?? 0),
     apply: (commands: EditCommand | EditCommand[], meta?: EditMeta): EditResult =>
       (PM?.Edit?.apply?.(commands, meta) as EditResult | undefined) ?? { ok: false, message: 'editing engine unavailable' },
@@ -340,6 +346,7 @@ function makeRender(PM: LegacyPM): RenderAPI {
       get context() { return PM?.GL?.gl ?? null; }
     },
     raster: (...args) => PM?.raster?.(...args) ?? null,
+    textLayout: (layer, time) => PM?.textCaretLayout?.(layer, time ?? PM?.time ?? 0) ?? null,
     renderFrameTo: (...args) => PM?.renderFrameTo?.(...args),
     snapshot: (...args) => PM?.Export?.snapshot?.(...args) ?? ''
   } as RenderAPI;
@@ -347,6 +354,7 @@ function makeRender(PM: LegacyPM): RenderAPI {
 
 function makeUIState(PM: LegacyPM): UIStateAPI {
   return {
+    timelineVersion: () => Number(PM?.UIState?.timelineVersion?.() ?? 0),
     getLayerCollapsed: (layer) => !!PM?.UIState?.getLayerCollapsed?.(layer),
     setLayerCollapsed: (layer, collapsed) => !!PM?.UIState?.setLayerCollapsed?.(layer, collapsed),
     getGroupCollapsed: (layer) => !!PM?.UIState?.getGroupCollapsed?.(layer),
@@ -480,26 +488,18 @@ function makeUI(
   return {
     controls: boundControls(controlAPI),
     toast: (text, opts) => PM?.toast?.(text, opts?.sticky ? 8000 : 2200, opts ?? {}),
-    confirm: (title, body) =>
-      new Promise<boolean>((resolve) => {
-        let settled = false;
-        const done = (value: boolean): void => {
-          if (settled) return;
-          settled = true;
-          resolve(value);
-        };
-        const handle = PM?.modal?.({
-          title,
-          body: body ?? '',
-          actions: [
-            { label: 'Cancel', run: () => done(false) },
-            { label: 'OK', pri: true, run: () => done(true) }
-          ],
-          onClose: () => done(false)
-        });
-        if (!handle) done(false);
-      }),
-    menu: (anchor, items: MenuContribution[]) => {
+    confirm: (title, body) => confirmPrompt(PM, { message: title, ...(body ? { detail: body } : {}) }),
+    openExternal: async (value) => {
+      const url = parseExtensionUrl(value);
+      if (!url) throw new TypeError('ui.openExternal accepts an https URL of at most 2 KB without credentials');
+      const host = hostBridge();
+      // The browser host (powermove serve) opens it in the page's own browser.
+      const open = host?.extensionOpenExternal ?? host?.openExternal;
+      if (!open) throw new Error('ui.openExternal is unavailable in this host');
+      await open.call(host, url.href);
+      return true;
+    },
+    menu: (anchor, items: MenuContribution[] | Promise<MenuContribution[]>) => {
       if (anchor && typeof (anchor as HTMLElement).getBoundingClientRect === 'function') PM?.menu?.(anchor, items);
       else {
         const point = anchor as { x: number; y: number };
@@ -540,7 +540,7 @@ function makeStorage(PM: LegacyPM): (id: string) => StorageAPI {
 }
 
 function makeAssets(PM: LegacyPM): AssetsAPI {
-  return {
+  const assets: AssetsAPI = {
     pick: (options = {}) => new Promise<File[]>((resolve, reject) => {
       const input = window.document.createElement('input');
       input.type = 'file';
@@ -576,10 +576,11 @@ function makeAssets(PM: LegacyPM): AssetsAPI {
       if (typeof live?.sourceText === 'string') return live.sourceText;
       const blob = live?.blob instanceof Blob ? live.blob : await PM?.MediaStore?.get?.(meta);
       if (!(blob instanceof Blob)) throw new Error(`Asset data is missing: ${meta.name || id}`);
-      if (blob.size > 64 * 1024 * 1024) throw new Error('Text asset is larger than 64 MB');
       return blob.text();
-    }
+    },
+    importUrl: (async (url: string, admit?: AdmitDownload) => (await assets.import(await fetchRemoteMedia(url, undefined, admit))).id) satisfies ImportUrl
   };
+  return assets;
 }
 
 /**
@@ -597,6 +598,7 @@ function makePanelsBackend(PM: LegacyPM, kernel: Kernel): PanelsBackend {
       const explicitOptions = typeof placement === 'object' && placement !== null;
       const options = typeof placement === 'string' ? { dock: placement } : (placement ?? {});
       const dock = options.dock;
+      PM?.Layout?.rememberPanelOpen?.(id);
       if (!PM?.Layout?.hasPanel?.(current(), id)) {
         PM?.WS?.mutate?.((workspace: any) => {
           /* A hidden panel remembers its dock, index and size — restore beats
@@ -623,11 +625,19 @@ function makePanelsBackend(PM: LegacyPM, kernel: Kernel): PanelsBackend {
       PM?.Layout?.refresh?.(id);
     },
     close: (id) => {
-      const hide = PM?.Layout?.hidePanel ?? PM?.Layout?.removePanel;
+      const hide = PM?.Layout?.closePanel ?? PM?.Layout?.hidePanel ?? PM?.Layout?.removePanel;
       if (!hide) return;
       PM?.WS?.mutate?.((workspace: unknown) => hide(workspace, id));
     },
     isOpen: (id) => !!PM?.Layout?.hasPanel?.(current(), id),
+    isHidden: (id) => {
+      const hidden = ((current() as { hiddenPanels?: Array<{ id?: string }> } | undefined)?.hiddenPanels ?? []).some((item) => item.id === id);
+      /* Seed the global preference from the old per-workspace behavior. This
+         runs only for activation-time auto-open checks, so an intentionally
+         hidden extension panel does not reappear in another project. */
+      if (hidden) PM?.Layout?.rememberPanelClosed?.(id);
+      return hidden || PM?.Layout?.isPanelClosed?.(id) === true;
+    },
     refresh: (id) => PM?.Layout?.refresh?.(id),
     list: () => [...new Set([...kernel.panels.ids(), ...Object.keys(PM?.PANELS ?? {})])]
   };
@@ -654,14 +664,23 @@ function makeExtensionsAPI(PM: LegacyPM, bridge: ExtensionsHostBridge | null, ge
     rebase: (id) => {
       if (typeof PM?.requestExtensionRebase === 'function') PM.requestExtensionRebase(id);
       else PM?.cmd?.('agent');
+    },
+    setUp: (id) => {
+      const record = storeRecords().find((item) => item.id === id);
+      if (record) PM?.Vars?.openSetup?.(record);
     }
   };
 }
 
 function resolveBridge(PM: LegacyPM): ExtensionsHostBridge | null {
-  const candidate = (globalThis as Record<string, any>)?.powermove?.extensions ?? PM?.extensionsBridge ?? null;
+  const candidate = (hostBridge() as Record<string, any> | undefined)?.extensions ?? PM?.extensionsBridge ?? null;
   if (candidate && typeof candidate.list === 'function' && typeof candidate.onChanged === 'function') return candidate as ExtensionsHostBridge;
   return null;
+}
+
+function resolveVarsBridge(): Pick<VarsBridge, 'values'> | null {
+  const candidate = (hostBridge() as Record<string, any> | undefined)?.vars;
+  return candidate && typeof candidate.values === 'function' ? candidate as VarsBridge : null;
 }
 
 /* ── install ─────────────────────────────────────────────── */
@@ -752,6 +771,8 @@ export function installKernel(PM: LegacyPM): InstalledKernel {
     typeof PM?.cmd === 'function' ? PM.cmd(command, ...(args ?? [])) : runKernelCommand(kernel, command, args)
   );
   subscriptions.push(() => keyListener.dispose());
+  const inputKeyOff = hostBridge()?.onInputKey?.(input => kernel.dispatchTrustedKey(input));
+  if (inputKeyOff) subscriptions.push(inputKeyOff);
 
   const signals = installKernelSignals(kernel);
   subscriptions.push(() => signals.dispose());
@@ -885,6 +906,19 @@ export function installKernel(PM: LegacyPM): InstalledKernel {
   });
 
   PM.Kernel = installed;
+  kernel.services.register('compositions', {
+    openTabs: () => PM.Comps?.openTabs() ?? [],
+    get: (id: string) => PM.Comps?.get(id) ?? null,
+    isOpen: (id: string) => PM.Comps?.isOpen(id) ?? false,
+    open: (id: string) => PM.Comps?.open(id) ?? false,
+    close: (id: string) => PM.Comps?.close(id) ?? false,
+    onChange: (listener: () => void) => PM.bus.on('comps', listener),
+  });
+  for (const location of ['viewer:context', 'timeline:context'] as const) {
+    kernel.contributeMenu('core', location, () => [
+      { label: 'New Composition…', icon: 'plus', kb: '⌘N', run: () => PM.cmd('newComposition') }
+    ]);
+  }
   return installed;
 }
 
@@ -897,6 +931,7 @@ export async function bootExtensions(installed: InstalledKernel, builtins: Recor
   const loader = createLoader({
     kernel: installed,
     bridge: installed.bridge,
+    vars: resolveVarsBridge(),
     builtins,
     deps: installed.deps
   });

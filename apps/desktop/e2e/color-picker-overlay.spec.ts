@@ -28,6 +28,7 @@ test('color picker stays above adjacent panels and inside the viewport', async (
   await fillRow.locator('.color-field').click();
   const picker = page.locator('.color-picker');
   await expect(picker).toBeVisible();
+  await picker.evaluate(element => Promise.all(element.getAnimations().map(animation => animation.finished)));
   const eyedropper = page.getByRole('button', { name: 'Sample screen color', exact: true });
   await expect(eyedropper).toBeVisible();
   expect(await page.evaluate(() => ({ secure: window.isSecureContext, available: typeof (window as any).EyeDropper === 'function' })))
@@ -39,7 +40,7 @@ test('color picker stays above adjacent panels and inside the viewport', async (
     });
   });
   await eyedropper.click();
-  await expect(page.getByRole('textbox', { name: 'Fill hex value', exact: true })).toHaveValue('#0A84FF');
+  await expect(page.getByRole('textbox', { name: 'Fill hex value', exact: true })).toHaveValue('#0A84FF / 100%');
 
   const geometry = await picker.evaluate(element => {
     const rect = element.getBoundingClientRect();
@@ -54,29 +55,34 @@ test('color picker stays above adjacent panels and inside the viewport', async (
     };
   });
   expect(geometry).toMatchObject({ overlayParent: 'BODY', bottomInsidePicker: true, insideViewport: true });
-  expect(geometry.width).toBeLessThanOrEqual(360);
-  expect(geometry.height).toBeLessThanOrEqual(300);
+  expect(geometry.width).toBeLessThanOrEqual(560);
+  expect(geometry.height).toBeLessThanOrEqual(310);
   await page.screenshot({ path: testInfo.outputPath('color-picker-overlay.png') });
   // Exercise both sides and the constrained middle without depending on inspector row order.
   for (const top of [70, 520, 290]) {
-    await page.getByRole('button', { name: 'Close color picker', exact: true }).click();
+    await page.keyboard.press('Escape');
+    await expect(picker).toHaveCount(0);
     const trigger = fillRow.locator('.color-field');
     await trigger.evaluate((element, y) => {
       Object.assign((element as HTMLElement).style, { position: 'fixed', top: `${y}px`, right: '24px' });
       (element as HTMLButtonElement).click();
     }, top);
     await expect(picker).toBeVisible();
+    // Measure at rest: the popover scales in from the trigger's edge first.
+    await picker.evaluate(element => Promise.all(element.getAnimations().map(animation => animation.finished)));
     const placement = await picker.evaluate(element => {
       const button = document.querySelector('#panel-inspector .color-field')!.getBoundingClientRect();
       const popup = element.getBoundingClientRect();
       return {
+        popup: { top: Math.round(popup.top), bottom: Math.round(popup.bottom) },
+        button: { top: Math.round(button.top), bottom: Math.round(button.bottom) },
         above: popup.bottom <= button.top - 5,
         below: popup.top >= button.bottom + 5,
         inside: popup.top >= 12 && popup.bottom <= window.innerHeight - 12
       };
     });
-    expect(placement.inside).toBe(true);
-    expect(placement.above || placement.below).toBe(true);
+    expect(placement, `trigger top ${top}`).toMatchObject({ inside: true });
+    expect(placement.above || placement.below, `trigger top ${top}: ${JSON.stringify(placement)}`).toBe(true);
     if (top === 70) expect(placement.below).toBe(true);
     if (top === 520) expect(placement.above).toBe(true);
   }

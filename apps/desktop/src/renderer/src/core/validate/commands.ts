@@ -46,11 +46,8 @@ import {
   type UpdateSectionCommand
 } from '../types/commands';
 
-export const COMMAND_JSON_LIMIT = 50_000;
-export const MAX_COMMANDS = 80;
-export const MAX_KEYFRAMES = 80;
-export const MAX_EASING_TARGETS = 1_000;
-export const MAX_DELETE_TARGETS = 20;
+import { COMMAND_JSON_LIMIT } from '../../../../shared/edit-limits';
+export { COMMAND_JSON_LIMIT } from '../../../../shared/edit-limits';
 export const MAX_EXPRESSION_CHARS = 2_000;
 
 const FORBIDDEN_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
@@ -69,12 +66,12 @@ const COMPOSITION_FIELDS = new Set([
   'name', 'width', 'height', 'fps', 'duration', 'background', 'backgroundFill',
   'shutter', 'workArea'
 ]);
-const EFFECT_FIELDS = new Set(['enabled', 'open']);
+const EFFECT_FIELDS = new Set(['enabled', 'open', 'index']);
 const EASING_PRESETS = new Set([
   'linear', 'ease', 'easeIn', 'easeOut', 'easeInOut', 'quadIn', 'quadOut', 'quadInOut',
   'cubicIn', 'cubicOut', 'cubicInOut', 'quartIn', 'quartOut', 'quartInOut', 'expoIn',
   'expoOut', 'expoInOut', 'circIn', 'circOut', 'circInOut', 'backIn', 'backOut',
-  'backInOut', 'power', 'snap', 'glide'
+  'backInOut', 'power', 'swish', 'snap', 'glide'
 ]);
 
 const COMMAND_FIELDS: Record<(typeof COMMAND_TYPES)[number], readonly string[]> = {
@@ -298,7 +295,7 @@ function parseReplaceKeyframes(source: Record<string, unknown>): ReplaceKeyframe
   if (path instanceof ValidationError) return path;
   if (!Array.isArray(source.keyframes)) return invalid('must be an array', 'keyframes');
   const keyframes: CommandKeyframe[] = [];
-  for (const [index, item] of source.keyframes.slice(0, MAX_KEYFRAMES).entries()) {
+  for (const [index, item] of source.keyframes.entries()) {
     if (!isRecord(item)) return invalid('must be an object', `keyframes[${index}]`);
     const time = finite(item.time, `keyframes[${index}].time`);
     if (time instanceof ValidationError) return time;
@@ -352,8 +349,7 @@ function easing(value: unknown): Easing | ValidationError {
 function parseSetEasing(source: Record<string, unknown>): SetEasingCommand | ValidationError {
   if (!Array.isArray(source.keyframes)) return invalid('must be an array', 'keyframes');
   const keyframes = source.keyframes
-    .filter((id): id is string => typeof id === 'string' && id.length > 0)
-    .slice(0, MAX_EASING_TARGETS);
+    .filter((id): id is string => typeof id === 'string' && id.length > 0);
   if (!keyframes.length) return invalid('must contain at least one keyframe ID', 'keyframes');
   const curve = easing(source.curve);
   return curve instanceof ValidationError ? curve : { type: 'set_easing', keyframes: [...new Set(keyframes)], curve };
@@ -495,7 +491,7 @@ function parseDeleteLayers(source: Record<string, unknown>): DeleteLayersCommand
   if (owns(source, 'targets')) {
     if (!Array.isArray(source.targets)) return invalid('must be an array', 'targets');
     const targets: LayerTarget[] = [];
-    for (const [index, item] of source.targets.slice(0, MAX_DELETE_TARGETS).entries()) {
+    for (const [index, item] of source.targets.entries()) {
       const parsed = target(item, `targets[${index}]`);
       if (parsed instanceof ValidationError) return parsed;
       targets.push(parsed);
@@ -550,6 +546,11 @@ function parseSetEffect(source: Record<string, unknown>): SetEffectCommand | Val
   if (targetError) return targetError;
   if (patch.enabled != null) out.patch.enabled = Boolean(patch.enabled);
   if (patch.open != null) out.patch.open = Boolean(patch.open);
+  if (patch.index != null) {
+    const index = finite(patch.index, 'patch.index');
+    if (index instanceof ValidationError) return index;
+    out.patch.index = Math.round(index);
+  }
   return out;
 }
 
@@ -577,7 +578,7 @@ function parseSetTransition(source: Record<string, unknown>): SetTransitionComma
     for (const [name, value] of Object.entries(parameters)) {
       if (typeof value === 'number' && Number.isFinite(value)
           || typeof value === 'boolean'
-          || typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value)) {
+          || typeof value === 'string' && /^#[0-9a-f]{6}(?:[0-9a-f]{2})?$/i.test(value)) {
         clean[name] = value;
       } else {
         return invalid('must be a finite number, hex color, or boolean', `transition.p.${name}`);
@@ -1060,11 +1061,12 @@ export function parseEditCommands(
     try { source = JSON.parse(raw); } catch { return invalid('commands must be valid JSON'); }
   }
   if (!Array.isArray(source)) return invalid('commands must be an array');
-  const requested = options.maxCommands ?? MAX_COMMANDS;
+  const requested = options.maxCommands ?? source.length;
   if (!Number.isSafeInteger(requested) || requested < 0) return invalid('maxCommands must be a non-negative integer');
+  if (source.length > requested) return invalid(`commands exceed the requested limit of ${requested}; no commands were parsed`);
   const commands: EditCommand[] = [];
   const parser = options.source === 'agent' ? parseAgentEditCommand : parseEditCommand;
-  for (const [index, item] of source.slice(0, requested).entries()) {
+  for (const [index, item] of source.entries()) {
     const command = parser(item);
     if (command instanceof ValidationError) {
       if (options.onInvalid === 'reject') return invalid(command.message, `commands[${index}]`);

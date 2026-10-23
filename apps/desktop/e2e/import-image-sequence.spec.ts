@@ -1,3 +1,4 @@
+import { exportStillPixels } from './helpers/media';
 import { writeFile, unlink, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { expect, test } from './helpers/app';
@@ -9,12 +10,13 @@ for (const fps of [12, 120]) test(`numbered images at ${fps} fps become one tran
   const { page } = session;
   const images = await page.evaluate(() => {
     const PM = (window as any).PM;
-    window.dispatchEvent(new CustomEvent('pm-open-project', { detail: PM.mkProject({ w: 64, h: 64, fps: 30, dur: 2, name: 'Sequence test' }) }));
+    window.dispatchEvent(new CustomEvent('pm-open-project', { detail: PM.mkProject({ w: 2048, h: 2048, fps: 30, dur: 2, name: 'Sequence test' }) }));
     PM.ProjectsScreen.hide(); PM.setTime(0, { raw: true, force: true });
     return ['red', 'lime', 'blue'].map(color => {
-      const canvas = document.createElement('canvas'); canvas.width = canvas.height = 64;
+      const canvas = document.createElement('canvas'); canvas.width = canvas.height = 2048;
       const ctx = canvas.getContext('2d')!;
-      ctx.fillStyle = color; ctx.fillRect(16, 16, 32, 32);
+      ctx.fillStyle = color; ctx.fillRect(512, 512, 1024, 1024);
+      ctx.globalAlpha = .5; ctx.fillRect(64, 64, 256, 256);
       return canvas.toDataURL('image/png').split(',')[1]!;
     });
   });
@@ -28,8 +30,34 @@ for (const fps of [12, 120]) test(`numbered images at ${fps} fps become one tran
   if (fps === 12) await expect(dialog).toContainText('Missing frame number: 11');
   await dialog.getByRole('spinbutton', { name: 'Sequence frame rate' }).fill(String(fps));
   await expect(dialog).toContainText(`${(3 / fps).toFixed(3)} s`);
+  await page.evaluate(() => {
+    const original = window.createImageBitmap.bind(window);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    window.createImageBitmap = (async (...args: any[]) => { await gate; return (original as any)(...args); }) as typeof createImageBitmap;
+    (window as any).releaseSequence = () => { window.createImageBitmap = original; release(); };
+    (window as any).sequenceProgress = [];
+    const observer = new MutationObserver(() => {
+      const card = document.querySelector('.toast[aria-label="Importing image sequence"]');
+      if (card) (window as any).sequenceProgress.push(Number(card.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow') || 0));
+    });
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true });
+    (window as any).sequenceObserver = observer;
+  });
   await dialog.getByRole('button', { name: 'Import sequence', exact: true }).click();
+  const progress = page.getByRole('status', { name: 'Importing image sequence', exact: true });
+  try {
+    await expect(progress).toContainText('Importing image sequence');
+    await expect(progress.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '0');
+    await progress.screenshot({ path: test.info().outputPath('sequence-progress.png') });
+  } finally { await page.evaluate(() => (window as any).releaseSequence()); }
   await page.waitForFunction(() => (window as any).PM.proj.layers.some((l: any) => l.name === 'frame sequence.webm'));
+  await expect(progress).toHaveCount(0);
+  const statuses = await page.evaluate(() => {
+    (window as any).sequenceObserver.disconnect();
+    return (window as any).sequenceProgress as number[];
+  });
+  expect(statuses.some(value => value > 0 && value <= 100)).toBe(true);
   const imported = await page.evaluate(() => {
     const PM = (window as any).PM, layer = PM.proj.layers[0];
     return { count: PM.proj.layers.length, type: layer.type, dur: layer.dur, from: layer.from, assets: Object.keys(PM.proj.assets).length, sourceDur: PM.assets.get(layer.d.asset).dur };
@@ -38,30 +66,28 @@ for (const fps of [12, 120]) test(`numbered images at ${fps} fps become one tran
   expect(imported.sourceDur).toBeCloseTo(3 / fps, 3);
   expect(imported.dur).toBeCloseTo(Math.max(1 / 30, 3 / fps), 3);
 
-  async function exportPixels(time: number) {
-    return session.page.evaluate(async time => {
-      const PM = (window as any).PM;
-      PM.setTime(time, { raw: true, force: true });
-      let pixels: number[][] = [];
-      const original = PM.download;
-      PM.download = async (blob: Blob) => {
-        const image = await createImageBitmap(blob);
-        const cv = document.createElement('canvas'); cv.width = cv.height = 64;
-        const ctx = cv.getContext('2d')!; ctx.drawImage(image, 0, 0); image.close();
-        pixels = [[...ctx.getImageData(32, 32, 1, 1).data], [...ctx.getImageData(0, 0, 1, 1).data]];
-      };
-      try {
-        const result = await PM.Export.run({ format: 'still', w: 64, h: 64, alpha: true, mblur: false });
-        if (result.error) throw new Error(result.error);
-        return pixels;
-      } finally { PM.download = original; }
-    }, time);
-  }
+  // Large image sequences must also retain alpha in Auto preview proxies.
+  const previewAlpha = await page.evaluate(async () => {
+    const PM = (window as any).PM, asset = PM.assets.get(PM.proj.layers[0].d.asset);
+    await asset.previewReady;
+    if (!asset.preview) throw new Error('Expected an editing preview for this 2K sequence');
+    const cv = document.createElement('canvas'); cv.width = cv.height = 64;
+    const ctx = cv.getContext('2d')!; ctx.drawImage(asset.preview.el, 0, 0, 64, 64);
+    return [ctx.getImageData(0, 0, 1, 1).data[3], ctx.getImageData(4, 4, 1, 1).data[3], ctx.getImageData(32, 32, 1, 1).data[3]];
+  });
+  expect(previewAlpha[0]).toBe(0);
+  expect(previewAlpha[1]).toBeGreaterThanOrEqual(125);
+  expect(previewAlpha[1]).toBeLessThanOrEqual(131);
+  expect(previewAlpha[2]).toBe(255);
+
+  const exportPixels = (time: number) => exportStillPixels(session, time, 64, 64, [[32, 32], [0, 0], [4, 4]]);
   for (let frame = 0; frame < 3; frame++) {
     const pixels = await exportPixels(frame / fps);
     expect(pixels[0]![frame]).toBeGreaterThan(240);
     expect(pixels[0]![(frame + 1) % 3]).toBeLessThan(15);
     expect(pixels[1]![3]).toBe(0);
+    expect(pixels[2]![3]).toBeGreaterThanOrEqual(125);
+    expect(pixels[2]![3]).toBeLessThanOrEqual(131);
   }
   await page.evaluate(() => (window as any).PM.cmd('undo'));
   expect(await page.evaluate(() => (window as any).PM.proj.layers.length)).toBe(0);
@@ -83,6 +109,8 @@ for (const fps of [12, 120]) test(`numbered images at ${fps} fps become one tran
   const restored = await exportPixels(1 / fps);
   expect(restored[0]![1]).toBeGreaterThan(240);
   expect(restored[1]![3]).toBe(0);
+  expect(restored[2]![3]).toBeGreaterThanOrEqual(125);
+  expect(restored[2]![3]).toBeLessThanOrEqual(131);
   expect(session.diagnostics.pageErrors).toEqual([]);
 });
 

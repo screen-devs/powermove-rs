@@ -1,11 +1,17 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ExtensionModule, ExtensionRecord, Project, ProjectAPI } from './api';
+import type { ExtensionModule, ExtensionRecord, PowermoveAPI, Project, ProjectAPI } from './api';
 import type { ExtensionsBridge, ExtensionsChangedEvent, ExtensionHealthReport } from '../../../shared/extensions';
 import { resetExtensionsStore } from './extensions.svelte';
 import type { HostDeps } from './host';
 import { createLoader, planLoad, type BuiltinFactory } from './loader';
 import { createKernel, type Kernel } from './registries';
+import { createSandboxRuntime } from './sandbox-host';
+
+vi.mock('./sandbox-host', async (original) => {
+  const actual = await original<typeof import('./sandbox-host')>();
+  return { ...actual, createSandboxRuntime: vi.fn(actual.createSandboxRuntime) };
+});
 
 /* ── fixtures ────────────────────────────────────────────── */
 
@@ -79,12 +85,13 @@ function fakeDeps(): { deps: Omit<HostDeps, 'reportRuntimeError'>; toasts: strin
         controls: {} as HostDeps['ui']['controls'],
         toast: (text) => void toasts.push(text),
         confirm: async () => true,
+        openExternal: async () => true,
         menu: () => {},
         modal: () => ({ close: () => {}, body: document.createElement('div') }),
         icon: () => ''
       },
       project,
-      assets: { pick: async () => [], import: async (file) => ({ id: 'a', name: file.name, kind: 'model' }), get: () => undefined, readText: async () => '' },
+      assets: { pick: async () => [], import: async (file) => ({ id: 'a', name: file.name, kind: 'model' }), get: () => undefined, readText: async () => '', importUrl: async () => 'a' },
       storage: () => ({ get: () => undefined, set: () => {}, delete: () => {} }),
       extensions: { list: () => [], setEnabled: async () => {}, remove: async () => {}, reload: async () => {}, reveal: async () => {}, requestFix: () => {}, rebase: () => {} },
       panelsBackend: { open: () => {}, close: () => {}, isOpen: () => false, refresh: () => {}, list: () => [] },
@@ -181,6 +188,21 @@ describe('planLoad', () => {
   it('never plans an extension main already marked build- or manifest-broken', () => {
     const plan = planLoad([rec('a', { health: { state: 'build-error', error: 'esbuild' } }), rec('b')], []);
     expect(plan.order).toEqual(['b']);
+  });
+
+  it('never plans untrusted store code that asks for full access', () => {
+    const full = { manifest: { id: 'x', name: 'x', version: '1.0.0', apiVersion: 3, permissions: ['full-access' as const] } };
+    const plan = planLoad([
+      // Main withholds the bundle and says so...
+      rec('held', { ...full, trust: 'store', health: { state: 'needs-trust' } }),
+      // ...and a record that claims ok is still refused.
+      rec('claims-ok', { ...full, trust: 'store', bundleUrl: 'data:text/javascript,export default () => {}' }),
+      rec('trusted', { ...full, trust: 'store-trusted' }),
+      rec('local', { ...full, trust: 'local' }),
+      rec('plain', { trust: 'store' })
+    ], []);
+    expect(plan.order).toEqual(['local', 'plain', 'trusted']);
+    expect(plan.skipped).toContainEqual({ id: 'claims-ok', health: { state: 'needs-trust' } });
   });
 });
 
@@ -578,5 +600,214 @@ describe('loader dispose', () => {
     bridge.emit({ ids: ['one'], reason: 'watch' });
     await loader.whenIdle();
     expect(log).toEqual(['one']);
+  });
+});
+
+
+describe('bridge recovery and bundle CSS ownership', () => {
+  it('keeps runtime failures quarantined across a health echo until an explicit retry', async () => {
+    const bridge = fakeBridge([rec('flaky')]);
+    let activations = 0;
+    bridge.bridge.reportHealth = (report) => {
+      bridge.state.records[0]!.health = report.health;
+      bridge.emit({ ids: [report.id], reason: 'health' });
+    };
+    const loader = createLoader({ kernel, bridge: bridge.bridge, deps: fakeDeps().deps,
+      builtins: { flaky: async () => ({ default: () => { activations++; } }) } });
+    await loader.boot();
+    await loader.whenIdle();
+    loader.reportRuntimeError('flaky', new Error('boom'));
+    loader.reportRuntimeError('flaky', new Error('boom'));
+    await loader.whenIdle();
+    await loader.whenIdle();
+    expect(activations).toBe(1);
+    expect(loader.activeIds()).toEqual([]);
+    bridge.emit({ ids: ['flaky'], reason: 'enable' });
+    await loader.whenIdle();
+    expect(activations).toBe(2);
+    await loader.dispose();
+  });
+
+  it('skips store + full-access with needs-trust instead of importing it', async () => {
+    const records = [rec('theirs', {
+      trust: 'store',
+      bundleUrl: 'data:text/javascript,globalThis.__trustLeak = true; export default () => {}',
+      manifest: { id: 'theirs', name: 'Theirs', version: '1.0.0', apiVersion: 3, permissions: ['full-access'] }
+    })];
+    const bridge = fakeBridge(records);
+    const loader = createLoader({ kernel, bridge: bridge.bridge, deps: fakeDeps().deps, builtins: {} });
+    await loader.boot();
+    await loader.whenIdle();
+    expect(loader.activeIds()).toEqual([]);
+    expect((globalThis as { __trustLeak?: boolean }).__trustLeak).toBeUndefined();
+    expect(loader.records().find((record) => record.id === 'theirs')?.health).toEqual({ state: 'needs-trust' });
+    await loader.dispose();
+  });
+
+  it('loads extensions discovered after the renderer initial list completes', async () => {
+    const bridge = fakeBridge([]);
+    const loader = createLoader({ kernel, bridge: bridge.bridge, deps: fakeDeps().deps, builtins: {} });
+    await loader.boot();
+    expect(loader.activeIds()).toEqual([]);
+    bridge.state.records = [rec('late', { bundleUrl: 'data:text/javascript,export default () => {}' })];
+    bridge.emit({ ids: [], reason: 'reload' });
+    await loader.whenIdle();
+    expect(loader.activeIds()).toEqual(['late']);
+    await loader.dispose();
+  });
+
+  it('releases styles on disable, reload and failed activation, and reacquires cached styles', async () => {
+    const bridge = fakeBridge([rec('styled')]);
+    let fail = false;
+    const listeners = new Set<(css: string) => void>();
+    const module = { __powermoveAcquireStyles: (listener: (css: string) => void) => {
+      module.__powermoveStyles.forEach(listener);
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    }, __powermoveStyles: ['.plain { color: red; }', '.svelte-scoped { color: blue; }'],
+      default: () => { if (fail) throw new Error('activation failed'); } };
+    const loader = createLoader({ kernel, bridge: bridge.bridge, deps: fakeDeps().deps,
+      builtins: { styled: async () => module } });
+    const styles = () => [...document.head.querySelectorAll('style[data-powermove-extension="styled"]')];
+    await loader.boot();
+    expect(styles()).toHaveLength(2);
+    const initial = styles();
+    await loader.reload('styled');
+    expect(styles()).toHaveLength(2);
+    expect(initial.every(style => !style.isConnected)).toBe(true);
+    bridge.state.records[0]!.enabled = false;
+    bridge.emit({ ids: ['styled'], reason: 'disable' });
+    await loader.whenIdle();
+    expect(styles()).toHaveLength(0);
+    expect(listeners.size).toBe(0);
+    bridge.state.records[0]!.enabled = true;
+    bridge.emit({ ids: ['styled'], reason: 'enable' });
+    await loader.whenIdle();
+    expect(styles()).toHaveLength(2);
+    expect(listeners.size).toBe(1);
+    for (const listener of listeners) listener('.lazy { color: green; }');
+    expect(styles()).toHaveLength(3);
+    fail = true;
+    await loader.reload('styled');
+    expect(styles()).toHaveLength(0);
+    expect(listeners.size).toBe(0);
+    await loader.dispose();
+  });
+});
+
+it('publishes record changes after the async bridge read and runtime state before unload', async () => {
+  const bridge = fakeBridge([rec('flaky')]);
+  const loader = createLoader({ kernel, bridge: bridge.bridge, deps: fakeDeps().deps,
+    builtins: { flaky: async () => ({ default: () => undefined }) } });
+  await loader.boot();
+  const observed: boolean[] = [];
+  kernel.events.on('extensions:changed', () => observed.push(loader.records()[0]!.enabled));
+  bridge.state.records[0]!.enabled = false;
+  bridge.emit({ ids: ['flaky'], reason: 'health' });
+  expect(observed).toEqual([]);
+  await loader.whenIdle();
+  expect(observed).toEqual([false]);
+  bridge.state.records[0]!.enabled = true;
+  bridge.emit({ ids: ['flaky'], reason: 'enable' });
+  await loader.whenIdle();
+  const unloaded: ExtensionRecord[] = [];
+  kernel.events.on('extension:unloaded', () => unloaded.push(loader.records()[0]!));
+  loader.reportRuntimeError('flaky', new Error('boom'));
+  loader.reportRuntimeError('flaky', new Error('boom'));
+  await loader.whenIdle();
+  expect(unloaded).toMatchObject([{ enabled: false, health: { state: 'runtime-error' } }]);
+  await loader.dispose();
+});
+
+it('turns an extension off at the first sandbox_fatal error', async () => {
+  const bridge = fakeBridge([rec('spinner')]);
+  const { deps, toasts } = fakeDeps();
+  const loader = createLoader({ kernel, bridge: bridge.bridge, deps, builtins: { spinner: async () => ({ default: () => undefined }) } });
+  await loader.boot();
+  await loader.whenIdle();
+  expect(loader.activeIds()).toEqual(['spinner']);
+  loader.reportRuntimeError('spinner', Object.assign(new Error('stopped responding'), { code: 'sandbox_fatal' }));
+  await loader.whenIdle();
+  expect(loader.activeIds()).toEqual([]);
+  expect(loader.records()[0]).toMatchObject({ enabled: false, health: { state: 'runtime-error', error: expect.stringContaining('stopped responding') } });
+  expect(toasts).toHaveLength(1);
+  await loader.dispose();
+});
+
+it('turns off a sandbox that spun while activating, with one report and one toast', async () => {
+  const store = rec('spinner', { trust: 'store', bundleUrl: 'app://x/bundle.js', manifest: { id: 'spinner', name: 'Spinner', version: '1.0.0', apiVersion: 3 } });
+  const bridge = fakeBridge([store]);
+  const { deps, toasts } = fakeDeps();
+  vi.mocked(createSandboxRuntime).mockRejectedValueOnce(Object.assign(new Error('stopped responding while activating'), { code: 'sandbox_fatal' }));
+  const loader = createLoader({ kernel, bridge: bridge.bridge, deps, builtins: {} });
+  await loader.boot();
+  await loader.whenIdle();
+  expect(loader.activeIds()).toEqual([]);
+  expect(loader.records()[0]).toMatchObject({ enabled: false, health: { state: 'runtime-error', error: 'stopped responding while activating' } });
+  expect(bridge.health).toEqual([{ id: 'spinner', health: { state: 'runtime-error', error: 'stopped responding while activating' } }]);
+  expect(toasts).toEqual(['Spinner stopped working — check Mods']);
+  await loader.dispose();
+});
+
+it('leaves a sandbox its own activation deadline instead of racing it', async () => {
+  const store = rec('slow', { trust: 'store', bundleUrl: 'app://x/bundle.js', manifest: { id: 'slow', name: 'Slow', version: '1.0.0', apiVersion: 3 } });
+  const { deps, toasts } = fakeDeps();
+  const handle = { disposeAll: vi.fn() } as unknown as Awaited<ReturnType<typeof createSandboxRuntime>>['handle'];
+  vi.mocked(createSandboxRuntime).mockImplementationOnce(() => new Promise(resolve => setTimeout(resolve, 60, { handle, dispose: vi.fn() })));
+  const loader = createLoader({ kernel, bridge: null, deps, builtins: {}, activateTimeoutMs: 20 });
+  expect(await loader.activate(store)).toBe(true);
+  expect(vi.mocked(createSandboxRuntime).mock.lastCall?.[4]).toEqual({ timeoutMs: 20 });
+  expect(toasts).toEqual([]);
+  await loader.dispose();
+});
+
+describe('api.vars', () => {
+  const declared = { apiVersion: 2, vars: [{ key: 'API_KEY', label: 'API key', secret: true, required: true }, { key: 'REGION', label: 'Region' }] };
+
+  function capture(): { factory: BuiltinFactory; seen: Array<PowermoveAPI['vars']> } {
+    const seen: Array<PowermoveAPI['vars']> = [];
+    return { seen, factory: async () => ({ default: (api) => void seen.push(api.vars) }) };
+  }
+
+  it('delivers values fetched before activate, keeping only declared keys', async () => {
+    const { deps } = fakeDeps();
+    const { factory, seen } = capture();
+    const values = vi.fn(async () => ({ API_KEY: 'sk-test', UNDECLARED: 'nope' }));
+    const loader = createLoader({ kernel, bridge: null, vars: { values }, deps, builtins: { weather: factory } });
+    expect(await loader.activate(rec('weather', { manifest: declared as never }))).toBe(true);
+    expect(values).toHaveBeenCalledWith({ id: 'weather' });
+    const vars = seen[0]!;
+    expect(vars.get('API_KEY')).toBe('sk-test');
+    expect(vars.has('API_KEY')).toBe(true);
+    expect(vars.get('REGION')).toBeUndefined();
+    expect(vars.has('UNDECLARED')).toBe(false);
+    expect(vars.keys()).toEqual(['API_KEY']);
+  });
+
+  it('gives an extension without vars an empty API and never asks for values', async () => {
+    const { deps } = fakeDeps();
+    const { factory, seen } = capture();
+    const values = vi.fn(async () => ({ API_KEY: 'sk-test' }));
+    const loader = createLoader({ kernel, bridge: null, vars: { values }, deps, builtins: { plain: factory } });
+    await loader.activate(rec('plain'));
+    expect(values).not.toHaveBeenCalled();
+    expect(seen[0]!.keys()).toEqual([]);
+    expect(seen[0]!.get('API_KEY')).toBeUndefined();
+  });
+
+  it('activates with no values when the host cannot deliver them', async () => {
+    const { deps } = fakeDeps();
+    const { factory, seen } = capture();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const values = vi.fn(async () => { throw new Error('Variables are not available in powermove serve yet'); });
+    const loader = createLoader({ kernel, bridge: null, vars: { values }, deps, builtins: { weather: factory } });
+    expect(await loader.activate(rec('weather', { manifest: declared as never }))).toBe(true);
+    expect(seen[0]!.keys()).toEqual([]);
+    warn.mockRestore();
+  });
+
+  it('never imports an extension waiting for setup', () => {
+    const plan = planLoad([rec('weather', { health: { state: 'needs-setup', missing: ['API_KEY'] } })], []);
+    expect(plan.order).toEqual([]);
   });
 });

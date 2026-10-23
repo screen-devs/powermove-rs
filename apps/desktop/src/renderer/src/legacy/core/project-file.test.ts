@@ -1,7 +1,33 @@
 import { describe, expect, it, vi } from 'vitest';
-import { packProjectFile, restoreProjectFileMedia, unpackProjectFile } from './project-file';
+import { packProjectFile, restoreProjectFileMedia, unpackProjectFile, unpackProjectFileBlob, packProjectFileBlob, restoreProjectFileStream, saveIncrementalProject } from './project-file';
+import { sha256Hex } from '../../../../shared/sha256';
 
 describe('portable project media', () => {
+  it('uploads only requested media, including media reachable solely from Undo', async () => {
+    const old = { id: 'deleted' }, current = { id: 'current' };
+    const snapshot = { proj: { assets: { current } }, history: { entries: [{ backward: [{ exists: true, path: ['assets', 'deleted'], value: old }] }] } };
+    const serialized = JSON.stringify(snapshot);
+    const bridge = { begin: vi.fn(async () => ({ ok: true as const, token: 'token', required: ['deleted'] })),
+      chunk: vi.fn(async () => undefined), finish: vi.fn(async () => ({ ok: true as const, path: 'file.pmv' })), abort: vi.fn(async () => undefined) };
+    const store = { get: vi.fn(), put: vi.fn(), getForSave: async (asset: any) => ({ blob: new Blob([asset.id]), revision: `revision-${asset.id}` }) };
+    expect(await saveIncrementalProject(snapshot, serialized, store, bridge, { name: 'file.pmv', projectId: 'one', saveAs: false }, () => {})).toMatchObject({ ok: true });
+    const chunks = bridge.chunk.mock.calls as unknown as Array<[string, string | null, Uint8Array]>;
+    expect(chunks.map(call => call[1])).toEqual([null, 'deleted']);
+    expect(new TextDecoder().decode(chunks[0]![2])).toBe(serialized);
+    expect(new TextDecoder().decode(chunks[1]![2])).toBe('deleted');
+    expect(store.get).not.toHaveBeenCalled();
+    expect(bridge.abort).toHaveBeenCalledWith('token');
+  });
+  it('rejects corrupted streamed media before putting it into the local store', async () => {
+    const put = vi.fn(async () => true);
+    vi.stubGlobal('navigator', { storage: {} });
+    try {
+      await expect(restoreProjectFileStream({ proj: { assets: { clip: { id: 'clip' } } } },
+        [{ id: 'clip', type: 'video/webm', offset: 0, length: 3, sha256: sha256Hex(new Uint8Array([1, 2, 3])), revision: 'saved' }],
+        { get: async () => null, put }, async () => new Uint8Array([4, 5, 6]))).rejects.toThrow('checksum');
+      expect(put).not.toHaveBeenCalled();
+    } finally { vi.unstubAllGlobals(); }
+  });
   it.each(['current', 'undo', 'redo', 'all missing'])('saves with missing %s media while preserving editable source and history', async location => {
     const missing = { id: 'missing', name: '01-window-plate.png', kind: 'image' };
     const available = { id: 'available', name: 'available.png', kind: 'image' };
@@ -38,6 +64,16 @@ describe('portable project media', () => {
       expect(new Uint8Array(await blob.arrayBuffer())).toEqual(data);
     }
   });
+
+  it('round-trips embedded media beyond the old 256 MiB limit', async () => {
+    const chunk = new Uint8Array(1024 * 1024); chunk[0] = 123; chunk[chunk.length - 1] = 45;
+    const blob = new Blob(Array(257).fill(chunk), { type: 'video/webm' });
+    const document = { proj: { w: 1080, h: 1920, layers: [], assets: { video: { id: 'video' } } } };
+    const packed = await packProjectFile(document, { get: async () => blob, put: async () => true });
+    const media = unpackProjectFile(packed).containerMedia[0].data;
+    expect(media.length).toBe(blob.size);
+    expect(media[0]).toBe(123); expect(media[media.length - 1]).toBe(45);
+  }, 30000);
 
   it('stores media as raw PMV3 bytes and restores it losslessly', async () => {
     const original = new Uint8Array([0, 1, 2, 127, 128, 254, 255]);
@@ -92,6 +128,33 @@ describe('portable project media', () => {
       media: { image: { type: 'image/png', data } },
     }, { get: async () => null, put })).rejects.toThrow('Invalid saved media');
     expect(put).not.toHaveBeenCalled();
+  });
+
+  it('imports browser files through slices without reading the complete container', async () => {
+    const packed = await packProjectFileBlob({ proj: { assets: { image: { id: 'image' } } } }, {
+      get: async () => new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' }), put: async () => true
+    });
+    const wholeRead = vi.spyOn(packed, 'arrayBuffer').mockRejectedValue(new Error('whole-file allocation'));
+    const unpacked = await unpackProjectFileBlob(packed);
+    let restored: Blob | undefined;
+    await restoreProjectFileMedia(unpacked, { get: async () => null, put: async (_id, blob) => { restored = blob; return true; } });
+    expect([...new Uint8Array(await restored!.arrayBuffer())]).toEqual([1, 2, 3]);
+    expect(wholeRead).not.toHaveBeenCalled();
+  });
+
+  it('aborts and removes import staging files when a native media read fails', async () => {
+    const writer = { write: vi.fn(), abort: vi.fn(async () => undefined) };
+    const root = { getFileHandle: vi.fn(async () => ({ createWritable: async () => writer })), removeEntry: vi.fn(async () => undefined) };
+    vi.stubGlobal('navigator', { storage: { getDirectory: async () => root } });
+    const put = vi.fn(async () => true);
+    try {
+      await expect(restoreProjectFileStream({ proj: { assets: { video: { id: 'video' } } } },
+        [{ id: 'video', type: 'video/webm', offset: 9, length: 10 }], { get: async () => null, put },
+        async () => { throw new Error('read failed'); })).rejects.toThrow('read failed');
+      expect(writer.abort).toHaveBeenCalledOnce();
+      expect(root.removeEntry).toHaveBeenCalledOnce();
+      expect(put).not.toHaveBeenCalled();
+    } finally { vi.unstubAllGlobals(); }
   });
 
   it('keeps legacy project files compatible', async () => {

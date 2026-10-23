@@ -1,6 +1,8 @@
+import { sha256HexOf } from '../../../../shared/sha256';
 import { resolveContent } from './content-properties';
 /* Ported from js/core/media.js — behavior-preserving. */
 import type { PMRegistry } from '../registry';
+import { bridge as hostBridge } from '../../kernel/bridge';
 
 export function install(PM: PMRegistry): void {
 const DB_NAME: any = 'powermove-media';
@@ -42,7 +44,7 @@ function openDB() {
   return dbPromise;
 }
 
-async function request(mode: any, action: any) {
+async function request(mode: any, action: any): Promise<{ ok: boolean; value: any }> {
   const db: any = await openDB();
   if (!db) return { ok: false, value: null };
   return new Promise((resolve: any) => {
@@ -70,20 +72,52 @@ const storageKey: any = (value: any) => {
   if (value && typeof value === 'object') return value.storageKey || value.id || null;
   return value || null;
 };
+const mediaRevision = () => crypto.randomUUID?.() ?? `media-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+async function readMediaRecord(value: any) {
+  const key = storageKey(value);
+  if (!key) return null;
+  let result = await request('readonly', (store: any) => store.get(key));
+  if (!result.ok) throw new Error('Media storage is unavailable. Try saving again.');
+  if (!result.value && value && typeof value === 'object' && value.id && value.id !== key) {
+    result = await request('readonly', (store: any) => store.get(value.id));
+    if (!result.ok) throw new Error('Media storage is unavailable. Try saving again.');
+  }
+  return result.value;
+}
 
 PM.MediaStore = {
-  async put(id: any, blob: any, meta: any = {}) {
+  async put(id: any, blob: any, meta: any = {}, savedRevision?: string) {
     const key: any = meta.storageKey || id;
     if (!key || !blob) return false;
     const result: any = await request('readwrite', (store: any) => store.put({
       id: key,
       blob,
+      // A new stored payload always gets a new identity, even if a sampled
+      // import fingerprint collides. Verified file imports retain their identity.
+      revision: savedRevision || mediaRevision(),
       fingerprint: meta.fingerprint || null,
       size: Number(blob.size) || 0,
       type: blob.type || meta.type || '',
       at: Date.now(),
     }));
     return result.ok;
+  },
+  async getForSave(value: any) {
+    let record = await readMediaRecord(value);
+    if (!record || !(record.blob instanceof Blob)) return null;
+    if (!record.revision) {
+      const result = await request('readwrite', (store: any) => {
+        const get = store.get(record.id);
+        get.addEventListener('success', () => {
+          const current = get.result;
+          if (current && !current.revision) { current.revision = mediaRevision(); store.put(current); }
+        });
+        return get;
+      });
+      if (!result.ok) throw new Error('Could not prepare media for saving.');
+      record = result.value;
+    }
+    return record?.blob instanceof Blob ? { blob: record.blob, revision: record.revision } : null;
   },
   async get(value: any) {
     const key: any = storageKey(value);
@@ -102,21 +136,17 @@ PM.MediaStore = {
     return key ? ((await request('readwrite', (store: any) => store.delete(key))) as any).ok : false;
   },
 };
+/* On a remote host this browser's IndexedDB is one device's cache: the host
+   keeps the bytes for every device. Wrapped here, before the first project
+   restore, so a miss is filled from the host. */
+if (typeof window !== 'undefined' && (hostBridge() as any)?.wrapMediaStore) PM.MediaStore = (hostBridge() as any).wrapMediaStore(PM.MediaStore);
 
 function normalizedName(value: any) {
   return String(value || '').normalize('NFKC').trim().toLocaleLowerCase();
 }
 
 async function sha256(bytes: any) {
-  if (window.crypto && window.crypto.subtle) {
-    const digest: any = new Uint8Array(await window.crypto.subtle.digest('SHA-256', bytes));
-    return [...digest].map((value: any) => value.toString(16).padStart(2, '0')).join('');
-  }
-  /* Deterministic fallback for older WebViews. SHA-256 is preferred; this path
-     still keeps imports functional without reading the whole file. */
-  let hash: any = 2166136261;
-  for (const value of bytes) { hash ^= value; hash = Math.imul(hash, 16777619); }
-  return (hash >>> 0).toString(16).padStart(8, '0');
+  return sha256HexOf(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
 }
 
 async function fingerprint(file: any) {
@@ -195,6 +225,7 @@ function removeAsset(project: any, assetId: any) {
     if (layer && removed.has(layer.parent)) layer.parent = null;
   }));
   delete project.assets[assetId];
+  PM.assets?.revokePoster?.(assetId);
   return { removedLayers: removedLayerIds.length, removedLayerIds };
 }
 
@@ -229,7 +260,10 @@ function coalesce(project: any, canonicalId: any, aliases: any) {
   layerLists(project).forEach((layers: any) => layers.forEach((layer: any) => {
     if (retired.has(layerAssetId(layer))) { replaceLayerAssetId(layer, canonicalId); changed++; }
   }));
-  retired.forEach((id: any) => { if (project.assets && project.assets[id]) delete project.assets[id]; });
+  retired.forEach((id: any) => {
+    if (project.assets && project.assets[id]) delete project.assets[id];
+    PM.assets?.revokePoster?.(id);
+  });
   return changed;
 }
 
@@ -238,6 +272,7 @@ PM.MediaImport = {
   normalizedName,
   fingerprint,
   storageKeyFor: (value: any) => value ? `media:${value}` : null,
+  posterKeyFor: (storageKey: string) => `${storageKey}:poster`,
   mapBounded,
   match,
   coalesce,

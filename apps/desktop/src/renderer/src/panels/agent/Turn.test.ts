@@ -68,6 +68,45 @@ describe('assistant word reveal', () => {
       steps: [{ kind: 'text', id: 'before-steer', text: 'I have started building the blur.' }]
     });
     expect(target.querySelector('.agent-trace-text')?.textContent).toBe('I have started building the blur.');
+    expect(target.querySelector('.agent-work-log')).toBeNull();
+  });
+
+  it('keeps steering checkpoints visible in stream order, even after the run finishes', () => {
+    render({
+      role: 'trace', steering: true,
+      steps: [
+        { kind: 'thought', id: 'before', label: 'Inspecting the timing.', live: false },
+        { kind: 'text', id: 'progress', text: 'I found the transition.' },
+        { kind: 'tool', id: 'read', toolName: 'bash', label: 'Read timeline', status: 'continued' },
+        { kind: 'thought', id: 'after', label: 'Keeping the clips aligned.', live: false },
+      ]
+    });
+    expect(target.querySelector('.agent-work-log')).toBeNull();
+    expect([...target.querySelectorAll('.agent-trace-text')].map(row => row.textContent)).toEqual([
+      'Inspecting the timing.', 'I found the transition.', 'Keeping the clips aligned.'
+    ]);
+    expect(target.querySelectorAll('.agent-tool-activity')).toHaveLength(1);
+    expect(target.querySelector('.shimmer-text')).toBeNull();
+  });
+
+  it.each([false, true])('preserves the complete response in stream order after archiving (tools: %s)', (withTools) => {
+    render({
+      role: 'trace', durationMs: 543000,
+      steps: [
+        { kind: 'text', id: 'progress', text: 'Inspecting the original audio.' },
+        { kind: 'thought', id: 'thought-1', label: 'Check the original timing.', live: false },
+        ...(withTools ? [{ kind: 'tool' as const, id: 'read', toolName: 'bash', label: 'Inspect timeline', status: 'done' as const }] : []),
+        { kind: 'thought', id: 'thought-2', label: 'Keep both stems aligned.', live: false },
+        { kind: 'text', id: 'reply', text: 'Both stems are ready.' }
+      ]
+    });
+    expect(target.querySelector('.agent-work-log')).toBeNull();
+    expect([...target.querySelectorAll('.agent-trace-text')].map(row => row.textContent)).toEqual([
+      'Inspecting the original audio.', 'Check the original timing.',
+      'Keep both stems aligned.', 'Both stems are ready.'
+    ]);
+    expect(target.querySelectorAll('.agent-tool-activity')).toHaveLength(withTools ? 1 : 0);
+    expect(target.querySelector('.shimmer-text')).toBeNull();
   });
 
   it('keeps archived tool details expandable without live motion', () => {
@@ -135,12 +174,52 @@ describe('assistant word reveal', () => {
   });
 });
 
+it('states what the agent could not do without dressing it as an editor error', () => {
+  const text = 'The generated workspace was not safe or complete enough to preview';
+  render({ role: 'assistant', error: true, notice: 'alert', text, entering: true });
+
+  const notice = target.querySelector('.error-notice')!;
+  expect(notice.classList.contains('is-alert')).toBe(true);
+  expect(notice.textContent).toContain(text);
+  // The agent's own sentence is the whole story: no title to read past, and
+  // nothing technical to unfold.
+  expect(target.querySelector('details')).toBeNull();
+  expect(target.querySelector('strong')).toBeNull();
+  expect(target.querySelector('[role="alert"]')).toBeNull();
+  expect([...target.querySelectorAll('button')].some(button => button.textContent === 'Try again')).toBe(true);
+});
+
+it('lets a turn where nothing broke read as an ordinary reply', () => {
+  const text = 'Those panels were already arranged that way. Nothing was changed.';
+  render({ role: 'assistant', error: true, notice: 'plain', text, entering: false });
+
+  expect(target.querySelector('.error-notice')).toBeNull();
+  expect(target.querySelector('.agent-msg.is-error')).toBeNull();
+  expect(target.textContent).toContain('Those panels were already arranged that way');
+  // It is still a turn the user may want to run again.
+  expect([...target.querySelectorAll('button')].some(button => button.textContent === 'Try again')).toBe(true);
+});
+
 it('shows a readable error with the raw diagnostic behind details', () => {
   const raw = 'The agent failed: Error: thread/resume: thread/resume failed: thread abc already has an active writer (code -32600)';
   render({ role: 'assistant', error: true, text: raw, entering: true });
   expect(target.querySelector('[role="alert"]')).toBeTruthy();
   expect(target.querySelector('strong')?.textContent).toBe('Agent session couldn’t reopen');
-  expect(target.querySelector('details')?.open).toBe(false);
+  const toggle = target.querySelector<HTMLButtonElement>('.log-toggle')!;
+  expect(toggle.getAttribute('aria-expanded')).toBe('false');
+  expect(target.querySelector('pre')).toBeNull();
+  toggle.click();
+  flushSync();
+  expect(toggle.getAttribute('aria-expanded')).toBe('true');
   expect(target.querySelector('pre')?.textContent).toBe(raw);
   expect(target.querySelector('p')?.textContent).not.toContain('-32600');
+});
+
+
+it('formats user prose alongside inline attachments', () => {
+  render({ role: 'user', text: '**Review** [Attachment: clip.mp4] and *trim* it.',
+    attachments: [{ name: 'clip.mp4', path: '/tmp/clip.mp4' }] });
+  expect(target.querySelector('.agent-bubble .is-bold')?.textContent).toBe('Review');
+  expect(target.querySelector('.agent-bubble .is-italic')?.textContent).toBe('trim');
+  expect(target.querySelector('.agent-inline-attachment')?.textContent).toContain('clip');
 });

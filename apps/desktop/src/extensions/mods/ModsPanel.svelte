@@ -16,10 +16,13 @@
     `${records.length} ${records.length === 1 ? 'mod' : 'mods'}` + (attention > 0 ? ` · ${attention} needs attention` : '')
   );
 
-  // There is no records-changed event on the API, so the list is re-read on the
-  // two load events plus after every action this panel triggers.
+  // Health and discovery updates can change records without loading a mod.
   $effect(() => {
-    const stops = [api.events.on('extension:loaded', refresh), api.events.on('extension:unloaded', refresh)];
+    const stops = [
+      api.events.on('extension:loaded', refresh),
+      api.events.on('extension:unloaded', refresh),
+      api.events.on('extensions:changed', refresh)
+    ];
     return () => {
       for (const stop of stops) stop.dispose();
     };
@@ -65,10 +68,17 @@
     );
   }
 
+  function setUp(record: ExtensionRecord): void {
+    api.extensions.setUp(record.id);
+  }
+
   function openMenu(record: ExtensionRecord, anchor: HTMLElement): void {
     const items: MenuContribution[] = [
       { label: 'Reload', run: () => void run(() => api.extensions.reload(record.id), `Could not reload ${nameOf(record)}.`) }
     ];
+    if (record.scope === 'user' && record.manifest?.vars?.length) {
+      items.push({ label: record.health.state === 'needs-setup' ? 'Set up…' : 'Variables…', run: () => setUp(record) });
+    }
     if (record.scope !== 'builtin') {
       items.push({
         label: 'Show in Finder',
@@ -98,7 +108,7 @@
     {:else}
       <div class="list" role="list">
         {#each mine as record (record.id)}
-          <ModRow {record} onToggle={toggle} onMenu={openMenu} />
+          <ModRow {record} onToggle={toggle} onMenu={openMenu} onSetup={setUp} />
         {/each}
       </div>
     {/if}

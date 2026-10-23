@@ -1,79 +1,20 @@
 /* Compact, byte-budgeted project history. */
 import type { PMRegistry } from '../registry';
 import { timelineService } from './services';
+import { HistoryRecords, unpackHistory } from '../../../../shared/history-memory';
 
-type PathPart = string | number;
-type Patch = { path: PathPart[]; exists: boolean; value?: any };
+import { applyPatch, clonePatchValue, diffPatches as diff, type Patch, type PathPart } from '../../../../shared/patch';
 
 // Patch entries are tiny for ordinary edits. Keep a deep practical timeline
 // while the byte budget remains the hard memory bound for structural changes.
 const MAX_ENTRIES = 1_000;
 const DEFAULT_MAX_BYTES = 256 * 1024 * 1024;
 
-const clone = (value: any) => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+const clone = clonePatchValue;
 const encodedBytes = (value: any) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
 
 function isRecord(value: any): value is Record<string, any> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
-}
-
-/**
- * Record only changed leaves. Arrays with the same length are traversed so a
- * single keyframe/property edit stays tiny; structural array edits use one
- * replacement because index-by-index patches would be larger and less safe.
- */
-function diff(before: any, after: any, path: PathPart[] = [], forward: Patch[] = [], backward: Patch[] = []) {
-  if (Object.is(before, after)) return { forward, backward };
-  if (Array.isArray(before) && Array.isArray(after)) {
-    const identityOrderChanged = before.length === after.length && before.some((item, index) =>
-      isRecord(item) && isRecord(after[index]) && typeof item.id === 'string' && typeof after[index].id === 'string'
-      && item.id !== after[index].id);
-    if (before.length !== after.length || identityOrderChanged) {
-      forward.push({ path, exists: true, value: clone(after) });
-      backward.push({ path, exists: true, value: clone(before) });
-      return { forward, backward };
-    }
-    for (let index = 0; index < before.length; index++) {
-      diff(before[index], after[index], [...path, index], forward, backward);
-    }
-    return { forward, backward };
-  }
-  if (isRecord(before) && isRecord(after)) {
-    const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
-    for (const key of keys) {
-      const inBefore = Object.hasOwn(before, key);
-      const inAfter = Object.hasOwn(after, key);
-      if (!inBefore || !inAfter) {
-        forward.push(inAfter ? { path: [...path, key], exists: true, value: clone(after[key]) } : { path: [...path, key], exists: false });
-        backward.push(inBefore ? { path: [...path, key], exists: true, value: clone(before[key]) } : { path: [...path, key], exists: false });
-      } else diff(before[key], after[key], [...path, key], forward, backward);
-    }
-    return { forward, backward };
-  }
-  forward.push({ path, exists: true, value: clone(after) });
-  backward.push({ path, exists: true, value: clone(before) });
-  return { forward, backward };
-}
-
-function applyPatch(root: any, patches: Patch[]): any {
-  let nextRoot = root;
-  for (const patch of patches) {
-    if (!patch.path.length) {
-      nextRoot = patch.exists ? clone(patch.value) : undefined;
-      continue;
-    }
-    let parent = nextRoot;
-    for (let index = 0; index < patch.path.length - 1; index++) {
-      parent = parent?.[patch.path[index]!];
-      if (parent == null) break;
-    }
-    if (parent == null) continue;
-    const key = patch.path.at(-1)!;
-    if (patch.exists) parent[key] = clone(patch.value);
-    else if (Array.isArray(parent) && typeof key === 'number') parent.splice(key, 1);
-    else delete parent[key];
-  }
-  return nextRoot;
 }
 
 function valueAt(root: any, path: PathPart[]): { exists: boolean; value?: any } {
@@ -89,12 +30,8 @@ function valueAt(root: any, path: PathPart[]): { exists: boolean; value?: any } 
     : { exists: false };
 }
 
-function sameValue(left: any, right: any): boolean {
-  return left.exists === right.exists
-    && (!left.exists || JSON.stringify(left.value) === JSON.stringify(right.value));
-}
-
 export function install(PM: PMRegistry): void {
+  let records = new HistoryRecords();
   let maxBytes = PM.Memory?.budget?.('history') || DEFAULT_MAX_BYTES;
   type Entry = {
     id: string;
@@ -142,6 +79,8 @@ export function install(PM: PMRegistry): void {
   };
   const push = (entry: Omit<Entry, 'id'> & { id?: string }) => {
     discardRedo();
+    if (entry.forward) records.sharePatches(entry.forward);
+    if (entry.backward) records.sharePatches(entry.backward);
     const next: Entry = { ...entry, id: entry.id || PM.uid('history') };
     stack.push(next);
     totalBytes += next.bytes;
@@ -150,9 +89,13 @@ export function install(PM: PMRegistry): void {
     publish();
     return next.id;
   };
+  /* Entries hold composition-independent paths (see core/compositions);
+     translate them onto whichever composition is open when they replay. */
+  const realize = (patches: Patch[]) => PM.Comps?.realize ? PM.Comps.realize(patches) : patches;
   const restorePatches = (patches: Patch[]) => {
+    PM.Comps?.prepareUndo?.(patches);
     const selection = clone(PM.sel);
-    const next = applyPatch(PM.proj, patches);
+    const next = applyPatch(PM.proj, realize(patches));
     PM.replaceProject(next, { selection });
   };
   const publishProjectPatch = (patches?: Patch[], origin: any = 'interface') => {
@@ -166,13 +109,21 @@ export function install(PM: PMRegistry): void {
   const scopedPatches = (current: any) => {
     const forward: Patch[] = [];
     const backward: Patch[] = [];
+    // Compare and count the same serialization. Structural scopes can contain
+    // megabytes; serializing them again solely for the budget delays commits.
+    const encoder = new TextEncoder();
+    let bytes = 4; // Two JSON arrays: [] and [].
     for (const item of current.scopes.values()) {
       const after = valueAt(PM.proj, item.path);
-      if (sameValue(item.before, after)) continue;
-      forward.push({ path: item.path, ...after });
-      backward.push({ path: item.path, ...item.before });
+      const next = { path: item.path, ...after }, previous = { path: item.path, ...item.before };
+      const nextJson = JSON.stringify(next), previousJson = JSON.stringify(previous);
+      if (nextJson === previousJson) continue;
+      if (forward.length) bytes += 2; // One comma in each array.
+      bytes += encoder.encode(nextJson).byteLength + encoder.encode(previousJson).byteLength;
+      forward.push(next);
+      backward.push(previous);
     }
-    return { forward, backward };
+    return { forward, backward, bytes };
   };
 
   const pathKey = (path: PathPart[]) => JSON.stringify(path);
@@ -197,10 +148,16 @@ export function install(PM: PMRegistry): void {
         const covered = [...pending.scopes.values()].some((item: any) =>
           item.path.length <= path.length && item.path.every((part: any, index: number) => part === path[index]));
         if (covered) continue;
+        const before = valueAt(PM.proj, path);
         for (const [key, item] of pending.scopes) {
-          if (path.length < item.path.length && path.every((part, index) => part === item.path[index])) pending.scopes.delete(key);
+          if (path.length < item.path.length && path.every((part, index) => part === item.path[index])) {
+            // The live parent already includes earlier child edits. Fold the
+            // original child values into its snapshot before discarding them.
+            before.value = applyPatch(before.value, [{ path: item.path.slice(path.length), ...item.before }]);
+            pending.scopes.delete(key);
+          }
         }
-        pending.scopes.set(pathKey(path), { path, before: valueAt(PM.proj, path) });
+        pending.scopes.set(pathKey(path), { path, before });
       }
       return true;
     },
@@ -215,7 +172,7 @@ export function install(PM: PMRegistry): void {
       if (!pending) return false;
       const current = pending;
       pending = null;
-      let patches: { forward: Patch[]; backward: Patch[] };
+      let patches: { forward: Patch[]; backward: Patch[]; bytes?: number };
       if (current.scoped) patches = scopedPatches(current);
       else {
         const afterJson = snap();
@@ -223,7 +180,9 @@ export function install(PM: PMRegistry): void {
         patches = diff(JSON.parse(current.before), JSON.parse(afterJson));
       }
       if (!patches.forward.length) return false;
-      const bytes = encodedBytes(patches.forward) + encodedBytes(patches.backward);
+      const live = patches.forward;
+      if (PM.Comps?.canonicalize) patches = { ...PM.Comps.canonicalize(patches.forward, patches.backward), bytes: patches.bytes };
+      const bytes = patches.bytes ?? encodedBytes(patches.forward) + encodedBytes(patches.backward);
       push({
         label: label || current.label,
         group: current.group,
@@ -234,7 +193,7 @@ export function install(PM: PMRegistry): void {
         undo: () => restorePatches(patches.backward),
         redo: () => restorePatches(patches.forward),
       });
-      publishProjectPatch(patches.forward, current.origin);
+      publishProjectPatch(live, current.origin);
       PM.touch();
       PM.autosave?.();
       return true;
@@ -253,6 +212,7 @@ export function install(PM: PMRegistry): void {
       return true;
     },
     pendingSnapshot: () => pending?.before || null,
+    busy: () => !!pending,
     /** Wrap a legacy direct mutation. PM.Edit uses the same compact patch entry. */
     do(label: any, fn: any, origin: any = 'interface') {
       H.begin(label, null, origin);
@@ -264,7 +224,7 @@ export function install(PM: PMRegistry): void {
       if (idx < 0) return false;
       const entry = stack[idx--]!;
       entry.undo();
-      publishProjectPatch(entry.backward, 'interface');
+      publishProjectPatch(entry.backward && realize(entry.backward), 'interface');
       publish();
       return true;
     },
@@ -272,7 +232,7 @@ export function install(PM: PMRegistry): void {
       if (idx >= stack.length - 1) return false;
       const entry = stack[++idx]!;
       entry.redo();
-      publishProjectPatch(entry.forward, 'interface');
+      publishProjectPatch(entry.forward && realize(entry.forward), 'interface');
       publish();
       return true;
     },
@@ -306,6 +266,9 @@ export function install(PM: PMRegistry): void {
     },
     selection(before: any, after: any) {
       if (pending || JSON.stringify(before) === JSON.stringify(after)) return null;
+      // Looking at another layer after Undo is navigation, not a new edit.
+      // Keep the redo chain until a document or workspace change replaces it.
+      if (idx < stack.length - 1) return null;
       const previous = clone(before), next = clone(after), projectId = PM.proj.id;
       const restoreSelection = (selection: any) => {
         if (PM.proj.id !== projectId) return;
@@ -340,7 +303,7 @@ export function install(PM: PMRegistry): void {
     /** Persist document edits; runtime UI callbacks belong to this session only. */
     export(options: { copy?: boolean } = {}) {
       const entries = stack.filter(entry => entry.project && entry.forward && entry.backward);
-      const saved = { version: 1,
+      const saved = { version: 1, paths: 'composition',
         index: stack.slice(0, idx + 1).filter(entry => entry.project && entry.forward && entry.backward).length - 1,
         entries: entries.map(entry => ({ label: entry.label, forward: entry.forward, backward: entry.backward })),
       };
@@ -350,6 +313,8 @@ export function install(PM: PMRegistry): void {
     },
     import(saved: any) {
       H.clear();
+      try { saved = unpackHistory(structuredClone(saved)); }
+      catch { return false; }
       const validPatches = (patches: any) => Array.isArray(patches) && patches.every(patch =>
         patch && Array.isArray(patch.path) && typeof patch.exists === 'boolean'
         && patch.path.every((part: any) => typeof part === 'string'
@@ -359,8 +324,14 @@ export function install(PM: PMRegistry): void {
           || !Number.isInteger(saved.index) || saved.index < -1 || saved.index >= saved.entries.length
           || !saved.entries.every((entry: any) => typeof entry?.label === 'string'
             && validPatches(entry.forward) && validPatches(entry.backward))) return false;
+      /* Histories saved before compositions were root-relative, and such a
+         file can only have been saved with its main composition open. */
+      if (saved.paths !== 'composition' && PM.Comps?.canonicalize) {
+        saved.entries = saved.entries.map((entry: any) => ({ ...entry, ...PM.Comps.canonicalize(entry.forward, entry.backward) }));
+      }
+      records.share(saved);
       for (const source of saved.entries) {
-        const { label, forward, backward } = clone(source);
+        const { label, forward, backward } = source;
         stack.push({ id: PM.uid('history'), label, project: true, forward, backward,
           bytes: encodedBytes(forward) + encodedBytes(backward),
           undo: () => restorePatches(backward), redo: () => restorePatches(forward) });
@@ -380,19 +351,60 @@ export function install(PM: PMRegistry): void {
       idx = -1;
       pending = null;
       depth = 0;
+      records.clear();
       totalBytes = 0;
       publish();
     },
+    /**
+     * Sets the live undo stack aside, untouched, for a project going into a
+     * background tab, and leaves an empty one. Unlike export(), this keeps the
+     * session-only entries (a media replacement, say) and their retained
+     * runtimes, so resuming the tab puts back exactly what it had.
+     */
+    suspend() {
+      const parked = { stack, idx, totalBytes, records };
+      stack = [];
+      idx = -1;
+      pending = null;
+      depth = 0;
+      totalBytes = 0;
+      records = new HistoryRecords();
+      publish();
+      return parked;
+    },
+    /** Puts back a stack set aside by suspend(), replacing the current one. */
+    resume(parked: any) {
+      if (!parked || !Array.isArray(parked.stack)) return false;
+      H.clear();
+      ({ stack, idx, totalBytes, records } = parked);
+      publish();
+      return true;
+    },
+    /** Lets go of a parked stack that will never be resumed. */
+    discard(parked: any) {
+      parked?.stack?.forEach?.((entry: Entry) => entry.cleanup?.());
+    },
     list: () => stack.map(entry => entry.label),
-    stats: () => ({ entries: stack.length, bytes: totalBytes, maxBytes, estimated: false }),
+    stats: () => ({ entries: stack.length, bytes: totalBytes, maxBytes, estimated: false, byteKind: 'serialized' }),
   };
   PM.hist = H;
   PM.Memory?.register?.('history', {
     bytes: () => totalBytes,
     entries: () => stack.length,
+    // Undo is durable document data, not a reconstructible render cache.
+    // Release the optional lookup index without discarding any saved actions.
+    pressure: () => records.clear(),
     trim: (target: number) => {
       maxBytes = Math.max(0, target);
       while (totalBytes > target && stack.length > 1) {
+        // Redo patches depend on every preceding step. Discard the distant
+        // redo tail before removing applied entries from the undo head.
+        if (stack.length > idx + 1) {
+          const removed = stack.pop()!;
+          totalBytes -= removed.bytes;
+          removed.cleanup?.();
+          continue;
+        }
         const removed = stack.shift()!;
         totalBytes -= removed.bytes;
         removed.cleanup?.();

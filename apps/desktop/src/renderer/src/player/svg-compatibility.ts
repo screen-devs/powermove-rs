@@ -19,11 +19,12 @@ export function inspectSvgExport(project: any) {
     }
     if (!fixed(layer.p?.['scale.z'], 100)) reject('3D scale requires WebGL');
     if (layer.type === 'text') {
-      if (layer.d.paragraph || layer.d.styles?.length || layer.d.animators?.length) reject('paragraph/rich text or character animators require WebGL');
+      if (layer.d.paragraph || layer.d.styles?.length) reject('paragraph or rich text requires WebGL');
       for (const key of Object.keys(layer.d)) if (key.startsWith('fontAxis.') && key !== 'fontAxis.wght') reject('custom font axes require WebGL');
     }
     if (layer.type === 'shape') {
       if (layer.d.paths?.length || !['rect', 'ellipse'].includes(layer.d.shape)) reject('this shape geometry requires WebGL');
+      if (!fixed(layer.d.independentCorners, false) || !fixed(layer.d.smoothing, 0)) reject('per-corner radii and corner smoothing require WebGL');
       if (layer.d.fill && layer.d.fill.type !== 'solid') reject('gradient fills require WebGL');
     }
   }

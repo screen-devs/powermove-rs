@@ -13,7 +13,7 @@ test('properties and timeline expose editable content animation, scrubbing, and 
     PM.proj.layers.push(layer); PM.selectLayers(layer.id); PM.bus.emit('layers'); PM.invalidate();
     return layer.id;
   });
-  const stopwatch = page.getByRole('button', { name: 'Animate Width', exact: true });
+  const stopwatch = page.getByRole('button', { name: 'Add keyframe for Width', exact: true });
   await expect(stopwatch).toBeVisible();
   const geometry = await stopwatch.evaluate(button => {
     const label = button.closest('.row')!.querySelector('.k')!;
@@ -21,7 +21,7 @@ test('properties and timeline expose editable content animation, scrubbing, and 
   });
   expect(geometry.button).toBeLessThan(geometry.label);
   await stopwatch.click();
-  await expect(page.getByRole('button', { name: 'Remove animation from Width', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.getByRole('button', { name: 'Remove keyframe for Width', exact: true })).toHaveAttribute('aria-pressed', 'true');
   await page.evaluate(() => (window as any).PM.setTime(1));
   const width = page.getByRole('spinbutton', { name: 'Width', exact: true });
   await width.focus(); await width.press('ArrowUp'); await width.press('Enter');
@@ -90,7 +90,7 @@ test('text, shader, extension, blend, and mask stopwatches animate their real va
       return type === 'text' ? ['c.text', 'c.font', 'c.size', 'c.color', 'c.align']
         : type === 'shader' ? ['u.uTint', 'u.uEnabled', 'u.uAmount']
         : type === 'extension' ? ['x.objectColor', 'x.autoRotate', 'x.size']
-        : ['l.on', 'l.blend', 'l.mblur', `${layer.fx[0].id}.$enabled`, `m.${layer.masks[0].id}.on`, `m.${layer.masks[0].id}.shape`, `m.${layer.masks[0].id}.mode`];
+        : ['l.blend', 'l.mblur', `${layer.fx[0].id}.$enabled`, `m.${layer.masks[0].id}.on`, `m.${layer.masks[0].id}.shape`, `m.${layer.masks[0].id}.mode`];
     }, type);
     for (const path of paths) {
       const button = page.locator(`[data-property-path="${path}"]`);
@@ -109,5 +109,35 @@ test('text, shader, extension, blend, and mask stopwatches animate their real va
     }, paths);
     expect(state).toEqual(paths.map(() => 1));
   }
+  expect(session.diagnostics.pageErrors).toEqual([]);
+});
+
+test('dragging a timeline value adjusts the same property on every selected layer in one undo step', async ({ session }) => {
+  const { page } = session;
+  await page.waitForFunction(() => { const PM = (window as any).PM, timeline = PM.Kernel.services.get('timeline'); return !!timeline?.cv; });
+  const ids = await page.evaluate(() => {
+    const PM = (window as any).PM, timeline = PM.Kernel.services.get('timeline');
+    PM.replaceProject(PM.mkProject({ name: 'Bulk value drag', dur: 5 }));
+    const a = PM.mkLayer('shape', { name: 'A', dur: 5, p: { 'position.x': 100, 'position.y': 0 }, d: { w: 60, h: 60 } });
+    const b = PM.mkLayer('shape', { name: 'B', dur: 5, p: { 'position.x': 300, 'position.y': 500 }, d: { w: 60, h: 60 } });
+    PM.proj.layers = [a, b]; PM.ProjectIndex.invalidate(); PM.touch();
+    PM.selectLayers([a.id, b.id]); PM.sel.chan = 'position.y';
+    timeline.reveal(a, ['position.y']); timeline.reveal(b, ['position.y']);
+    PM.bus.emit('layers'); PM.invalidate();
+    return [a.id, b.id];
+  });
+  const rowPoint = (id: string) => page.evaluate(id => {
+    const PM = (window as any).PM, timeline = PM.Kernel.services.get('timeline'), rect = timeline.cv.getBoundingClientRect();
+    const index = timeline.rows.findIndex((row: any) => row.L.id === id && row.key === 'position.y');
+    return index < 0 ? null : { x: rect.x + timeline.propertyValueX + 12, y: rect.y + timeline.ruler + index * timeline.row - timeline.scrollY + timeline.row / 2 };
+  }, id);
+  await expect.poll(() => rowPoint(ids[1]!)).not.toBeNull();
+  const coords = (await rowPoint(ids[1]!))!;
+  const values = () => page.evaluate(ids => ids.map(id => { const PM = (window as any).PM, L = PM.L(id); return PM.evP(L, L.p['position.y'], PM.time ?? 0, 'position.y'); }), ids);
+  await page.mouse.move(coords.x, coords.y); await page.mouse.down();
+  await page.mouse.move(coords.x + 30, coords.y, { steps: 5 }); await page.mouse.up();
+  await expect.poll(values).toEqual([30, 530]);
+  await page.evaluate(() => (window as any).PM.hist.undo());
+  expect(await values()).toEqual([0, 500]);
   expect(session.diagnostics.pageErrors).toEqual([]);
 });

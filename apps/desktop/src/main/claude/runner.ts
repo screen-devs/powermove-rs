@@ -3,10 +3,12 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import type { CodexRunRequest, CodexRunResult, CodexTraceEvent } from '../../shared/ipc';
-import { isRecord } from '../../shared/guards';
+import type { CodexAnswerRequest, CodexQuestion, CodexRunRequest, CodexRunResult, CodexTraceEvent } from '../../shared/ipc';
+import { isRecord, isString } from '../../shared/guards';
 import { collectArtifacts } from '../codex/artifacts';
-import { publishExtensionChanges } from '../codex/change-history';
+import { publishExtensionChanges, withStageSnapshot } from '../codex/change-history';
+import { AgentResultValidationError, repairAgentResult } from '../codex/result-repair';
+import { validateStagedExtensions } from '../codex/validate-staged-extensions';
 import { consumeToken } from '../codex/consent';
 import { agentInstructions, agentResultSchema } from '../codex/instructions';
 import { parseAgentExtensionChanges } from '../codex/runner';
@@ -23,14 +25,43 @@ import {
   type AgentWorkspace,
   type CodexAuthority
 } from '../codex/workspace';
-import { buildClaudeArgv } from './adapter';
+import { buildClaudeArgv, claudeUserMessage } from './adapter';
+import { loadUserMcpServers, type UserMcpServers } from '../agent-tools/user-mcp';
 import { discoverClaudeBinary } from './env';
 import { ClaudeEventParser } from './events';
 import { isolatedClaudeEnvironment, prepareIsolatedClaudeHome } from './isolation';
 import type { NativeMcpServerConfig } from '../agent-tools/spec';
+import { imageExtension } from '../image-extension';
 
 const DEFAULT_TIMEOUT_MS = 3_600_000;
 const MAX_DIAGNOSTIC_BYTES = 2 * 1024 * 1024;
+const QUESTION_LIMITS = { questions: 6, options: 8, header: 80, question: 1_000, label: 160, description: 400 } as const;
+
+function clip(value: unknown, limit: number): string {
+  return typeof value === 'string' ? value.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '').trim().slice(0, limit) : '';
+}
+
+/** AskUserQuestion input, bounded for the renderer. Claude always accepts a typed "Other". */
+function askUserQuestions(itemId: string, input: Record<string, unknown>): { questions: CodexQuestion[]; texts: Map<string, string> } {
+  const texts = new Map<string, string>();
+  const entries = Array.isArray(input.questions) ? input.questions.slice(0, QUESTION_LIMITS.questions) : [];
+  const questions = entries.flatMap((entry, index): CodexQuestion[] => {
+    if (!isRecord(entry) || !isString(entry.question)) return [];
+    const question = clip(entry.question, QUESTION_LIMITS.question);
+    if (!question) return [];
+    const id = `${itemId}-${index}`;
+    texts.set(id, entry.question);
+    const options = (Array.isArray(entry.options) ? entry.options : []).slice(0, QUESTION_LIMITS.options).flatMap((option) => {
+      const label = isRecord(option) ? clip(option.label, QUESTION_LIMITS.label) : '';
+      return label ? [{ label, description: clip((option as Record<string, unknown>).description, QUESTION_LIMITS.description) }] : [];
+    });
+    return [{
+      id, header: clip(entry.header, QUESTION_LIMITS.header), question, options,
+      allowOther: true, secret: false, ...(entry.multiSelect === true ? { multiSelect: true } : {})
+    }];
+  });
+  return { questions, texts };
+}
 
 type SpawnLike = (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess;
 
@@ -47,11 +78,22 @@ export interface ClaudeRunOptions {
   spawnProcess?: SpawnLike;
   consumeConsentToken?: (token: string) => boolean;
   nativeTools?: NativeMcpServerConfig;
+  externalMcpServers?: UserMcpServers;
+}
+
+/** An AskUserQuestion call held open on the CLI's permission prompt. */
+interface HeldQuestion {
+  controlId: string;
+  input: Record<string, unknown>;
+  /** Question id → the question text Claude keys its answers by. */
+  texts: Map<string, string>;
 }
 
 interface ActiveRun {
   request: CodexRunRequest;
   child: ChildProcess | null;
+  /** Held questions by tool_use id (the trace item id). */
+  questions: Map<string, HeldQuestion>;
   layout: AgentWorkspace | null;
   killTimer: NodeJS.Timeout | null;
   userData: string;
@@ -113,7 +155,7 @@ async function writeEditorImages(req: CodexRunRequest): Promise<{ directory: str
   const directory = await mkdtemp(path.join(tmpdir(), 'powermove-claude-'));
   const imagePaths: string[] = [];
   for (const [index, image] of req.images.entries()) {
-    const extension = image[0] === 0x89 && image[1] === 0x50 ? 'png' : 'jpg';
+    const extension = imageExtension(image);
     const file = path.join(directory, `reference-${index}.${extension}`);
     await writeFile(file, image);
     imagePaths.push(file);
@@ -135,15 +177,17 @@ export class ClaudeRunner {
     }
 
     const state: ActiveRun = {
-      request: req, child: null, layout: null, killTimer: null,
+      request: req, child: null, questions: new Map(), layout: null, killTimer: null,
       userData: options.userData, sessionWrite: Promise.resolve()
     };
     this.active.set(req.id, state);
     let editorDirectory: string | null = null;
+    let repairingResult = false;
     try {
-      const [binary, configDirectory] = await Promise.all([
+      const [binary, configDirectory, externalMcpServers] = await Promise.all([
         options.binary ?? discoverClaudeBinary(options.claudeBinaryPref ?? null),
-        prepareIsolatedClaudeHome(options.userData)
+        prepareIsolatedClaudeHome(options.userData),
+        options.externalMcpServers ?? loadUserMcpServers('claude')
       ]);
       if (this.cancelled.has(req.id)) return failure('The Claude run was cancelled.', true);
 
@@ -158,8 +202,9 @@ export class ClaudeRunner {
           reasoningEffort: req.reasoningEffort,
           sessionId: null,
           access: 'editor',
-          nativeTools: options.nativeTools
-        }), null, options);
+          nativeTools: options.nativeTools,
+          externalMcpServers
+        }), claudeUserMessage(req.prompt, editor.imagePaths), null, options);
         if (this.cancelled.has(req.id)) return failure('The Claude run was cancelled.', true);
         if (attempt.code !== 0 || attempt.resultError) return failure(humanizeFailure(attempt, 'Claude generation failed.'));
         const output = attempt.output ?? (() => {
@@ -181,28 +226,32 @@ export class ClaudeRunner {
       state.layout = layout;
       let sessionId = await readSession(layout.sessionPath);
       let attempt: Attempt | null = null;
-      for (let index = 0; index < 2; index += 1) {
-        attempt = await this.execute(req, state, binary, configDirectory, layout.root, buildClaudeArgv({
+      const executeAutonomous = async (prompt: string, resumeId: string | null) => {
+        if (this.cancelled.has(req.id)) throw new Error('The Claude run was cancelled.');
+        const result = await this.execute(req, state, binary, configDirectory, layout.root, buildClaudeArgv({
           schema: agentResultSchema(),
-          prompt: req.prompt,
+          prompt,
           imagePaths: layout.imagePaths,
           model: req.model,
           reasoningEffort: req.reasoningEffort,
-          sessionId,
+          sessionId: resumeId,
           access: req.access,
           extensionsDir: layout.extensionsDir,
           instructions: agentInstructions({
             projectName: req.projectName,
             artifactPath: `artifacts/${layout.runId}`,
             access: authority,
+            context: req.context,
             extensionsDir: layout.extensionsDir
           }),
-          nativeTools: options.nativeTools
-        }), layout, options);
-        if (this.cancelled.has(req.id)) {
-          await this.cleanupCancelled(state, options.userData);
-          return failure('The Claude run was cancelled.', true);
-        }
+          nativeTools: options.nativeTools,
+          externalMcpServers
+        }), claudeUserMessage(prompt, layout.imagePaths), layout, options);
+        if (this.cancelled.has(req.id)) throw new Error('The Claude run was cancelled.');
+        return result;
+      };
+      for (let index = 0; index < 2; index += 1) {
+        attempt = await executeAutonomous(req.prompt, sessionId);
         const diagnostic = `${attempt.stderr}\n${attempt.resultError ?? ''}`;
         if (index === 0 && sessionId && attempt.code !== 0 && unknownSession(diagnostic)) {
           options.onProgress?.('The saved Claude thread could not be resumed — starting a fresh run…');
@@ -218,20 +267,38 @@ export class ClaudeRunner {
         await clearSession(layout.sessionPath);
         return failure(attempt ? humanizeFailure(attempt, 'The Claude agent failed.') : 'The Claude agent failed.');
       }
-      const output = attempt.output ?? (() => {
-        try { return JSON.parse(attempt.resultText); } catch { return undefined; }
-      })();
-      if (!isRecord(output)) return failure('Claude returned an invalid autonomous result.');
-      const parsed: Record<string, unknown> = { ...output };
-      parsed.artifacts = await collectArtifacts(
-        layout.runDirectory,
-        layout.runId,
-        Array.isArray(parsed.artifacts) ? parsed.artifacts : []
-      );
-      parsed.projectId = req.projectId;
-      parsed.access = authority;
-      const extensions = parseAgentExtensionChanges(parsed.extensions);
-      const changeSet = await publishExtensionChanges(layout, extensions ?? []);
+      const { parsed, extensions, changeSet } = await repairAgentResult(async () => {
+        if (this.cancelled.has(req.id)) throw new Error('The Claude run was cancelled.');
+        const output = attempt!.output ?? (() => {
+          try { return JSON.parse(attempt!.resultText); } catch { return undefined; }
+        })();
+        if (!isRecord(output)) throw new AgentResultValidationError('Claude returned an invalid autonomous result. Return a JSON object matching the result schema.');
+        const parsed: Record<string, unknown> = { ...output };
+        if (req.context === 'app' && (Array.isArray(parsed.commands) && parsed.commands.length
+          || Array.isArray(parsed.artifacts) && parsed.artifacts.some((item: any) => item?.importToTimeline === true))) {
+          throw new AgentResultValidationError('No project is attached. Return commands: [] and do not import artifacts to a timeline.');
+        }
+        parsed.artifacts = await collectArtifacts(
+          layout.runDirectory,
+          layout.runId,
+          Array.isArray(parsed.artifacts) ? parsed.artifacts : []
+        );
+        parsed.projectId = req.projectId;
+        parsed.access = authority;
+        const extensions = parseAgentExtensionChanges(parsed.extensions);
+        // One private copy is checked and published; later stage writes cannot ship.
+        const changeSet = await withStageSnapshot(layout, async snapshot => {
+          await validateStagedExtensions(snapshot, extensions ?? []);
+          if (this.cancelled.has(req.id)) throw new Error('The Claude run was cancelled.');
+          return publishExtensionChanges(snapshot, extensions ?? []);
+        }, (extensions ?? []).map(change => change.id));
+        return { parsed, extensions, changeSet };
+      }, async prompt => {
+        repairingResult = true;
+        attempt = await executeAutonomous(prompt, await readSession(layout.sessionPath));
+        if (attempt.code !== 0 || attempt.resultError) throw new Error(humanizeFailure(attempt, 'Claude could not correct its result.'));
+      }, options.onProgress);
+      repairingResult = false;
       await discardExtensionStage(layout);
       return {
         ok: true,
@@ -244,6 +311,9 @@ export class ClaudeRunner {
       if (this.cancelled.has(req.id)) {
         await this.cleanupCancelled(state, options.userData);
         return failure('The Claude run was cancelled.', true);
+      }
+      if ((error instanceof AgentResultValidationError || repairingResult) && state.layout) {
+        await preserveCancelledRun(state.layout).catch(checkpointError => options.onWarning?.(`Could not save the agent checkpoint: ${String(checkpointError)}`));
       }
       return failure(error instanceof Error ? error.message : String(error));
     } finally {
@@ -267,6 +337,66 @@ export class ClaudeRunner {
     await Promise.all([...this.active.keys()].map((id) => this.cancel(id)));
   }
 
+  /** Settles a held AskUserQuestion with the person's answers; none means skipped. */
+  answer(req: CodexAnswerRequest): boolean {
+    const state = this.active.get(req.id);
+    const held = state?.questions.get(req.itemId);
+    if (!state || !held) return false;
+    state.questions.delete(req.itemId);
+    const answers = Object.fromEntries([...held.texts].flatMap(([id, text]) => {
+      const chosen = (req.answers[id] ?? []).map((answer) => answer.trim()).filter(Boolean);
+      return chosen.length ? [[text, chosen.join(', ')]] : [];
+    }));
+    this.respondControl(state, held.controlId, Object.keys(answers).length
+      ? { behavior: 'allow', updatedInput: { ...held.input, answers } }
+      : { behavior: 'deny', message: 'The user skipped the question. Continue with your best judgement.' });
+    return true;
+  }
+
+  private respondControl(state: ActiveRun, requestId: string, response: Record<string, unknown>): void {
+    const stdin = state.child?.stdin;
+    if (!stdin || stdin.destroyed || stdin.writableEnded) return;
+    stdin.write(`${JSON.stringify({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response } })}\n`);
+  }
+
+  /* The stdio permission prompt. AskUserQuestion becomes a question card and
+     waits for the person; every other prompt is denied, as --print would
+     without a prompt tool, so this channel never widens a run's access. */
+  private control(state: ActiveRun, event: Record<string, unknown>, onTrace?: (step: CodexTraceEvent) => void): void {
+    const requestId = isString(event.request_id, 200) ? event.request_id : null;
+    if (!requestId) return;
+    if (event.type === 'control_cancel_request') {
+      for (const [itemId, held] of state.questions) {
+        if (held.controlId !== requestId) continue;
+        state.questions.delete(itemId);
+        onTrace?.({ kind: 'question-closed', itemId });
+      }
+      return;
+    }
+    const request = isRecord(event.request) ? event.request : {};
+    if (request.subtype !== 'can_use_tool') {
+      const stdin = state.child?.stdin;
+      if (stdin && !stdin.destroyed && !stdin.writableEnded) {
+        stdin.write(`${JSON.stringify({ type: 'control_response', response: { subtype: 'error', request_id: requestId, error: 'Unsupported by Powermove.' } })}\n`);
+      }
+      return;
+    }
+    const itemId = isString(request.tool_use_id, 120) ? request.tool_use_id : null;
+    const input = isRecord(request.input) ? request.input : {};
+    if (request.tool_name === 'AskUserQuestion' && itemId && onTrace && !state.questions.has(itemId)) {
+      const { questions, texts } = askUserQuestions(itemId, input);
+      if (questions.length) {
+        state.questions.set(itemId, { controlId: requestId, input, texts });
+        onTrace({ kind: 'question', itemId, questions, transport: 'reply', blocking: true });
+        return;
+      }
+    }
+    this.respondControl(state, requestId, {
+      behavior: 'deny',
+      message: `Powermove does not allow ${isString(request.tool_name, 80) ? request.tool_name : 'this tool'} in this run.`
+    });
+  }
+
   private async execute(
     req: CodexRunRequest,
     state: ActiveRun,
@@ -274,6 +404,7 @@ export class ClaudeRunner {
     configDirectory: string,
     cwd: string,
     argv: string[],
+    message: string,
     layout: AgentWorkspace | null,
     options: ClaudeRunOptions
   ): Promise<Attempt> {
@@ -284,7 +415,7 @@ export class ClaudeRunner {
         cwd,
         detached: true,
         env: isolatedClaudeEnvironment(configDirectory),
-        stdio: ['ignore', 'pipe', 'pipe']
+        stdio: ['pipe', 'pipe', 'pipe']
       });
     } catch (error) {
       return {
@@ -294,6 +425,9 @@ export class ClaudeRunner {
       };
     }
     state.child = child;
+    // A CLI that exits early closes its end; the exit status reports why.
+    child.stdin?.on('error', () => undefined);
+    child.stdin?.write(message);
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     const parser = new ClaudeEventParser({
@@ -301,6 +435,9 @@ export class ClaudeRunner {
       onTrace: options.onTrace,
       onWarning: options.onWarning,
       projectCwd: cwd,
+      onControl: (event) => this.control(state, event, options.onTrace),
+      // The CLI reads more turns until stdin closes; one prompt is one run.
+      onResult: () => { child.stdin?.end(); },
       onSessionId: (sessionId) => {
         if (!layout) return;
         state.sessionWrite = state.sessionWrite
@@ -322,6 +459,8 @@ export class ClaudeRunner {
         settled = true;
         clearTimeout(timer);
         parser.finish();
+        // Held questions die with the process; the renderer closes their cards.
+        state.questions.clear();
         void state.sessionWrite.then(() => resolve({
           code,
           signal,

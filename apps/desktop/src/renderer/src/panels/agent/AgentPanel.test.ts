@@ -1,8 +1,10 @@
 // @vitest-environment happy-dom
-import { flushSync, mount, unmount } from 'svelte';
+import { flushSync, mount, tick, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import AgentPanel from '../AgentPanel.svelte';
+import ThreadPicker from './ThreadPicker.svelte';
+import { BLINK_MS } from '../../controls/menu-blink';
 import { install as installSpatial } from '../../legacy/assistant/spatial';
 import { registerAgentPanel } from '../register-agent';
 import {
@@ -80,7 +82,7 @@ function snapshot(overrides: Partial<AgentSnapshot> = {}): AgentSnapshot {
       { id: 'gpt-5.6-terra', label: '5.6 Terra' }
     ],
     providers: [
-      { id: 'chatgpt', label: 'ChatGPT' },
+      { id: 'chatgpt', label: 'Codex' },
       { id: 'claude', label: 'Claude' }
     ],
     reasoningEfforts: ['low', 'high'],
@@ -225,14 +227,14 @@ describe('AgentPanel', () => {
     expect(picker).toBeTruthy();
     expect(picker?.textContent).toContain('Saved conversation');
     expect(target.querySelector('.agent-scroll')?.textContent).toContain('Your title animation is ready.');
-    expect(target.querySelector<HTMLTextAreaElement>('textarea')?.value).toBe('Make it slower');
+    expect(target.querySelector<HTMLDivElement>('.agent-inline-prompt')?.textContent).toBe('Make it slower');
   });
 
-  it('keeps setup visible while checking another provider and restores the saved draft', async () => {
-    const chatgpt = window.powermove!.chatgpt;
+  it('keeps the connection gate and queued draft visible while checking another provider', async () => {
+    const chatgpt = (window as any).powermove.chatgpt;
     vi.mocked(chatgpt.status).mockResolvedValue({ state: 'disconnected', email: null, planType: null, detail: null });
     let resolveStatus!: (status: any) => void;
-    Object.assign(window.powermove!, { claude: {
+    Object.assign((window as any).powermove, { claude: {
       status: vi.fn(() => new Promise(resolve => { resolveStatus = resolve; })),
       onChanged: vi.fn(() => () => undefined)
     } });
@@ -243,17 +245,18 @@ describe('AgentPanel', () => {
     });
     flushSync(() => setAgentSnapshot(snapshot({ provider: 'claude', composerDraft: 'Animate my title' })));
     expect(target.querySelector('.agent-connect-gate')?.textContent).toContain('Checking connection…');
-    expect(target.querySelector('[aria-label="Message composer"]')).toBeNull();
+    expect(target.querySelector('[aria-label="Message composer"]')).toBeTruthy();
+    expect(target.querySelector<HTMLDivElement>('.agent-inline-prompt')?.textContent).toBe('Animate my title');
     expect(target.querySelector<HTMLButtonElement>('.agent-connect-button')?.disabled).toBe(true);
     resolveStatus({ state: 'connected', email: null, planType: null, detail: null });
     await vi.waitFor(() => {
       flushSync();
       expect(target.querySelector('.agent-connect-gate')).toBeNull();
-      expect(target.querySelector<HTMLTextAreaElement>('textarea')?.value).toBe('Animate my title');
+      expect(target.querySelector<HTMLDivElement>('.agent-inline-prompt')?.textContent).toBe('Animate my title');
     });
   });
 
-  it('offers accessible new-thread and switching controls and disables them during a run', () => {
+  it('offers accessible new-thread and switching controls and disables them during a run', async () => {
     PM.AgentUI.newThread = vi.fn(); PM.AgentUI.switchThread = vi.fn(); PM.AgentUI.deleteThread = vi.fn();
     const now = Date.now();
     const threads = [
@@ -281,16 +284,58 @@ describe('AgentPanel', () => {
     expect(PM.AgentUI.switchThread).not.toHaveBeenCalled();
 
     flushSync(() => rows[1]!.click());
+    await new Promise((resolve) => setTimeout(resolve, BLINK_MS * 2 + 10));
     expect(PM.AgentUI.switchThread).toHaveBeenCalledWith('second');
     newThread.click();
     expect(PM.AgentUI.newThread).toHaveBeenCalledOnce();
+    // A run no longer holds the picker: only an in-flight apply does.
+    flushSync(() => setAgentSnapshot(snapshot({threadId:'first',threads,legacyPhase:'working'})));
+    expect(picker.disabled).toBe(false);
+    expect(newThread.disabled).toBe(false);
     flushSync(() => setAgentSnapshot(snapshot({threadId:'first',threads,threadSwitchBlocked:true})));
     expect(picker.disabled).toBe(true);
     expect(newThread.disabled).toBe(true);
-    expect(picker.title).toContain('Finish or stop');
+    expect(picker.title).toContain('Finish applying');
   });
 
-  it('filters threads by the picker search field', () => {
+  it('keeps a rapidly reopened thread picker open when its new animation ends', async () => {
+    PM.AgentUI.switchThread = vi.fn();
+    renderPanel(snapshot({ threadId: 'first', threads: [
+      { id: 'first', title: 'First' }, { id: 'second', title: 'Second' }
+    ] }));
+    const picker = target.querySelector<HTMLButtonElement>('[aria-label="Switch thread"]')!;
+    flushSync(() => picker.click());
+    await tick(); flushSync();
+    flushSync(() => target.querySelector<HTMLElement>('.thread-row')!.click());
+    await new Promise((resolve) => setTimeout(resolve, BLINK_MS * 2 + 10));
+    flushSync();
+    expect(picker.getAttribute('aria-expanded')).toBe('false');
+    flushSync(() => picker.click());
+    await tick(); flushSync();
+    const popup = target.querySelector<HTMLElement>('.thread-popup')!;
+    flushSync(() => popup.dispatchEvent(new Event('animationend')));
+    expect(picker.getAttribute('aria-expanded')).toBe('true');
+    expect(target.querySelector('.thread-popup')).toBe(popup);
+    flushSync(() => picker.click());
+    flushSync(() => popup.dispatchEvent(new Event('animationend')));
+    expect(target.querySelector('.thread-popup')).toBeNull();
+  });
+
+  it('releases an open thread picker’s global dismissal listeners when its panel unmounts', async () => {
+    const add = vi.spyOn(document, 'addEventListener');
+    const remove = vi.spyOn(document, 'removeEventListener');
+    setAgentSnapshot(snapshot({ threadId: 'first', threads: [{ id: 'first', title: 'First' }] }));
+    instance = mount(ThreadPicker, { target, props: { PM } });
+    flushSync();
+    flushSync(() => target.querySelector<HTMLButtonElement>('[aria-label="Switch thread"]')!.click());
+    await tick(); flushSync();
+    const registration = () => add.mock.calls.find(([type, , capture]) => type === 'scroll' && capture === true);
+    await vi.waitFor(() => expect(registration()).toBeDefined());
+    await unmount(instance!); instance = undefined;
+    expect(remove).toHaveBeenCalledWith('scroll', registration()![1], true);
+  });
+
+  it('filters threads by the picker search field', async () => {
     PM.AgentUI.switchThread = vi.fn();
     const threads = [{ id: 'first', title: 'Animate the title' }, { id: 'second', title: 'Colour grade' }];
     renderPanel(snapshot({ threadId: 'first', threads }));
@@ -302,6 +347,7 @@ describe('AgentPanel', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]!.textContent).toContain('Colour grade');
     flushSync(() => rows[0]!.click());
+    await new Promise((resolve) => setTimeout(resolve, BLINK_MS * 2 + 10));
     expect(PM.AgentUI.switchThread).toHaveBeenCalledWith('second');
   });
   it('renders idle, prompt, running, preview, and result blocks from state setters', () => {
@@ -335,11 +381,11 @@ describe('AgentPanel', () => {
 
   it('clears the focused composer after Enter and does not resend an empty draft', () => {
     renderPanel();
-    const textarea = target.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message Powermove agent"]')!;
-    expect(target.querySelector(`label[for="${textarea.id}"]`)?.textContent).toBe('Message Powermove agent');
+    const textarea = target.querySelector<HTMLDivElement>('.agent-inline-prompt[aria-label="Message Powermove agent"]')!;
+    expect(textarea.getAttribute('aria-label')).toBe('Message Powermove agent');
 
     textarea.focus();
-    textarea.value = 'Make the title bounce';
+    textarea.textContent = 'Make the title bounce';
     flushSync(() => textarea.dispatchEvent(new InputEvent('input', { bubbles: true })));
     PM.AgentUI.submit.mockImplementationOnce(() => {
       setAgentSnapshot(snapshot({
@@ -354,9 +400,58 @@ describe('AgentPanel', () => {
     flushSync();
 
     expect(PM.AgentUI.submit).toHaveBeenCalledExactlyOnceWith('Make the title bounce');
-    expect(textarea.value).toBe('');
+    expect(textarea.textContent).toBe('');
     textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
     expect(PM.AgentUI.submit).toHaveBeenCalledOnce();
+  });
+
+  it('releases composer focus before another surface consumes a pointer interaction', () => {
+    renderPanel(snapshot({ composerDraft: 'Keep this draft' }));
+    const textarea = target.querySelector<HTMLDivElement>('.agent-inline-prompt')!;
+    const canvas = document.createElement('canvas');
+    target.append(canvas);
+    const focusedAtPointer = vi.fn();
+    canvas.addEventListener('pointerdown', event => {
+      focusedAtPointer(document.activeElement === textarea);
+      event.preventDefault();
+      event.stopPropagation();
+    });
+    for (const button of [0, 1]) {
+      flushSync(() => textarea.focus());
+      canvas.dispatchEvent(new PointerEvent('pointerdown', { button, bubbles: true, cancelable: true }));
+      expect(document.activeElement).not.toBe(textarea);
+    }
+    expect(focusedAtPointer.mock.calls).toEqual([[false], [false]]);
+    expect(textarea.textContent).toBe('Keep this draft');
+    expect(agentState.composerDraft).toBe('Keep this draft');
+  });
+
+  it('keeps composer interactions and context clicks from dismissing the draft focus', () => {
+    renderPanel(snapshot({ composerDraft: 'Keep this draft' }));
+    const textarea = target.querySelector<HTMLDivElement>('.agent-inline-prompt')!;
+    flushSync(() => textarea.focus());
+    for (const element of [textarea, target.querySelector('.agent-send')!]) {
+      element.dispatchEvent(new PointerEvent('pointerdown', { button: 0, bubbles: true, cancelable: true }));
+      expect(document.activeElement).toBe(textarea);
+    }
+    target.dispatchEvent(new PointerEvent('pointerdown', { button: 2, bubbles: true, cancelable: true }));
+    expect(document.activeElement).toBe(textarea);
+  });
+
+  it('leaves the composer on Escape after dismissing slash commands', () => {
+    renderPanel(snapshot({ composerDraft: '/' }));
+    const textarea = target.querySelector<HTMLDivElement>('.agent-inline-prompt')!;
+    flushSync(() => textarea.focus());
+    const escape = () => flushSync(() => textarea.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Escape', bubbles: true, cancelable: true
+    })));
+    escape();
+    expect(target.querySelector('.agent-slash-menu')).toBeNull();
+    expect(document.activeElement).toBe(textarea);
+    escape();
+    expect(document.activeElement).not.toBe(textarea);
+    expect(textarea.textContent).toBe('/');
+    expect(PM.AgentUI.submit).not.toHaveBeenCalled();
   });
 
   it('renders steering as a compact continuation of the active user request', () => {
@@ -374,6 +469,51 @@ describe('AgentPanel', () => {
     expect(userTurns[0]?.classList.contains('is-steering')).toBe(false);
     expect(userTurns[1]?.classList.contains('is-steering')).toBe(true);
     expect(userTurns[1]?.querySelector('.agent-bubble')?.textContent).toBe('continue');
+  });
+
+  it('filters slash commands, selects a model with the keyboard, and returns to typing', () => {
+    renderPanel();
+    const textarea = target.querySelector<HTMLDivElement>('.agent-inline-prompt')!;
+    flushSync(() => textarea.focus());
+    textarea.textContent = '/mod';
+    flushSync(() => textarea.dispatchEvent(new InputEvent('input', { bubbles: true })));
+    expect(target.querySelector('[role="listbox"][aria-label="Slash commands"]')?.textContent).toContain('/model');
+    const key = (value: string) => flushSync(() => textarea.dispatchEvent(new KeyboardEvent('keydown', { key: value, bubbles: true, cancelable: true })));
+    key('Tab');
+    expect(textarea.textContent).toBe('/model ');
+    expect(target.querySelectorAll('[role="option"]')).toHaveLength(2);
+    key('ArrowDown');
+    key('Enter');
+    expect(PM.AgentUI.setModel).toHaveBeenCalledExactlyOnceWith('gpt-5.6-terra', 'high');
+    expect(PM.AgentUI.submit).not.toHaveBeenCalled();
+    expect(textarea.textContent).toBe('');
+    expect(document.activeElement).toBe(textarea);
+    expect(target.querySelector('.agent-slash-menu')).toBeNull();
+  });
+
+  it('dismisses shortcuts without consuming a literal slash prompt, and keeps /new open while working', () => {
+    renderPanel(snapshot({ legacyPhase: 'working', requestToken: 1 }));
+    const textarea = target.querySelector<HTMLDivElement>('.agent-inline-prompt')!;
+    flushSync(() => textarea.focus());
+    textarea.textContent = '/';
+    flushSync(() => textarea.dispatchEvent(new InputEvent('input', { bubbles: true })));
+    const menu = target.querySelector('.agent-slash-menu')!;
+    expect(menu.textContent).toContain('/new');
+    expect(menu.textContent).toContain('/stop');
+    flushSync(() => textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })));
+    expect(target.querySelector('.agent-slash-menu')).toBeNull();
+    expect(textarea.textContent).toBe('/');
+    textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    expect(PM.AgentUI.submit).toHaveBeenCalledExactlyOnceWith('/');
+  });
+
+  it('keeps IME confirmation and Shift+Enter local to the draft', () => {
+    renderPanel(snapshot({ composerDraft: 'Animate this' }));
+    const textarea = target.querySelector<HTMLDivElement>('.agent-inline-prompt')!;
+    textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', isComposing: true, bubbles: true }));
+    textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true }));
+    expect(PM.AgentUI.submit).not.toHaveBeenCalled();
+    expect(textarea.textContent).toBe('Animate this\n');
   });
 
   it('keeps error recovery inside the diagnostic card', () => {
@@ -489,6 +629,21 @@ describe('AgentPanel', () => {
     expect(PM.SpatialAssistant.requestFix).not.toHaveBeenCalled();
   });
 
+  it('renders Markdown in completion reviews and critiques', () => {
+    renderPanel(snapshot({
+      legacyPhase: 'result',
+      run: {
+        autonomous: true, changed: true,
+        review: { message: 'Sandbox **passed** for `random-hello-world`.', critique: 'Updated `random-hello-world.panel`.\n\n- Preserved **permissions**' }
+      }
+    }));
+    const details = target.querySelector('.agent-run-details')!;
+    expect([...details.querySelectorAll('code')].map(node => node.textContent)).toEqual(['random-hello-world', 'random-hello-world.panel']);
+    expect(details.querySelector('.agent-md-li')).not.toBeNull();
+    expect(details.textContent).not.toContain('`');
+    expect(details.textContent).not.toContain('**');
+  });
+
   it('shows autonomous results once in the conversation without a completion card', () => {
     renderPanel(snapshot({
       legacyPhase: 'result',
@@ -513,7 +668,7 @@ describe('AgentPanel', () => {
     expect(log.querySelector('details img')?.getAttribute('alt')).toBe('Rendered composition at 0 seconds');
   });
 
-  it('keeps files, notes, and warnings inline for an autonomous response with no source changes', () => {
+  it('omits files and external activity after completion while keeping review notes', () => {
     PM.assetKind.mockReturnValue('video');
     renderPanel(snapshot({
       legacyPhase: 'result',
@@ -530,14 +685,14 @@ describe('AgentPanel', () => {
     const log = target.querySelector('[role="log"]')!;
     expect(log.textContent).toContain('Review the license before publishing.');
     expect(log.textContent).toContain('The clip could not be imported.');
-    expect(log.textContent).toContain('Downloaded reference footage');
+    expect(log.textContent).not.toContain('Downloaded reference footage');
+    expect(log.querySelector('.agent-artifacts')).toBeNull();
+    expect(log.querySelector('.agent-external-actions')).toBeNull();
     expect(target.textContent).not.toContain('Undo change');
     expect(target.textContent).not.toContain('Done');
-    log.querySelector<HTMLButtonElement>('[aria-label="Add clip.mp4 to timeline"]')!.click();
-    log.querySelector<HTMLButtonElement>('[aria-label="Reveal clip.mp4 in Finder"]')!.click();
-    expect(PM.AgentUI.importArtifact).toHaveBeenCalledOnce();
-    expect(PM.AgentUI.revealArtifact).toHaveBeenCalledOnce();
-    expect(target.querySelector('textarea')?.disabled).toBe(false);
+    expect(log.querySelector('[aria-label="Add clip.mp4 to timeline"]')).toBeNull();
+    expect(log.querySelector('[aria-label="Reveal clip.mp4 in Finder"]')).toBeNull();
+    expect(target.querySelector('.agent-inline-prompt')?.getAttribute('aria-disabled')).toBe('false');
 
     flushSync(() => setAgentSnapshot(snapshot({
       legacyPhase: 'result', conversation: [{ role: 'assistant', text: 'No changes needed.' }],
@@ -555,6 +710,18 @@ describe('AgentPanel', () => {
     buttons.find(button => button.textContent === 'Keep change')!.click();
     expect(PM.AgentUI.undoSceneRun).toHaveBeenCalledOnce();
     expect(PM.AgentUI.keepSceneRun).toHaveBeenCalledOnce();
+  });
+
+  it('renders autonomous review notes as separate markdown blocks', () => {
+    renderPanel(snapshot({ legacyPhase: 'result', run: {
+      autonomous: true, changed: false,
+      review: { message: 'Callouts:\n- 01 Auto mode\n- 02 HEPA 13\n\nCheck the `marker`.' }
+    } }));
+    const review = target.querySelector('.agent-review-markdown')!;
+    expect(review.querySelectorAll('.agent-md-li')).toHaveLength(2);
+    expect(review.querySelector('.agent-md-p')?.textContent).toBe('Callouts:');
+    expect(review.querySelectorAll('.agent-md-li')[0]?.textContent?.trim()).toBe('01 Auto mode');
+    expect(review.querySelector('.agent-trace-code')?.textContent).toBe('marker');
   });
 });
 

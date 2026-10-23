@@ -1,16 +1,46 @@
+import { webmTimestampScale } from '../../../../shared/video-timing';
+import { createCloudMedia, cloudSourcePaths, readLocalMediaSource } from '../core/cloud-media';
+import { prepareVideoPreview } from '../core/video-preview';
+import { disposeVideoInstances } from '../core/video-instances';
+import { cancelPreviewVideoSeek } from '../core/video-seek';
 import { importedSequences } from '../core/image-sequence';
+import { convertAnimatedImage, convertStillImage, isAnimatedImage, mayAnimate, readProxyFile } from '../core/media-conversion';
+import {
+  isImageExtension, isVideoExtension, mayNeedVideoProxy, mediaExtension, needsImageConversion, needsVideoProxy,
+} from '../../../../shared/media-formats';
 import { fontAnchorOffset } from '../core/font-anchor';
-import { animatedGlyphs, textControlValues } from '../core/text-animation';
+import { animatedGlyphs, isIdentityGlyph, textAnimationKey, textAnimationState } from '../core/text-animation';
+import { glyphLayout, textSourceLines } from '../core/text-layout';
 import { rasterPaths, pathValues, groupMatrix } from '../core/vector-paths';
 import { createVariableFontRenderer, variationEntries, variationSettings } from '../../typography/font-renderer';
 export { variationEntries as textVariationEntries, variationSettings as formatFontVariationSettings } from '../../typography/font-renderer';
 import { resolveContent } from '../core/content-properties';
 import { shapeRasterGeometry, type RasterWindow } from './shape-raster-window';
+import { cornerRadii, isUniformCircular, roundedRectPath } from './corner-geometry';
 /* Ported from js/gl/raster.js — behavior-preserving. */
 import type { PMRegistry } from '../registry';
 import { parseObj } from '../../kernel/obj';
 import { parseSvg } from '../core/svg-import';
 import { inspectorService, viewerService } from '../core/services';
+import { capturePoster } from '../core/poster';
+import { bridge as hostBridge } from '../../kernel/bridge';
+
+const posterUrls = new Map<string, string>();
+
+function revokePoster(id: any) {
+  const previous = posterUrls.get(String(id));
+  posterUrls.delete(String(id));
+  if (!previous) return;
+  try { window.URL?.revokeObjectURL?.(previous); } catch (error) { }
+}
+
+function setPoster(id: any, blob: Blob) {
+  revokePoster(id);
+  try {
+    if (typeof window.URL?.createObjectURL !== 'function') return;
+    posterUrls.set(String(id), window.URL.createObjectURL(blob));
+  } catch (error) { }
+}
 
 const VIDEO_READ_FAILURE = 'Could not read this video file';
 
@@ -137,89 +167,60 @@ function resolvedTextContent(input: any, time = PM.time) {
   return resolved;
 }
 
-/** The Type tool's drag gesture creates AE-style paragraph text. Keep the
-    complete source string, but wrap its rendered lines inside the authored
-    box and clip overflow below the box. */
 function textLines(d: any, context: any, lineHeight: number): string[] {
-  const source = String(d.text == null ? '' : d.text).split('\n');
-  const boxWidth = Number(d.boxWidth);
-  if (!d.paragraph || !Number.isFinite(boxWidth) || boxWidth <= 0) return source;
-  const width = (value: string) => context.measureText(value).width;
-  const wrapped: string[] = [];
-  for (const paragraph of source) {
-    if (!paragraph) { wrapped.push(''); continue; }
-    let line = '';
-    for (const token of paragraph.split(/(\s+)/u).filter(Boolean)) {
-      const candidate = line + token;
-      if (line && width(candidate) > boxWidth) {
-        wrapped.push(line.trimEnd());
-        line = token.trimStart();
-      } else line = candidate;
-      while (line && width(line) > boxWidth) {
-        let cut = 1;
-        while (cut < line.length && width(line.slice(0, cut + 1)) <= boxWidth) cut++;
-        wrapped.push(line.slice(0, cut));
-        line = line.slice(cut);
-      }
-    }
-    wrapped.push(line.trimEnd());
-  }
-  const boxHeight = Number(d.boxHeight);
-  if (!Number.isFinite(boxHeight) || boxHeight <= 0) return wrapped;
-  return wrapped.slice(0, Math.max(1, Math.floor(boxHeight / Math.max(1, lineHeight))));
+  return textSourceLines(d, context, lineHeight).map(line => line.text);
 }
+
+function graphemesOf(value: string): string[] {
+  if (typeof Intl !== 'undefined' && Intl.Segmenter) {
+    return [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(value)].map(item => item.segment);
+  }
+  return Array.from(value);
+}
+
+interface CaretLine { text: string; start: number; x: number; y: number; baseline: number; width: number; boundaries: { index: number; x: number }[] }
+interface CaretLayout { lines: CaretLine[]; lineHeight: number; size: number; length: number; align: 'left' | 'center' | 'right'; boxWidth: number; boxHeight: number }
+
+/* Caret and selection geometry for the on-canvas text editor. Every x comes
+   from the same measuring context and wrapping as the rasterizer, so the
+   caret sits between the painted glyphs at any zoom. Coordinates are in the
+   layer's local space: the first baseline is at size * .82 below the origin
+   and x is measured from the alignment origin. */
+function textCaretLayout(d: any): CaretLayout {
+  const size = Math.max(1, Number(d.size) || 16);
+  const meas = getCanvas(8, 8).getContext('2d') as any;
+  const align = d.align === 'center' ? 'center' : d.align === 'right' ? 'right' : 'left';
+  meas.font = fontStr(d);
+  meas.textAlign = 'left';
+  meas.textBaseline = 'alphabetic';
+  if ('letterSpacing' in meas) meas.letterSpacing = (d.tracking || 0) + 'px';
+  const lh = size * (d.leading || 1.15);
+  const width = (value: string) => meas.measureText(value).width;
+  const text = String(d.text == null ? '' : d.text);
+  const lines = textSourceLines(d, meas, lh).map((line, row): CaretLine => {
+    const lineWidth = width(line.text);
+    const startX = align === 'center' ? -lineWidth / 2 : align === 'right' ? -lineWidth : 0;
+    const boundaries = [{ index: line.start, x: startX }];
+    let prefix = '';
+    for (const segment of graphemesOf(line.text)) {
+      prefix += segment;
+      boundaries.push({ index: line.start + prefix.length, x: startX + width(prefix) });
+    }
+    return { text: line.text, start: line.start, x: startX, y: row * lh, baseline: row * lh + size * .82, width: lineWidth, boundaries };
+  });
+  return { lines, lineHeight: lh, size, length: text.length, align, boxWidth: Number(d.boxWidth) || 0, boxHeight: Number(d.boxHeight) || 0 };
+}
+PM.textCaretLayout = (input: any, time = PM.time) => textCaretLayout(resolvedTextContent(input, time));
 
 /* Use the exact same canvas text metrics as the rasterizer when a procedural
    tool needs to reason about glyph placement. The returned offsets are in the
    source text layer's local coordinate system, before its transform. */
 function textLayout(d: any) {
-  const size = Math.max(1, Number(d.size) || 16);
   const meas = getCanvas(8, 8).getContext('2d') as any;
-  const align = d.align === 'center' ? 'center' : d.align === 'right' ? 'right' : 'left';
   meas.font = fontStr(d);
-  meas.textAlign = align;
   meas.textBaseline = 'alphabetic';
   if ('letterSpacing' in meas) meas.letterSpacing = (d.tracking || 0) + 'px';
-  const lh = size * (d.leading || 1.15);
-  const lines = textLines(d, meas, lh);
-  const width = (value: any) => meas.measureText(value).width;
-  const graphemes = (value: any): any[] => {
-    if (typeof Intl !== 'undefined' && Intl.Segmenter) {
-      return [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(value)].map(item => item.segment);
-    }
-    return Array.from(value);
-  };
-  const output: any = { characters: [], words: [], lines: [] };
-  /* measureText(prefix) omits kerning between the prefix and the next glyph.
-     Measuring the joined run and subtracting the isolated segment preserves
-     that incoming pair adjustment when the segment becomes its own layer. */
-  const segmentX = (lineStart: any, prefix: any, segment: any) => lineStart + width(prefix + segment) - width(segment);
-  let characterIndex = 0, wordIndex = 0, lineIndex = 0, sourceOffset=0;
-  lines.forEach((line, row) => {
-    const lineWidth = width(line);
-    const startX = align === 'center' ? -lineWidth / 2 : align === 'right' ? -lineWidth : 0;
-    const y = row * lh;
-    const lineSource=Math.max(sourceOffset,String(d.text||'').indexOf(line,sourceOffset));
-    if (line.length) output.lines.push({ text: line, x: startX, y, line: row, sourceStart: lineSource, index: lineIndex++ });
-
-    let prefix = '';let localWord=-1,wasSpace=true;
-    for (const segment of graphemes(line)) {
-      const x = segmentX(startX, prefix, segment);
-      const space=/^\s+$/u.test(segment);if(!space&&wasSpace)localWord++;
-      if (!space) output.characters.push({ text: segment, x, y, line: row, word:wordIndex+localWord, sourceStart:lineSource+prefix.length,index: characterIndex++ });
-      wasSpace=space;
-      prefix += segment;
-    }
-
-    sourceOffset=lineSource+line.length;
-    const matcher = /\S+/gu;
-    let match;
-    while ((match = matcher.exec(line))) {
-      const prefix = line.slice(0, match.index);
-      output.words.push({ text: match[0], x: segmentX(startX, prefix, match[0]), y, line: row, sourceStart: lineSource + match.index, index: wordIndex++ });
-    }
-  });
-  return output;
+  return glyphLayout(d, meas);
 }
 PM.textLayout = (input: any, time = PM.time) => textLayout(resolvedTextContent(input, time));
 
@@ -306,22 +307,87 @@ function textRasterGeometry(d: any, scale: number) {
 // anchoring continue through their existing complete-source rendering path.
 PM.textRasterGeometry = (layer: any, scale: number, time = PM.time) => textRasterGeometry(resolvedTextContent(layer, time), scale);
 
-function rasterText(d: any, scale: number) {
+/* A text raster can come out empty although the layer has visible text: a
+   font that is still loading paints nothing on a 2D canvas, and a canvas the
+   browser refused to allocate reads back as transparent. Cached as-is, that
+   blank bitmap would stay on screen until the app restarts. Sample a small
+   downscale of the result so such a raster can be retried instead. */
+const BLANK_RETRY_MS = 250;
+const warnedBlank = new Set<string>();
+function rasterLooksBlank(cv: HTMLCanvasElement): boolean {
+  try {
+    const probe = getCanvas(24, 24), ctx = probe.getContext('2d') as any;
+    if (!ctx?.drawImage || !ctx.getImageData) return false;
+    ctx.drawImage(cv, 0, 0, 24, 24);
+    const data = ctx.getImageData(0, 0, 24, 24)?.data;
+    if (!data) return false;
+    for (let i = 3; i < data.length; i += 4) if (data[i]! > 0) return false;
+    return true;
+  } catch { return false; }
+}
+
+function rasterText(d: any, scale: number, crop?: RasterWindow) {
   const g = textRasterGeometry(d, scale);
-  const cv = getCanvas(g.width, g.height);
-  const c = cv.getContext('2d') as any;
+  const source = getCanvas(g.width, g.height);
+  let cv = source;
+  const c = source.getContext('2d') as any;
   c.scale(g.density, g.density);
   c.font = fontStr(d);
   if ('letterSpacing' in c) c.letterSpacing = (d.tracking || 0) + 'px';
   c.textBaseline = 'alphabetic'; c.textAlign = g.align; c.fillStyle = d.color || '#fff';
   g.lines.forEach((line: string, i: number) => c.fillText(line, g.x, g.pad + g.lh * i + g.size * .82));
-  return { cv, w: g.w, h: g.h, anchorX: g.anchorX, anchorY: g.anchorY, selection: g.selection };
+  if (crop) {
+    // Paint at the original coordinates first: translating or clipping glyph
+    // drawing changes Canvas antialiasing. A 1:1 copy preserves those pixels
+    // while the caches and compositor retain only the visible source window.
+    const clipped = getCanvas(crop.width, crop.height);
+    clipped.getContext('2d')!.drawImage(cv, crop.x, crop.y, crop.width, crop.height, 0, 0, crop.width, crop.height);
+    cv = clipped;
+  }
+  const visible = g.lines.some((line: string) => line.trim().length) && !/^(transparent|rgba?\(.*,\s*0\s*\)|#[0-9a-f]{6}00)$/i.test(String(d.color || ''));
+  // Font readiness and context loss are available without reading GPU pixels.
+  // A readback here serializes every fresh text source with the GPU, even when
+  // its font is already loaded. Keep pixel probing for older canvas APIs and
+  // loading fonts, and retain retries for a lost backing store.
+  const fonts = window.document.fonts;
+  const target = cv.getContext('2d') as any;
+  const lost = typeof c.isContextLost === 'function' && typeof target.isContextLost === 'function'
+    ? c.isContextLost() || target.isContextLost() : undefined;
+  const ready = lost === false && typeof fonts?.check === 'function' && fonts.check(c.font, String(d.text || ''));
+  const blank = visible && (lost === true || (!ready && rasterLooksBlank(cv)));
+  if (blank && !warnedBlank.has(c.font)) {
+    warnedBlank.add(c.font);
+    console.warn('[raster] text painted nothing; retrying shortly', { font: c.font, size: g.width + 'x' + g.height, text: String(d.text).slice(0, 40) });
+  }
+  if (source !== cv) source.width = source.height = 0;
+  const sourceWindow = crop ? [crop.x, crop.y, g.width, g.height] : undefined;
+  return { cv, w: g.w, h: g.h, anchorX: g.anchorX, anchorY: g.anchorY, selection: g.selection, blank, sourceWindow };
 }
 
-function rasterAnimatedText(layer:any,d:any,time:number,scale:number) {
-  const glyphs=animatedGlyphs(PM,layer,time,d,textLayout(d)),measure=getCanvas(8,8).getContext('2d')!;
-  const [animators,styles]=textControlValues(PM,layer,time);
-  if(!styles.length&&animators.every((a:any)=>!a.p.x&&!a.p.y&&!a.p.rotation&&!a.p.tracking&&a.p.scale===100&&a.p.opacity===100))return rasterText(d,scale);
+/* The raster cache key needs each animated text layer's unit counts every
+   frame; measure its layout once per typography rather than per frame. */
+const textLayoutCache = new Map<string, any>();
+function cachedTextLayout(d: any) {
+  const key = JSON.stringify(d, (name, value) => name === 'animators' || name === 'styles' || name === 'fontAnchorBounds' ? undefined : value);
+  let layout = textLayoutCache.get(key);
+  if (!layout) {
+    layout = textLayout(d);
+    textLayoutCache.set(key, layout);
+    if (textLayoutCache.size > 128) textLayoutCache.delete(textLayoutCache.keys().next().value!);
+  }
+  return layout;
+}
+
+type TextAnimation = ReturnType<typeof textAnimationState> & { layout: any };
+function textAnimation(layer: any, d: any, time: number): TextAnimation {
+  const layout = cachedTextLayout(d);
+  return { ...textAnimationState(PM, layer, time, layout), layout };
+}
+
+function rasterAnimatedText(layer:any,d:any,time:number,scale:number,animation:TextAnimation) {
+  const glyphs=animatedGlyphs(PM,layer,time,d,animation.layout,animation),measure=getCanvas(8,8).getContext('2d')!;
+  // A settled animation renders exactly like plain text, so reuse that path.
+  if(!animation.styles.length&&glyphs.every(isIdentityGlyph))return rasterText(d,scale);
   // Range font metrics contribute to the following characters' advances.
   for(const line of new Set(glyphs.map((g:any)=>g.line))){
     const run=glyphs.filter((g:any)=>g.line===line);let advance=0;
@@ -329,11 +395,16 @@ function rasterAnimatedText(layer:any,d:any,time:number,scale:number) {
     const align=d.align==='center'?.5:d.align==='right'?1:0;for(const glyph of run)glyph.x-=advance*align;
   }
   let x0=0,y0=0,x1=1,y1=Math.max(1,d.size);
-  const records=glyphs.map((g:any)=>{measure.font=fontStr(g.style);const metrics=measure.measureText(g.text),w=metrics.width,h=Number(g.style.size)||d.size,r=g.rotation*Math.PI/180,c=Math.cos(r)*g.scale,s=Math.sin(r)*g.scale,baseline=g.y+d.size*.82;
-    for(const [x,y] of ([[0,-h],[w,-h],[0,h*.3],[w,h*.3]] as Array<[number,number]>)){const xx=g.x+c*x-s*y,yy=baseline+s*x+c*y;x0=Math.min(x0,xx-4);y0=Math.min(y0,yy-4);x1=Math.max(x1,xx+4);y1=Math.max(y1,yy+4);}return {...g,baseline};});
-  const w=Math.max(1,x1-x0),h=Math.max(1,y1-y0),density=Math.min(scale,8192/w,8192/h),cv=getCanvas(Math.ceil(w*density),Math.ceil(h*density)),ctx=cv.getContext('2d')!;ctx.scale(density,density);ctx.translate(-x0,-y0);
-  for(const g of records){ctx.save();ctx.translate(g.x,g.baseline);ctx.rotate(g.rotation*Math.PI/180);ctx.scale(g.scale,g.scale);ctx.globalAlpha=g.opacity;ctx.font=fontStr(g.style);ctx.fillStyle=g.style.color;ctx.fillText(g.text,0,0);ctx.restore();}
-  return {cv,w,h,anchorX:-x0,anchorY:-y0,selection:{x0,y0,x1,y1,w,h}};
+  const records=glyphs.filter((g:any)=>g.opacity>0).map((g:any)=>{measure.font=fontStr(g.style);const w=measure.measureText(g.text).width,h=Number(g.style.size)||d.size,baseline=g.y+d.size*.82,m=g.matrix,pad=4+g.blur*2;
+    for(const [x,y] of ([[0,-h],[w,-h],[0,h*.3],[w,h*.3]] as Array<[number,number]>)){const xx=g.x+m[0]*x+m[2]*y+m[4],yy=baseline+m[1]*x+m[3]*y+m[5];x0=Math.min(x0,xx-pad);y0=Math.min(y0,yy-pad);x1=Math.max(x1,xx+pad);y1=Math.max(y1,yy+pad);}return {...g,baseline};});
+  const w=Math.max(1,x1-x0),h=Math.max(1,y1-y0),density=Math.min(scale,8192/w,8192/h),cv=getCanvas(Math.ceil(w*density),Math.ceil(h*density)),ctx=cv.getContext('2d')!;
+  for(const g of records){ctx.save();ctx.setTransform(density,0,0,density,-x0*density,-y0*density);ctx.translate(g.x,g.baseline);ctx.transform(...(g.matrix as [number,number,number,number,number,number]));ctx.globalAlpha=g.opacity;
+    // Canvas filters measure in device pixels, independent of the transform.
+    if(g.blur>0.01)ctx.filter=`blur(${g.blur*density}px)`;
+    ctx.font=fontStr(g.style);ctx.fillStyle=g.color??g.style.color;ctx.fillText(g.text,0,0);ctx.restore();}
+  // Select the resting text box: it neither collapses while glyphs are hidden
+  // nor jumps when the animation settles onto the plain-text path.
+  return {cv,w,h,anchorX:-x0,anchorY:-y0,selection:animation.styles.length?{x0,y0,x1,y1,w,h}:textGeometry(d).selection};
 }
 
 /* ── shapes ────────────────────────────────────────────── */
@@ -373,7 +444,13 @@ function rasterShape(d: any, scale: any, crop?: RasterWindow) {
     c.beginPath(); c.moveTo(0, H / 2); c.lineTo(W, H / 2);
     c.lineWidth = Math.max(1, d.stroke || 6); c.strokeStyle = d.color; c.lineCap = 'round'; c.stroke();
     return { cv, w, h: hh, anchorX: pad, anchorY: pad, selection, uv };
-  } else rr(c, 0, 0, W, H, d.radius || 0);
+  } else if (isUniformCircular(d)) rr(c, 0, 0, W, H, d.radius || 0);
+  else {
+    const outline = new Path2D(roundedRectPath(d));
+    c.fill(outline);
+    if (d.stroke > 0) c.stroke(outline);
+    return { cv, w, h: hh, anchorX: pad, anchorY: pad, selection, uv };
+  }
   c.fill();
   if (d.stroke > 0) c.stroke();
   return { cv, w, h: hh, anchorX: pad, anchorY: pad, selection, uv };
@@ -382,7 +459,7 @@ function rasterShape(d: any, scale: any, crop?: RasterWindow) {
 /** Get (and cache) a rasterized bitmap for a layer. `scale` = render supersample. */
 PM.raster = (L: any, scale: any = 1, time: any = PM.time, uploaded?: (key: string) => any, crop?: RasterWindow) => {
   const d = L.type === 'text' ? resolvedTextContent(L, time) : resolveContent(PM, L, time);
-  const controls=L.type==='text'?textControlValues(PM,L,time):null;
+  const animation=L.type==='text'&&(L.d.animators?.length||L.d.styles?.length)?textAnimation(L,d,time):null;
   // Above the bitmap dimension limit, different requested zoom densities
   // produce identical pixels. Key those sources by their effective density
   // so pinch gestures do not rebuild/upload the same capped bitmap repeatedly.
@@ -390,18 +467,28 @@ PM.raster = (L: any, scale: any = 1, time: any = PM.time, uploaded?: (key: strin
     : L.type === 'text' && !L.d.animators?.length && !L.d.styles?.length ? textRasterGeometry(d, scale).density
     : scale;
   const key = (L.d.paths?.length ? 'paths|'+JSON.stringify(L.d.paths.map((path:any)=>({values:pathValues(PM,L,path,time),matrix:groupMatrix(PM,L,path,time)})))+'|'+scale : L.type === 'text'
-    ? 't|' + [d.text, d.boxWidth, d.boxHeight, d.font, d.weight, d.size, d.tracking, d.leading, d.color, d.align, d.italic, variationSettings(d), JSON.stringify(controls), rasterScale].join('|')
-    : 's|' + [d.shape, d.color, d.w, d.h, d.radius, d.stroke, d.strokeColor, d.points, rasterScale].join('|'))
+    ? 't|' + [d.text, d.boxWidth, d.boxHeight, d.font, d.weight, d.size, d.tracking, d.leading, d.color, d.align, d.italic, variationSettings(d), animation ? textAnimationKey(animation) : '', rasterScale].join('|')
+    : 's|' + [d.shape, d.color, d.w, d.h, d.radius, d.independentCorners ? cornerRadii(d).join(',') : '', d.smoothing, d.stroke, d.strokeColor, d.points, rasterScale].join('|'))
     + (crop ? `|crop:${crop.x},${crop.y},${crop.width},${crop.height}` : '');
   // Typography anchoring may need a separate, unanimated CPU measurement.
   // Keep that path intact; otherwise the renderer can reuse uploaded pixels
   // and their geometry without retaining a second canvas in memory.
-  let e = cache.get(key) || (!L.d.fontAnchorBounds && uploaded?.(key));
+  let e = cache.get(key);
+  if (e?.blank) {
+    // Give a loading font a moment, then paint again instead of keeping the blank bitmap.
+    if (Date.now() >= e.retryAt) { release(key, e); e = null; }
+  }
+  if (!e && !L.d.fontAnchorBounds) { const stub = uploaded?.(key); if (stub && !stub.blank) e = stub; }
   if (!e) {
-    e = L.d.paths?.length ? rasterPaths(PM,L,time,scale) : L.type === 'text' ? (L.d.animators?.length||L.d.styles?.length ? rasterAnimatedText(L,d,time,scale) : rasterText(d, scale)) : rasterShape(d, scale, crop);
+    e = L.d.paths?.length ? rasterPaths(PM,L,time,scale) : L.type === 'text' ? (animation ? rasterAnimatedText(L,d,time,scale,animation) : rasterText(d, scale, crop)) : rasterShape(d, scale, crop);
     e.dirty = true;
     e.used = ++tick;
     e.bytes = Math.max(0, Number(e.cv?.width || 0) * Number(e.cv?.height || 0) * 4);
+    if (e.blank) {
+      e.retryAt = Date.now() + BLANK_RETRY_MS;
+      window.setTimeout(() => PM.invalidate?.('render'), BLANK_RETRY_MS + 16);
+      (window.document as any)?.fonts?.ready?.then?.(() => PM.invalidate?.('render'));
+    }
     cache.set(key, e);
     cacheBytes += e.bytes;
     if (PM.Memory?.maintain) PM.Memory.maintain('raster', cache.size > MAX);
@@ -427,6 +514,7 @@ PM.raster = (L: any, scale: any = 1, time: any = PM.time, uploaded?: (key: strin
 PM.rasterStats = () => ({ size: cache.size, bytes: cacheBytes, maxBytes: MAX_BYTES });
 PM.rasterClear = () => {
   textGeometryCache.clear();
+  textLayoutCache.clear();
   for (const [key, entry] of [...cache]) release(key, entry);
   PM.GL && PM.GL.dropTextures && PM.GL.dropTextures('r:');
 };
@@ -442,13 +530,23 @@ function assetKind(file: any) {
   if (mime.startsWith('image/')) return 'image';
   if (mime.startsWith('video/')) return 'video';
   if (PM.Audio && PM.Audio.accepts(file)) return 'audio';
-  const ext = (String(file.name || '').split('.').pop() as any).toLowerCase();
+  const ext = mediaExtension(file.name);
   if (ext === 'obj' || mime === 'model/obj' || mime === 'text/plain+obj') return 'model';
-  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'bmp', 'svg'].includes(ext)) return 'image';
-  if (['mp4', 'mov', 'm4v', 'webm'].includes(ext)) return 'video';
+  if (isImageExtension(ext)) return 'image';
+  if (isVideoExtension(ext)) return 'video';
   return null;
 }
 PM.assetKind = assetKind;
+/* An animated GIF, APNG or WebP is a still to `assetKind` and a clip to the
+   editor. Only the decoder can tell the two apart, so import and replacement
+   both settle the question before anything else looks at the file. */
+async function resolveAssetKind(file: any) {
+  const kind = assetKind(file);
+  if (kind !== 'image') return { kind, animated: false };
+  const animated = mayAnimate(file) && await isAnimatedImage(file);
+  return { kind: animated ? 'video' : 'image', animated };
+}
+PM.resolveAssetKind = resolveAssetKind;
 const disposedAssets = new WeakSet<object>();
 const historyAssetRetains = new WeakMap<object, number>();
 function disposeAsset(a: any) {
@@ -457,8 +555,20 @@ function disposeAsset(a: any) {
     if (disposedAssets.has(a)) return;
     disposedAssets.add(a);
   }
+  disposeVideoInstances(a);
+  if (a.preview) {
+    cancelPreviewVideoSeek(a.preview.el);
+    a.preview.el.pause(); a.preview.el.removeAttribute('src'); a.preview.el.load();
+    window.URL.revokeObjectURL(a.preview.url); delete a.preview;
+  }
   if ((a.kind === 'audio' || a.audioBlob) && PM.Audio) PM.Audio.disposeAsset(a);
   try { if (a.el && a.el.pause) a.el.pause(); } catch (e) { }
+  if (a.kind === 'video' && a.el) {
+    cancelPreviewVideoSeek(a.el);
+    // Revoking a Blob URL alone leaves the element's decoder and decoded
+    // frames alive. Only unload after the final live/history owner is gone.
+    try { a.el.removeAttribute('src'); a.el.load(); } catch (e) { }
+  }
   try { if (a.el && a.el.close) a.el.close(); } catch (e) { }
   if (a.url && String(a.url).startsWith('blob:')) window.URL.revokeObjectURL(a.url);
 }
@@ -499,37 +609,22 @@ function waitForVideoMetadata(el: any, fileName: any, timeout: any = 15000) {
     loaded();
   });
 }
-async function playbackProxy(file: any, name: string): Promise<any> {
-  const media = window.powermove?.media;
+async function playbackProxy(file: any, name: string, onStage?: (label: string) => void): Promise<any> {
+  const media = hostBridge()?.media;
   if (!media?.createPlaybackProxy) {
     throw new Error(videoImportFailureMessage(name, { code: 4 }));
   }
-  PM.toast(`Optimizing “${name}” for smooth playback…`, 30_000);
-  const result = await media.createPlaybackProxy(file);
+  if (onStage) onStage('Optimizing video for playback');
+  else PM.toast(`Optimizing “${name}” for smooth playback…`, 30_000, { error: false });
+  const result = await media.createPlaybackProxy(file, cloudSourcePaths.get(file));
   if (!result.ok) throw new Error(result.error);
-  try {
-    const parts: ArrayBuffer[] = [];
-    const chunkSize = 4 * 1024 * 1024;
-    for (let offset = 0; offset < result.size; offset += chunkSize) {
-      const chunk = await media.readPlaybackProxy(result.token, offset, Math.min(chunkSize, result.size - offset));
-      if (!chunk.byteLength) throw new Error('The optimized playback file ended unexpectedly');
-      const owned = new Uint8Array(chunk.byteLength);
-      owned.set(chunk);
-      parts.push(owned.buffer);
-    }
-    return new window.File(parts, name, {
-      type: result.type,
-      lastModified: Number(file.lastModified) || Date.now(),
-    });
-  } finally {
-    await media.releasePlaybackProxy(result.token).catch(() => undefined);
-  }
+  onStage?.('Loading optimized video');
+  return readProxyFile(result, name, file.lastModified);
 }
-async function prepareAsset({ id, name, kind, blob, meta = {} }: any) {
+async function prepareAsset({ id, name, kind, blob, meta = {}, onStage }: any) {
   const imageSequence = importedSequences.get(blob) || meta.imageSequence;
   if (kind === 'audio') return PM.Audio.prepareAsset({ id, name, blob, meta });
   if (kind === 'model') {
-    if (Number(blob?.size) > 64 * 1024 * 1024) throw new Error('OBJ files larger than 64 MB are not supported');
     const sourceText = await blob.text();
     const mesh = parseObj(sourceText);
     return {
@@ -577,23 +672,30 @@ async function prepareAsset({ id, name, kind, blob, meta = {} }: any) {
         await ready;
         w = el.videoWidth || 0; hh = el.videoHeight || 0; dur = el.duration || 0;
       };
-      const canProxy = !playbackProxyUsed && /\.(mov|mp4|m4v)$/i.test(String(name || ''));
-      let needsProxy = false;
-      try { await openVideo(); }
-      catch (error) {
-        if (!canProxy) throw error;
-        needsProxy = true;
+      const extension = mediaExtension(name);
+      const canProxy = !playbackProxyUsed && mayNeedVideoProxy(extension);
+      /* Chromium opens none of MKV, AVI, MPEG-TS and friends, so those skip
+         straight to conversion instead of waiting out a decode failure. */
+      let needsProxy = canProxy && needsVideoProxy(extension);
+      if (!needsProxy) {
+        try { await openVideo(); }
+        catch (error) {
+          if (!canProxy) throw error;
+          needsProxy = true;
+        }
       }
       /* A MOV can expose valid dimensions and advance its audio clock even when
          Chromium cannot decode a single video frame (notably Apple ProRes).
          Probe one presented frame, then stream an alpha-preserving VP9 proxy
          if metadata or frame decoding fails. Known proxies skip the probe on restore. */
       if (canProxy && (needsProxy || !await waitForPresentedVideoFrame(el))) {
-        try { el.pause(); } catch (e) { }
-        el.removeAttribute('src');
-        el.load();
+        if (el) {
+          try { el.pause(); } catch (e) { }
+          el.removeAttribute('src');
+          el.load();
+        }
         window.URL.revokeObjectURL(url);
-        sourceBlob = await playbackProxy(blob, name);
+        sourceBlob = await playbackProxy(blob, name, onStage);
         playbackProxyUsed = true;
         playbackProxyVersion = 3;
         url = window.URL.createObjectURL(sourceBlob);
@@ -604,11 +706,12 @@ async function prepareAsset({ id, name, kind, blob, meta = {} }: any) {
       }
     } else throw new Error('Unsupported media kind');
     const asset: any = {
-      id, name, kind, url, el,
+      id, name, kind, url, el, storageKey: meta.storageKey,
       w: w || meta.w || 0, h: hh || meta.h || 0,
       dur: dur || meta.dur || 0, size: sourceBlob.size || meta.size || 0,
       playbackProxy: playbackProxyUsed,
       playbackProxyVersion,
+      ...(kind === 'video' ? { videoTimestampScale: await webmTimestampScale(sourceBlob) } : {}),
       persistBlob: sourceBlob,
       ...(imageSequence ? { imageSequence } : {}),
       ...(imageFormat ? { format: imageFormat } : {}),
@@ -643,6 +746,10 @@ async function prepareAsset({ id, name, kind, blob, meta = {} }: any) {
         asset.hasAudio = false;
       }
     } else if (kind === 'video') asset.hasAudio = false;
+    if (kind === 'video') {
+      asset.previewReady = prepareVideoPreview(PM, asset, sourceBlob, () => disposedAssets.has(asset));
+      if (asset.playbackProxy && asset.playbackProxyVersion < 3) await asset.previewReady;
+    }
     return asset;
   } catch (error) {
     try { if (el && el.close) el.close(); } catch (e) { }
@@ -661,6 +768,7 @@ function assetIdentity(id: any, file: any, kind: any, prepared: any, fingerprint
     playbackProxyVersion: Number(prepared.playbackProxyVersion) || 0,
     persisted: persisted === true,
     ...(prepared.imageSequence ? { imageSequence: prepared.imageSequence } : {}),
+    ...(prepared.poster === true ? { poster: true } : {}),
     ...(prepared.format ? { format: prepared.format } : {}),
     ...(prepared.svg ? { editablePaths: prepared.svg.paths.length } : {}),
     ...(kind === 'video' ? {
@@ -676,7 +784,70 @@ function assetIdentity(id: any, file: any, kind: any, prepared: any, fingerprint
   };
 }
 let assetEpoch = 0;
-async function ingestAsset(file: any, { silent = false, layerDefinition }: any = {}) {
+function checkpointAssetMetadata(project: any) {
+  if (!project || PM.proj !== project) return;
+  /* Asset metadata is mutated outside typed history, so an existing recovery
+     journal cannot replay it. Force the smallest full project checkpoint. */
+  try { PM.Projects?.put?.(project); } catch (error) { }
+}
+/** Import and replacement share all reading, decoding, conversion, and storage. */
+async function prepareImportedAsset(file: any, { id, assertCurrentProject, resolved: settled, onStage }: any) {
+  const resolved = settled || await resolveAssetKind(file);
+  const kind = resolved.kind;
+  if (!kind) throw new Error('Unsupported media file');
+  const sourcePath = cloudSourcePaths.get(file) || hostBridge()?.media?.sourcePath?.(file) || '';
+  onStage?.('Reading file');
+  /* Fingerprint the file the user chose, not the conversion, so re-importing
+     the same GIF still resolves to the media already in the project. */
+  const fingerprint = await PM.MediaImport.fingerprint(file);
+  assertCurrentProject();
+  const storageKey = PM.MediaImport.storageKeyFor(fingerprint);
+  /* Formats Chromium cannot show become ones it can before anything decodes,
+     stores, or measures them. */
+  const extension = mediaExtension(file.name);
+  let source = file;
+  let meta: any = {};
+  if (resolved.animated) {
+    const animation = await convertAnimatedImage(file, { onStage });
+    assertCurrentProject();
+    source = animation.file;
+    meta = { format: extension, imageSequence: { fps: animation.fps, frames: animation.frames } };
+  } else if (kind === 'image' && needsImageConversion(extension)) {
+    source = await convertStillImage(file, { onStage });
+    assertCurrentProject();
+    meta = { format: extension };
+  }
+  onStage?.('Preparing media');
+  const preparation = prepareAsset({ id, name: file.name, kind, blob: source, meta: { ...meta, storageKey }, onStage });
+  /* Images/audio can persist while they decode. Video preparation may replace
+     an unsupported source with a much smaller playback proxy, so wait for that
+     decision before writing any video bytes to durable storage. */
+  const mayNeedPlaybackProxy = kind === 'video' && !resolved.animated && mayNeedVideoProxy(extension);
+  // Observe storage failures immediately, even while decoding is still pending.
+  const persist = (blob: any) => Promise.resolve().then(() => PM.MediaStore.put(storageKey, blob, {
+    storageKey, fingerprint, type: blob.type || file.type,
+  })).then(value => ({ status: 'fulfilled', value }), reason => ({ status: 'rejected', reason }));
+  const eagerPersist = mayNeedPlaybackProxy ? null : persist(source);
+  const preparedResult: any = await Promise.resolve(preparation).then(
+    value => ({ status: 'fulfilled', value }),
+    reason => ({ status: 'rejected', reason })
+  );
+  const prepared = preparedResult.status === 'fulfilled' ? preparedResult.value : null;
+  const persistBlob = prepared?.persistBlob || source;
+  if (prepared) delete prepared.persistBlob;
+  if (prepared) onStage?.('Saving media');
+  const persistedResult: any = await (eagerPersist || (prepared
+    ? persist(persistBlob) : { status: 'fulfilled', value: false }));
+  if (preparedResult.status === 'rejected' || persistedResult.status === 'rejected') {
+    if (prepared) disposeAsset(prepared);
+    throw preparedResult.status === 'rejected' ? preparedResult.reason : persistedResult.reason;
+  }
+  try { assertCurrentProject(); }
+  catch (error) { disposeAsset(prepared); throw error; }
+  const persisted = persistedResult.value;
+  return { prepared, kind, fingerprint, storageKey, sourcePath, persisted };
+}
+async function ingestAsset(file: any, { silent = false, layerDefinition, onStage }: any = {}) {
   const targetProject = PM.proj;
   const targetEpoch = assetEpoch;
   const assertCurrentProject = () => {
@@ -686,41 +857,22 @@ async function ingestAsset(file: any, { silent = false, layerDefinition }: any =
       throw error;
     }
   };
-  const kind = assetKind(file);
-  if (!kind) throw new Error('Unsupported media file');
-  const sourcePath = window.powermove?.media?.sourcePath?.(file) || '';
-  const fingerprint = await PM.MediaImport.fingerprint(file);
-  assertCurrentProject();
-  const storageKey = PM.MediaImport.storageKeyFor(fingerprint);
   const provisionalId = PM.uid('a');
-  const preparation = prepareAsset({ id: provisionalId, name: file.name, kind, blob: file });
-  /* Images/audio can persist while they decode. Video preparation may replace
-     an unsupported source with a much smaller playback proxy, so wait for that
-     decision before writing any video bytes to durable storage. */
-  const mayNeedPlaybackProxy = kind === 'video' && /\.(mov|mp4|m4v)$/i.test(String(file.name || ''));
-  const eagerPersist = mayNeedPlaybackProxy ? null
-    : PM.MediaStore.put(storageKey, file, { storageKey, fingerprint, type: file.type });
-  const preparedResult: any = await Promise.resolve(preparation).then(
-    value => ({ status: 'fulfilled', value }),
-    reason => ({ status: 'rejected', reason })
-  );
-  const prepared = preparedResult.status === 'fulfilled' ? preparedResult.value : null;
-  const persistBlob = prepared?.persistBlob || file;
-  if (prepared) delete prepared.persistBlob;
-  const persistedResult: any = preparedResult.status === 'fulfilled'
-    ? await Promise.resolve(eagerPersist || PM.MediaStore.put(storageKey, persistBlob, {
-      storageKey, fingerprint, type: persistBlob.type || file.type,
-    })).then(value => ({ status: 'fulfilled', value }), reason => ({ status: 'rejected', reason }))
-    : eagerPersist
-      ? await Promise.resolve(eagerPersist).then(value => ({ status: 'fulfilled', value }), reason => ({ status: 'rejected', reason }))
-      : { status: 'fulfilled', value: false };
-  if (preparedResult.status === 'rejected' || persistedResult.status === 'rejected') {
-    if (prepared) disposeAsset(prepared);
-    throw preparedResult.status === 'rejected' ? preparedResult.reason : persistedResult.reason;
-  }
+  const { prepared, kind, fingerprint, storageKey, sourcePath, persisted } = await prepareImportedAsset(file, {
+    id: provisionalId, assertCurrentProject, onStage,
+  });
+  let posterBlob: Blob | null = null;
+  try {
+    posterBlob = await capturePoster(prepared);
+    if (posterBlob) {
+      const posterKey = PM.MediaImport.posterKeyFor(storageKey);
+      const stored = await PM.MediaStore.put(posterKey, posterBlob, { storageKey: posterKey, type: posterBlob.type });
+      if (stored) prepared.poster = true;
+      else posterBlob = null;
+    }
+  } catch (error) { posterBlob = null; }
   try { assertCurrentProject(); }
   catch (error) { disposeAsset(prepared); throw error; }
-  const persisted = persistedResult.value;
   const { id: _identityId, persisted: _identityPersisted, ...identity } = assetIdentity(
     provisionalId, file, kind, prepared, fingerprint, storageKey, sourcePath, persisted, layerDefinition,
   );
@@ -729,6 +881,7 @@ async function ingestAsset(file: any, { silent = false, layerDefinition }: any =
   const existingLive = plan.canonicalId && PM.assets.map.get(plan.canonicalId);
   const wasMissing = !!(existingMeta && !existingLive);
   const id = plan.canonicalId || provisionalId;
+  if (!identity.poster && existingMeta?.poster) identity.poster = true;
   let asset = prepared;
   const upgradesPlayback = !!(existingLive && prepared.playbackProxy
     && (!existingLive.playbackProxy || prepared.playbackProxyVersion > (existingLive.playbackProxyVersion || 0)));
@@ -747,6 +900,7 @@ async function ingestAsset(file: any, { silent = false, layerDefinition }: any =
   }
   Object.assign(asset, identity, { id, persisted });
   PM.proj.assets[id] = { id, ...identity, persisted };
+  if (posterBlob) setPoster(id, posterBlob);
   const relinkedLayers = PM.MediaImport.coalesce(PM.proj, id, plan.aliases);
   plan.aliases.forEach((alias: any) => {
     const duplicate = PM.assets.map.get(alias);
@@ -763,45 +917,76 @@ async function ingestAsset(file: any, { silent = false, layerDefinition }: any =
   };
   if (!silent) {
     PM.touch();
+    checkpointAssetMetadata(PM.proj);
     PM.bus.emit('assets');
     if (relinkedLayers) PM.bus.emit('layers');
   }
   return result;
 }
+async function recoverSourceAsset(meta: any, file: File, current: () => boolean) {
+  const assertCurrentProject = () => { if (!current()) throw new Error('The project changed'); };
+  if (meta.fingerprint && await PM.MediaImport.fingerprint(file) !== meta.fingerprint) {
+    throw new Error('The source file has changed. Use Locate File to choose a replacement.');
+  }
+  assertCurrentProject();
+  const imported = await prepareImportedAsset(file, { id: meta.id, assertCurrentProject });
+  if (!current()) { disposeAsset(imported.prepared); return; }
+  Object.assign(meta, assetIdentity(meta.id, file, imported.kind, imported.prepared,
+    imported.fingerprint, imported.storageKey, imported.sourcePath, imported.persisted, meta.layerDefinition));
+  Object.assign(imported.prepared, meta);
+  PM.assets.map.set(meta.id, imported.prepared);
+  PM.assets.errors.delete(meta.id);
+  PM.touch();
+  checkpointAssetMetadata(PM.proj);
+  PM.Audio?.rebalanceCache?.();
+}
+const cloudMedia = createCloudMedia(PM, recoverSourceAsset);
 PM.assets = {
+  cloud: cloudMedia,
   map: new Map<any, any>(),
+  loading: new Set<string>(),
+  errors: new Map<string, string>(),
   async add(file: any, options: any) {
     const result = await ingestAsset(file, options);
     result.asset.importResult = result;
     return result.asset;
   },
-  async importBatch(files: any, { concurrency, onProgress }: any = {}) {
+  async importBatch(files: any, { concurrency, onProgress, onStage, replaceAssetId }: any = {}) {
     const list = Array.from(files || []);
+    if (replaceAssetId != null && list.length !== 1) throw new Error('Choose one file or one image sequence to replace this media');
     const cores = Math.max(1, Number(window.navigator && window.navigator.hardwareConcurrency) || 4);
     const limit = concurrency == null ? Math.max(1, Math.min(3, Math.floor(cores / 2))) : concurrency;
     let completed = 0;
     const results = await PM.MediaImport.mapBounded(list, limit, async (file: any, index: any) => {
       let result: any;
-      try { result = await ingestAsset(file, { silent: true }); }
+      const options = { silent: true, onStage: onStage
+        ? (label: string) => onStage({ file, index, label, completed, total: list.length }) : undefined };
+      try {
+        result = replaceAssetId != null
+          ? { ...await PM.assets.replace(replaceAssetId, file, options), status: 'replaced' }
+          : await ingestAsset(file, options);
+      }
       catch (error) { result = { file, status: 'failed', error }; }
       completed++;
       if (onProgress) onProgress({ completed, total: list.length, index, file, result });
       return result;
     });
-    if (results.some((result: any) => result.status !== 'failed')) {
+    if (results.some((result: any) => result.status !== 'failed' && result.status !== 'replaced')) {
       PM.touch();
+      checkpointAssetMetadata(PM.proj);
       PM.bus.emit('assets');
       if (results.some((result: any) => result.relinkedLayers)) PM.bus.emit('layers');
     }
     return results;
   },
-  async replace(id: any, file: any) {
+  async replace(id: any, file: any, { onStage }: any = {}) {
     const targetProject = PM.proj;
     const targetProjectId = targetProject?.id;
     const targetEpoch = assetEpoch;
     const currentMeta: any = targetProject?.assets?.[id];
     if (!currentMeta) throw new Error('This media item is no longer in the project');
-    const kind = assetKind(file);
+    const resolved = await resolveAssetKind(file);
+    const kind = resolved.kind;
     if (!kind) throw new Error('Unsupported media file');
     if (kind !== currentMeta.kind) {
       const article = currentMeta.kind === 'image' || currentMeta.kind === 'audio' ? 'an' : 'a';
@@ -814,38 +999,50 @@ PM.assets = {
         throw error;
       }
     };
-    const sourcePath = window.powermove?.media?.sourcePath?.(file) || '';
-    const fingerprint = await PM.MediaImport.fingerprint(file);
-    assertCurrentProject();
-    const storageKey = PM.MediaImport.storageKeyFor(fingerprint);
     let prepared: any = null;
     try {
-      prepared = await prepareAsset({ id, name: file.name, kind, blob: file });
-      const persistBlob = prepared.persistBlob || file;
-      delete prepared.persistBlob;
-      const persisted = await PM.MediaStore.put(storageKey, persistBlob, {
-        storageKey, fingerprint, type: persistBlob.type || file.type,
-      });
+      const imported = await prepareImportedAsset(file, { id, assertCurrentProject, resolved, onStage });
+      prepared = imported.prepared;
+      const { fingerprint, storageKey, sourcePath, persisted } = imported;
       if (!persisted) throw new Error('Could not store the replacement media · the original file is unchanged');
+      let nextPoster: Blob | null = null;
+      try {
+        nextPoster = await capturePoster(prepared);
+        if (nextPoster) {
+          const posterKey = PM.MediaImport.posterKeyFor(storageKey);
+          const stored = await PM.MediaStore.put(posterKey, nextPoster, { storageKey: posterKey, type: nextPoster.type });
+          if (stored) prepared.poster = true;
+          else nextPoster = null;
+        }
+      } catch (error) { nextPoster = null; }
       assertCurrentProject();
 
       const previousRuntime = PM.assets.map.get(id) || null;
       const previousMeta = JSON.parse(JSON.stringify(currentMeta));
+      let previousPoster: Blob | null = null;
+      if (currentMeta.poster && currentMeta.storageKey && typeof PM.MediaStore.get === 'function') {
+        try { previousPoster = await PM.MediaStore.get(PM.MediaImport.posterKeyFor(currentMeta.storageKey)); }
+        catch (error) { }
+      }
+      assertCurrentProject();
       const nextMeta = assetIdentity(id, file, kind, prepared, fingerprint, storageKey, sourcePath, true, currentMeta.layerDefinition);
       Object.assign(prepared, nextMeta);
 
-      const applyVersion = (meta: any, runtime: any) => {
+      const applyVersion = (meta: any, runtime: any, poster: Blob | null) => {
         if (!PM.proj || PM.proj.id !== targetProjectId || !PM.proj.assets?.[id]) return;
         viewerService(PM)?.preview?.clear();
         if (kind === 'audio' || kind === 'video') PM.Audio?.pause?.();
         PM.proj.assets[id] = JSON.parse(JSON.stringify(meta));
         if (runtime) PM.assets.map.set(id, runtime);
         else PM.assets.map.delete(id);
+        if (poster) setPoster(id, poster);
+        else revokePoster(id);
         PM.rasterClear?.();
         PM.GL?.dropTextures?.(`a:${id}`);
         PM.GL?.dropMesh?.(id);
         PM.preparedVideoFrames?.clear?.();
         PM.touch();
+        checkpointAssetMetadata(PM.proj);
         PM.bus.emit('assets');
         PM.bus.emit('layers');
         PM.bus.emit('project');
@@ -854,62 +1051,177 @@ PM.assets = {
         PM.autosave?.();
       };
 
-      applyVersion(nextMeta, prepared);
+      applyVersion(nextMeta, prepared, nextPoster);
       const retainedRuntimes = [...new Set([previousRuntime, prepared].filter(Boolean))];
       retainedRuntimes.forEach(retainHistoryAsset);
       const historyId = PM.hist.external(
         `Replace ${currentMeta.name || 'media'}`,
-        () => applyVersion(previousMeta, previousRuntime),
-        () => applyVersion(nextMeta, prepared),
+        () => applyVersion(previousMeta, previousRuntime, previousPoster),
+        () => applyVersion(nextMeta, prepared, nextPoster),
         {
           bytes: Number(previousMeta.size || 0) + Number(nextMeta.size || 0),
           cleanup: () => retainedRuntimes.forEach(runtime => releaseHistoryAsset(runtime, id)),
         },
       );
       if (!historyId) {
-        applyVersion(previousMeta, previousRuntime);
+        applyVersion(previousMeta, previousRuntime, previousPoster);
         retainedRuntimes.forEach(runtime => releaseHistoryAsset(runtime, id));
         throw new Error('Could not add the replacement to Undo history · the original file is unchanged');
       }
       if (kind === 'audio' && PM.Audio) PM.Audio.rebalanceCache();
-      return { asset: prepared, previous: previousRuntime, meta: nextMeta, persisted: true };
+      return { asset: prepared, previous: previousRuntime, previousName: currentMeta.name, meta: nextMeta, persisted: true };
     } catch (error) {
       if (prepared && PM.assets.map.get(id) !== prepared) disposeAsset(prepared);
       throw error;
     }
   },
   get: (id: any) => PM.assets.map.get(id),
+  poster: (id: any) => posterUrls.get(String(id)) || '',
+  revokePoster,
   clear() {
     assetEpoch++;
-    for (const a of PM.assets.map.values()) disposeAsset(a);
+    cloudMedia.clear();
+    for (const [id, a] of PM.assets.map) {
+      disposeAsset(a);
+      PM.GL?.dropMesh?.(id);
+    }
     PM.assets.map.clear();
+    PM.assets.loading.clear();
+    PM.assets.errors.clear();
+    PM.GL?.dropTextures?.('a:');
+    PM.GL?.dropTextures?.('video:');
+    for (const id of [...posterUrls.keys()]) revokePoster(id);
+  },
+  /**
+   * Sets this project's loaded media aside for a background tab and leaves the
+   * cache empty for the next one. Nothing is disposed: switching back resumes
+   * the decoded media as it was. GPU copies are dropped, because two projects
+   * can share asset ids (a duplicate does) and textures are keyed by id; they
+   * re-upload from the kept media on the next draw.
+   */
+  suspend() {
+    assetEpoch++;
+    cloudMedia.clear();
+    const parked = { map: PM.assets.map, errors: PM.assets.errors, posters: new Map(posterUrls) };
+    PM.assets.map = new Map();
+    PM.assets.loading = new Set();
+    PM.assets.errors = new Map();
+    posterUrls.clear();
+    PM.GL?.dropTextures?.('a:');
+    PM.GL?.dropTextures?.('video:');
+    for (const id of parked.map.keys()) PM.GL?.dropMesh?.(id);
+    PM.preparedVideoFrames?.clear?.();
+    return parked;
+  },
+  /** Puts back media set aside by suspend(), replacing what is loaded now. */
+  resume(parked: any) {
+    if (!parked?.map) return false;
+    PM.assets.clear();
+    PM.assets.map = parked.map;
+    PM.assets.errors = parked.errors || new Map();
+    for (const [id, url] of parked.posters || []) posterUrls.set(id, url);
+    return true;
+  },
+  /** Lets go of parked media that will never be resumed. */
+  discard(parked: any) {
+    for (const asset of parked?.map?.values?.() || []) disposeAsset(asset);
+    for (const url of parked?.posters?.values?.() || []) {
+      try { window.URL?.revokeObjectURL?.(url); } catch (error) { }
+    }
   },
   async restoreProject(project: any) {
     const epoch = assetEpoch;
+    // The cache this pass fills. A tab switch parks it whole, so a pass that
+    // goes stale must take back only what it added, and only from here.
+    const cache = PM.assets.map;
     const metas: any[] = Object.values(project && project.assets || {})
       .filter((meta: any) => meta && meta.id && ['image', 'video', 'audio', 'model'].includes(meta.kind));
     const restored: any[] = [], missing: any[] = [];
+    const loading = new Set(metas.map(meta => String(meta.id)));
+    PM.assets.loading = loading;
+    PM.bus?.emit?.('assets');
     const results = await PM.MediaImport.mapBounded(metas, 3, async (meta: any) => {
-      if (epoch !== assetEpoch || PM.proj !== project) return { stale: true };
-      const blob = await PM.MediaStore.get(meta);
-      if (!blob) return { meta, missing: true };
+      const current = () => epoch === assetEpoch && PM.proj === project && project.assets?.[meta.id] === meta;
+      if (!current()) return { stale: true };
+      // A tab brought back keeps what it had loaded; only the rest is read.
+      const kept = PM.assets.map.get(meta.id);
+      if (kept) {
+        loading.delete(String(meta.id));
+        return { asset: kept, meta, kept: true };
+      }
+      PM.assets.errors.delete(meta.id);
+      let posterBlob: any = null;
+      let cacheError: unknown;
       try {
-        const asset = await prepareAsset({ id: meta.id, name: meta.name, kind: meta.kind, blob, meta });
-        Object.assign(asset, {
-          fingerprint: meta.fingerprint, storageKey: meta.storageKey, persisted: true,
-          channels: asset.channels || meta.channels || 0,
-          sampleRate: asset.sampleRate || meta.sampleRate || 0,
-        });
-        return { asset };
-      } catch (error) { return { meta, missing: true, error }; }
+        const posterKey = meta.storageKey
+          ? PM.MediaImport.posterKeyFor(meta.storageKey)
+          : null;
+        const [blob, storedPoster] = await Promise.all([
+          Promise.resolve().then(() => PM.MediaStore.get(meta)).catch(error => { cacheError = error; return null; }),
+          posterKey ? Promise.resolve(PM.MediaStore.get(posterKey)).catch(() => null) : Promise.resolve(null),
+        ]);
+        if (!current()) return { stale: true };
+        posterBlob = storedPoster;
+        if (blob) {
+          try {
+            const asset = await prepareAsset({ id: meta.id, name: meta.name, kind: meta.kind, blob, meta });
+            Object.assign(asset, {
+              fingerprint: meta.fingerprint, storageKey: meta.storageKey, persisted: true,
+              channels: asset.channels || meta.channels || 0,
+              sampleRate: asset.sampleRate || meta.sampleRate || 0,
+            });
+            if (!current()) { disposeAsset(asset); return { stale: true }; }
+            // Publish each ready asset without waiting for unrelated conversions.
+            PM.assets.map.set(asset.id, asset);
+            return { asset, meta, posterBlob };
+          } catch (error) { cacheError = error; }
+        }
+        const file = await readLocalMediaSource(meta, current);
+        if (!current()) return { stale: true };
+        if (file) {
+          await recoverSourceAsset(meta, file, current);
+          if (!current()) return { stale: true };
+          return { asset: PM.assets.get(meta.id), meta, posterBlob };
+        }
+        if (cacheError) throw cacheError;
+        return { meta, missing: true, posterBlob };
+      } catch (error) {
+        if (!current()) return { stale: true };
+        PM.assets.errors.set(meta.id, error instanceof Error ? error.message : 'Could not read this media file');
+        return { meta, missing: true, posterBlob, error };
+      }
+      finally {
+        loading.delete(String(meta.id));
+        if (epoch === assetEpoch && PM.proj === project) {
+          PM.bus?.emit?.('assets');
+          PM.invalidate?.('render');
+        }
+      }
     });
     results.forEach((result: any) => {
       if (result.asset) restored.push(result.asset);
       else if (result.missing) missing.push(result.meta);
     });
     if (epoch !== assetEpoch || PM.proj !== project) {
-      restored.forEach(disposeAsset);
+      results.forEach((result: any) => {
+        if (!result.asset || result.kept) return;
+        if (cache.get(result.asset.id) === result.asset) cache.delete(result.asset.id);
+        disposeAsset(result.asset);
+      });
       return { restored: [], missing: [], stale: true };
+    }
+    let repairedPosterMetadata = false;
+    results.forEach((result: any) => {
+      if (!result.posterBlob || !result.meta?.id || project.assets?.[result.meta.id] !== result.meta) return;
+      setPoster(result.meta.id, result.posterBlob);
+      if (result.meta.poster !== true) {
+        result.meta.poster = true;
+        repairedPosterMetadata = true;
+      }
+    });
+    if (repairedPosterMetadata) {
+      PM.touch();
+      checkpointAssetMetadata(project);
     }
     restored.forEach((a: any) => {
       /* Older projects already preserve the original .svg bytes and name but
@@ -917,9 +1229,43 @@ PM.assets = {
          the editor UI and subsequent web exports also identify the asset. */
       const meta: any = project.assets?.[a.id];
       if (a.format && meta && meta.format !== a.format) meta.format = a.format;
-      PM.assets.map.set(a.id, a);
     });
-    return { restored, missing };
+    const backfill = results.filter((result: any) => result.asset && !result.posterBlob && !result.kept);
+    if (backfill.length) setTimeout(() => {
+      void (async () => {
+        if (epoch !== assetEpoch || PM.proj !== project) return;
+        const completed = await PM.MediaImport.mapBounded(backfill, 3, async (result: any) => {
+          if (epoch !== assetEpoch || PM.proj !== project) return null;
+          const blob = await capturePoster(result.asset);
+          if (!blob || epoch !== assetEpoch || PM.proj !== project) return null;
+          const meta = project.assets?.[result.asset.id];
+          if (!meta?.storageKey || meta !== result.meta || PM.assets.map.get(result.asset.id) !== result.asset) return null;
+          const posterKey = PM.MediaImport.posterKeyFor(meta.storageKey);
+          try {
+            const stored = await PM.MediaStore.put(posterKey, blob, { storageKey: posterKey, type: blob.type });
+            return stored ? { id: result.asset.id, blob, meta, asset: result.asset } : null;
+          } catch (error) { return null; }
+        });
+        if (epoch !== assetEpoch || PM.proj !== project) return;
+        const available = completed.filter(Boolean);
+        if (!available.length) return;
+        let applied = 0;
+        available.forEach(({ id, blob, meta, asset }: any) => {
+          if (project.assets?.[id] !== meta || PM.assets.map.get(id) !== asset) return;
+          meta.poster = true;
+          setPoster(id, blob);
+          applied++;
+        });
+        if (applied) {
+          PM.touch();
+          checkpointAssetMetadata(project);
+          PM.bus?.emit?.('assets');
+        }
+      })();
+    }, 0);
+    await cloudMedia.scan(project, missing);
+    if (epoch !== assetEpoch || PM.proj !== project) return { restored: [], missing: [], stale: true };
+    return { restored, missing: missing.filter(meta => !cloudMedia.get(meta.id) && !PM.assets.get(meta.id)) };
   },
   /** Procedural placeholder so demo projects work with zero imports. */
   gradient(name: any, c0: any, c1: any) {

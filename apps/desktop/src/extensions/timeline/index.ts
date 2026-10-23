@@ -4,6 +4,7 @@ import { createTimelineRuntime, timelinePanelOptions } from './timeline';
 import { adjacentKeyframe } from './keyframe-navigation';
 import { createPropertyReveal, propertyShortcuts } from './property-reveal';
 import { selectedLayers, trimAtStart } from './api-helpers';
+import { COMP_TABS_STYLES, mountCompTabs } from './comp-tabs';
 
 let activeApi: PowermoveAPI | null = null;
 
@@ -36,11 +37,19 @@ const TIMELINE_STYLES = `
 #tl-head .tl-graph-slot{margin-left:auto}
 #tl-head .tl-graph-slot .iconbtn.on{color:var(--on-accent);background:var(--accent)}
 #tl-head .tl-graph-slot .iconbtn.on:hover{background:var(--accent-hover)}
+#tl-head .tl-graph-slot{gap:1px}
+#tl-head .tl-graph-slot>.iconbtn:not(.tl-view-button){margin-right:5px}
+#tl-head .tl-view-button,#tl-head[data-density] .tl-view-button{width:26px;border-radius:0;color:var(--tx-2)}
+#tl-head .tl-view-button svg,#tl-head[data-density] .tl-view-button svg{width:15px;height:15px}
+#tl-head .tl-view-button.first{border-radius:var(--r-sm) 0 0 var(--r-sm)}
+#tl-head .tl-view-button.last{border-radius:0 var(--r-sm) var(--r-sm) 0}
+#tl-head .tl-view-button:not(.on):hover{color:var(--tx)}
+#tl-head .tl-graph-slot .tl-view-button.on{color:var(--on-accent);background:var(--accent)}
 #tl-time{font-family:var(--f-mono);font-size:var(--fs-md);letter-spacing:0;color:var(--tx-2);font-variant-numeric:tabular-nums;margin-left:4px;padding:0 2px;white-space:nowrap;cursor:ew-resize}
 #tl-time.edit{color:var(--accent)}
 #tl-canvas-wrap{flex:1;position:relative;min-height:0;overflow:hidden}
 #tl-canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
-`;
+${COMP_TABS_STYLES}`;
 
 export function toggleLayerStrips(api: PowermoveAPI): void {
   const layers = selectedLayers(api);
@@ -51,6 +60,7 @@ export function toggleLayerStrips(api: PowermoveAPI): void {
   for (const layer of layers) {
     layer.collapsed = collapsed;
     api.uiState.setLayerCollapsed(layer, collapsed);
+    if (collapsed && layer.type === 'group') api.uiState.setGroupCollapsed(layer, true);
   }
   api.transport.invalidate('timeline');
 }
@@ -126,8 +136,10 @@ export default function activate(api: PowermoveAPI): void {
      module instance's disposer so disabling/reloading the extension cannot
      leave its bus, window, observer, or DOM listeners alive. */
   const disposeRuntime = timeline.disposeRuntime;
+  let disposeTabs: (() => void) | null = null;
   api.onDispose(() => {
     if (activeApi === api) activeApi = null;
+    disposeTabs?.();
     disposeRuntime();
   });
   api.services.register('timeline', timeline);
@@ -164,8 +176,11 @@ export default function activate(api: PowermoveAPI): void {
       canvas.id = 'tl-canvas';
       wrap.appendChild(canvas);
 
-      body.replaceChildren(styles, head, wrap);
+      const tabs = document.createElement('div');
+      body.replaceChildren(styles, tabs, head, wrap);
       if (moveHandle) head.prepend(moveHandle);
+      disposeTabs?.();
+      disposeTabs = mountCompTabs(api, tabs);
 
       timeline.attachHead(head);
       timeline.attachCanvas(wrap);

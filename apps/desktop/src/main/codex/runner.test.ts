@@ -1,3 +1,11 @@
+vi.mock('../agent-tools/user-resources', () => ({ prepareUserResources: async () => undefined }));
+
+// Keep runner tests independent of the developer's configured external services.
+vi.mock('../agent-tools/user-mcp', async importOriginal => ({
+  ...await importOriginal<typeof import('../agent-tools/user-mcp')>(),
+  loadUserMcpServers: vi.fn(async () => ({}))
+}));
+
 import { spawn } from 'node:child_process';
 import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -13,6 +21,7 @@ import {
   parseAgentExtensionChanges,
   type CodexRunOptions
 } from './runner';
+import { PROJECT_PERMISSION_PROFILE } from './adapter';
 import { isolatedCodexHome } from './isolation';
 import { agentWorkspaceRoot, sessionPathFor } from './workspace';
 
@@ -60,6 +69,15 @@ it('validates optional thread ids without accepting paths or unbounded input', (
   }
 });
 
+it('requires an isolated empty snapshot for app extension runs', () => {
+  const app = request({ context: 'app', projectId: 'powermove-global', projectName: 'Powermove app', projectJSON: '{}' });
+  expect(isCodexRunRequest(app)).toBe(true);
+  expect(isCodexRunRequest({ ...app, projectId: 'previously-open-project' })).toBe(false);
+  expect(isCodexRunRequest({ ...app, projectJSON: '{"layers":[]}' })).toBe(false);
+  expect(isCodexRunRequest({ ...app, access: 'computer' })).toBe(false);
+  expect(isCodexRunRequest({ ...app, mode: 'editor' })).toBe(false);
+});
+
 it('accepts every persistable project snapshot and rejects oversized UTF-8 input', () => {
   const projectJSON = JSON.stringify({ data: 'x'.repeat(LIMITS.storeValueBytes - 11) });
   expect(Buffer.byteLength(projectJSON)).toBe(LIMITS.storeValueBytes);
@@ -88,7 +106,6 @@ function fakeOptions(userData: string, environment: Record<string, string>): Cod
     ],
     binary: fakeCodex,
     timeoutMs: 10_000,
-    discoverDisabledSkillPaths: async () => [],
     spawnProcess: (command, args, options) => spawn(command, args, {
       ...options,
       env: { ...options.env, ...environment }
@@ -120,6 +137,62 @@ it('starts each thread fresh and resumes only the selected thread', async () => 
 });
 
 describe('CodexRunner validation and authority', () => {
+  it('keeps the staged mod when its correction attempt loses the provider connection', async () => {
+    const userData = await temporaryDirectory('runner-repair-disconnect');
+    const req = request({ threadId: 'disconnected-repair' });
+    const options = fakeOptions(userData, { FAKE_CODEX_EXTENSION_ID: 'pending-mod' });
+    const spawnProcess = options.spawnProcess!;
+    let calls = 0;
+    options.spawnProcess = (command, args, spawnOptions) => spawnProcess(command, args, {
+      ...spawnOptions,
+      env: { ...spawnOptions.env, FAKE_CODEX_MODE: ++calls === 1 ? 'success' : 'structured-failure' }
+    });
+    const result = await new CodexRunner().run(req, options);
+    expect(result).toMatchObject({ ok: false, cancelled: false });
+    expect(calls).toBe(2);
+    const session = sessionPathFor(agentWorkspaceRoot(userData, req.projectId), 'project', req.threadId);
+    const checkpoint = JSON.parse(await readFile(`${session}.checkpoint.json`, 'utf8'));
+    expect(await readFile(path.join(checkpoint.stagingDirectory, 'pending-mod', 'index.ts'), 'utf8')).toContain('activate');
+    expect(await readdir(path.join(userData, 'extensions'))).toEqual([]);
+  });
+
+  it('repairs a mismatched extension report in the same run before publishing once', async () => {
+    const userData = await temporaryDirectory('runner-report-repair');
+    const invocationFile = path.join(userData, 'invocations.txt');
+    const original = { summary: 'done', commands: [], artifacts: [], externalActions: [], notes: [], extensions: [] };
+    const progress: string[] = [];
+    const result = await new CodexRunner().run(request(), {
+      ...fakeOptions(userData, {
+        FAKE_CODEX_INVOCATIONS: invocationFile,
+        FAKE_CODEX_EXTENSION_ID: 'repaired-extension',
+        FAKE_CODEX_RESULT: JSON.stringify(original),
+        FAKE_CODEX_REPAIRED_RESULT: JSON.stringify({ ...original, extensions: [{ id: 'repaired-extension', action: 'created' }] })
+      }),
+      onProgress: text => progress.push(text)
+    });
+    expect(result).toMatchObject({ ok: true, extensions: [{ id: 'repaired-extension', action: 'created' }] });
+    expect((await readFile(invocationFile, 'utf8')).trim().split('\n')).toEqual(['fresh', 'resume']);
+    expect(progress).toContain('Correcting the agent result (1 of 2)…');
+    expect(await readdir(path.join(userData, 'Agent Change History', 'runner-project'))).toHaveLength(1);
+    expect(await readFile(path.join(userData, 'extensions', 'repaired-extension', 'index.ts'), 'utf8')).toContain('activate');
+  });
+
+  it('bounds unsuccessful report repairs and preserves the stage for a later retry', async () => {
+    const userData = await temporaryDirectory('runner-report-limit');
+    const invocationFile = path.join(userData, 'invocations.txt');
+    const req = request({ threadId: 'repair-thread' });
+    const result = await new CodexRunner().run(req, fakeOptions(userData, {
+      FAKE_CODEX_INVOCATIONS: invocationFile,
+      FAKE_CODEX_EXTENSION_ID: 'unreported-extension'
+    }));
+    expect(result).toMatchObject({ ok: false, cancelled: false, error: expect.stringContaining('unreported-extension') });
+    expect((await readFile(invocationFile, 'utf8')).trim().split('\n')).toEqual(['fresh', 'resume', 'resume']);
+    expect(await readdir(path.join(userData, 'extensions'))).toEqual([]);
+    const sessionPath = sessionPathFor(agentWorkspaceRoot(userData, req.projectId), 'project', req.threadId);
+    const checkpoint = JSON.parse(await readFile(`${sessionPath}.checkpoint.json`, 'utf8'));
+    expect(await readFile(path.join(checkpoint.stagingDirectory, 'unreported-extension', 'index.ts'), 'utf8')).toContain('activate');
+  });
+
   it('drops invalid extension changes and caps the typed result at 32 items', () => {
     const valid = Array.from({ length: 35 }, (_, index) => ({
       id: `extension-${index}`,
@@ -212,6 +285,29 @@ describe('CodexRunner lifecycle', () => {
     expect(result.ok).toBe(true);
     expect(launchedHome).toBe(isolatedCodexHome(userData));
   });
+
+  it.each([['project', true], ['editor', false]] as const)(
+    'passes full shell network to autonomous %s access: %s, and denies no reads either way',
+    async (access, network) => {
+      const userData = await temporaryDirectory(`runner-network-${access}`);
+      let launchedArgs: readonly string[] = [];
+      const options = fakeOptions(userData, {});
+      options.spawnProcess = (command, args, spawnOptions) => {
+        launchedArgs = args;
+        return spawn(command, args, spawnOptions);
+      };
+      const result = await new CodexRunner().run(request({ id: `runner-network-${access}-1234`, access }), options);
+      expect(result.ok).toBe(true);
+      expect(launchedArgs.includes(`permissions.${PROJECT_PERMISSION_PROFILE}.network.enabled=true`)).toBe(network);
+      expect(launchedArgs.join(' ')).not.toMatch(/network_proxy|network\.domains/);
+      expect(launchedArgs).toContain(`default_permissions="${PROJECT_PERMISSION_PROFILE}"`);
+      expect(launchedArgs).not.toContain('--approve-for-me');
+      expect(launchedArgs).toEqual(expect.arrayContaining(['approvals_reviewer="auto_review"', 'approval_policy="on-request"']));
+      expect(launchedArgs.find(arg => arg.startsWith(`permissions.${PROJECT_PERMISSION_PROFILE}.filesystem`))).toBeUndefined();
+      expect(launchedArgs.join(' ')).not.toMatch(/="deny"|auth\.json|\.ssh/);
+      expect(launchedArgs.join(' ')).not.toMatch(/projects=|trust_level/);
+    }
+  );
 
   it('forwards structured traces from editor-mode stdout', async () => {
     const trace: unknown[] = [];
@@ -395,7 +491,7 @@ describe('CodexRunner lifecycle', () => {
     expect(progress).toContain('The agent stopped before it could start — retrying…');
   });
 
-  it('isolates a resumed session from broken user MCP configuration on the first attempt', async () => {
+  it('reports a failed user MCP connection without silently dropping user resources', async () => {
     const userData = await temporaryDirectory('runner-mcp-fallback');
     const invocationFile = path.join(userData, 'invocations.txt');
     const root = agentWorkspaceRoot(userData, 'runner-project');
@@ -412,9 +508,10 @@ describe('CodexRunner lifecycle', () => {
       onProgress: (text) => progress.push(text)
     });
 
-    expect(result.ok).toBe(true);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain('MCP startup failed');
     expect((await readFile(invocationFile, 'utf8')).trim().split('\n')).toEqual(['resume']);
-    expect(await readFile(sessionPath, 'utf8')).toBe('thread-recorded-1');
+    await expect(readFile(sessionPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
     expect(progress).not.toContain('One of your Codex integrations failed to start — retrying without integrations…');
   });
 

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   selectionOutlineColor,
@@ -6,8 +6,8 @@ import {
   calculateResize, composeLocalLinear, compositionFramePosition, compositionIsOutOfView, editableTextAtPoint,
   createViewerRuntime, layerContainsPoint, layerWorldPivot,
   localRotationForWorldDirection, multiplyLinear, resolveSelectionGeometry, resizeCursorForHandle,
-  previewRenderSize, previewRenderViewport, resizeLocksAspect, rotateLinear, selectionTransformRoots, solveLocalTransformForWorldLinear,
-  selectionBoundsCenter, shapeBoxFromDrag, transformPointAround, viewerWheelMode, zoomPanForPoint,
+  previewRenderSize, previewRenderViewport, effectViewportPadding, effectViewportSafe, resizeLocksAspect, rotateLinear, selectionTransformRoots, solveLocalTransformForWorldLinear,
+  selectionBoundsCenter, resolvePickTarget, drillTarget, shapeBoxFromDrag, transformPointAround, viewerWheelMode, zoomPanForPoint,
 } from './viewer';
 import type { PreviewViewport } from './viewer';
 import type { PowermoveAPI, Space3DAPI, ViewerService } from 'powermove';
@@ -33,7 +33,7 @@ afterEach(() => {
   else (globalThis as any).window = originalWindow;
 });
 
-function viewerApi(): PowermoveAPI {
+function viewerApi(configure?: (api: PowermoveAPI) => void): PowermoveAPI {
   (globalThis as any).window = {
     addEventListener() {}, removeEventListener() {},
     requestAnimationFrame: () => 1, cancelAnimationFrame() {},
@@ -67,6 +67,7 @@ function viewerApi(): PowermoveAPI {
     },
     ui: {}, dnd: {}, menus: {}, edit: {}, history: {},
   } as unknown as PowermoveAPI;
+  configure?.(api);
   const runtime = createViewerRuntime(api, testSpace3d(api));
   api.services.register('viewer', runtime);
   return api;
@@ -86,6 +87,204 @@ function viewer(api: PowermoveAPI): ViewerTestRuntime {
 }
 
 describe('viewer runtime', () => {
+  function overlayHarness() {
+    const handlers = new Map<string, (payload?: any) => void>();
+    const frames = new Map<number, FrameRequestCallback>();
+    let nextFrame = 0;
+    const api = viewerApi(api => {
+      api.events.on = ((event: string, handler: (payload?: any) => void) => {
+        handlers.set(event, handler);
+        return { dispose: () => handlers.delete(event) };
+      }) as PowermoveAPI['events']['on'];
+    });
+    window.requestAnimationFrame = callback => { frames.set(++nextFrame, callback); return nextFrame; };
+    window.cancelAnimationFrame = id => { frames.delete(id); };
+    const runtime = viewer(api) as any;
+    const rect = { width: 1000, height: 700, left: 0, top: 0, right: 1000, bottom: 700 };
+    const stageRead = vi.fn(() => rect);
+    const frameRead = vi.fn(() => ({
+      left: rect.left + Number.parseFloat(runtime.inner.style.left || '0'),
+      top: rect.top + Number.parseFloat(runtime.inner.style.top || '0'),
+    }));
+    const context = Object.fromEntries(['setTransform', 'clearRect', 'save', 'restore', 'translate', 'scale',
+      'beginPath', 'closePath', 'moveTo', 'lineTo', 'arc', 'stroke', 'fill', 'fillRect', 'strokeRect']
+      .map(method => [method, vi.fn()]));
+    runtime.el = { style: {} };
+    runtime.ov = { width: 1000, height: 700, style: {} };
+    runtime.octx = context;
+    runtime.stage = { getBoundingClientRect: stageRead, style: {} };
+    runtime.inner = { getBoundingClientRect: frameRead, style: {} };
+    (api.render.gl as any).resize = vi.fn((width: number, height: number, viewport: PreviewViewport | null) => {
+      runtime.el.width = width; runtime.el.height = height;
+      (api.render.gl as any).previewViewport = viewport;
+    });
+    runtime.layout();
+    const flush = () => {
+      const scheduled = [...frames.values()]; frames.clear();
+      scheduled.forEach(callback => callback(0));
+    };
+    flush();
+    stageRead.mockClear(); frameRead.mockClear(); context.clearRect!.mockClear();
+    return { api, runtime, rect, handlers, frames, context, stageRead, frameRead, flush };
+  }
+
+  it('paints playback overlays once per frame without forcing DOM layout', () => {
+    const h = overlayHarness();
+    h.api.transport.playing = () => true;
+    for (let frame = 0; frame < 60; frame++) {
+      h.handlers.get('time')?.(frame / 30);
+      h.handlers.get('overlay')?.();
+      h.flush();
+    }
+    expect(h.context.clearRect).toHaveBeenCalledTimes(60);
+    expect(h.stageRead).not.toHaveBeenCalled();
+    expect(h.frameRead).not.toHaveBeenCalled();
+    h.runtime.dispose();
+  });
+
+  it('does not remeasure the composition or stage during steady playback', () => {
+    const h = overlayHarness();
+    for (let frame = 0; frame < 60; frame++) h.handlers.get('overlay')?.();
+    expect(h.stageRead.mock.calls.length + h.frameRead.mock.calls.length).toBe(0);
+    h.runtime.dispose();
+  });
+
+  it('updates overlay coordinates immediately after zoom, pan and resize', () => {
+    const h = overlayHarness();
+    h.runtime.setZoom(.5);
+    expect(h.context.translate).toHaveBeenLastCalledWith(20, 80);
+    expect(h.context.scale).toHaveBeenLastCalledWith(.5, .5);
+    h.runtime.pan = [150, -30];
+    h.runtime.layout(true);
+    expect(h.context.translate).toHaveBeenLastCalledWith(170, 50);
+    h.rect.width = 1200;
+    h.rect.height = 800;
+    h.runtime.layout();
+    expect(h.context.translate).toHaveBeenLastCalledWith(270, 100);
+    expect(h.runtime.ov).toMatchObject({ width: 1200, height: 800 });
+    Object.defineProperty(window, 'devicePixelRatio', { value: 2, configurable: true });
+    h.runtime.layout();
+    expect(h.context.translate).toHaveBeenLastCalledWith(540, 200);
+    expect(h.context.scale).toHaveBeenLastCalledWith(1, 1);
+    expect(h.runtime.ov).toMatchObject({ width: 2400, height: 1600 });
+    h.runtime.dispose();
+  });
+
+  it('does not rescan a heavy composition on every navigation event', () => {
+    const h = overlayHarness();
+    let scans = 0;
+    h.api.project.get().layers = Array.from({ length: 5000 }, () => ({
+      type: 'shape', get threeD() { scans++; return false; }, fx: [], masks: [],
+    })) as any;
+    h.runtime.setZoom(2);
+    h.stageRead.mockClear();
+    for (let event = 0; event < 60; event++) {
+      h.runtime.pan = [event, event / 2]; h.runtime.layout(true);
+    }
+    expect(scans).toBe(5000);
+    expect(h.stageRead).not.toHaveBeenCalled();
+    h.runtime.dispose();
+  });
+
+  it('moves retained full-frame pixels immediately and resizes only when navigation settles', () => {
+    const h = overlayHarness();
+    h.api.transport.previewResolution = 'auto';
+    h.runtime.setZoom(.5);
+    h.handlers.get('frame:rendered')?.({ viewport: null, time: 0, version: 0, quality: 1 });
+    const resize = vi.mocked(h.api.render.gl.resize); resize.mockClear();
+    h.runtime.zoom = 2; h.runtime.layout(false, true);
+    expect(h.runtime.inner.style.width).toBe('3840px');
+    expect(h.runtime.el.style.width).toBe('100%');
+    expect(resize).not.toHaveBeenCalled();
+    expect(h.runtime.deferNavigationRender(50)).toBe(true);
+    expect(h.runtime.deferNavigationRender(101)).toBe(false);
+    expect(resize).toHaveBeenCalledOnce();
+    expect(resize.mock.calls[0]?.[2]).not.toBeNull();
+    h.handlers.get('frame:rendered')?.({ viewport: h.api.render.gl.previewViewport, time: 0, version: 0, quality: 1 });
+    expect(h.runtime.el.style.position).toBe('absolute');
+    h.runtime.dispose();
+  });
+
+  it.each(['time', 'edit', 'playback'])('flushes deferred navigation before a %s change can retain stale content', (change) => {
+    const h = overlayHarness();
+    h.runtime.setZoom(.5);
+    h.handlers.get('frame:rendered')?.({ viewport: null, time: 0, version: 0, quality: 1 });
+    const resize = vi.mocked(h.api.render.gl.resize); resize.mockClear();
+    h.runtime.zoom = 2; h.runtime.layout(false, true);
+    expect(resize).not.toHaveBeenCalled();
+    if (change === 'time') h.api.transport.time = () => 1;
+    if (change === 'edit') h.api.anim.version = () => 1;
+    if (change === 'playback') { h.api.transport.playing = () => true; h.handlers.get('transport')?.(); }
+    expect(h.runtime.deferNavigationRender(50)).toBe(false);
+    expect(resize).toHaveBeenCalledOnce();
+    h.runtime.dispose();
+  });
+
+  it('rerenders immediately when navigation exposes pixels outside the retained crop', () => {
+    const h = overlayHarness();
+    h.runtime.setZoom(2);
+    h.handlers.get('frame:rendered')?.({ viewport: h.api.render.gl.previewViewport, time: 0, version: 0, quality: 1 });
+    const resize = vi.mocked(h.api.render.gl.resize); resize.mockClear();
+    h.runtime.zoom = .5; h.runtime.layout(false, true);
+    expect(resize).toHaveBeenCalledOnce();
+    expect(resize.mock.calls[0]?.[2]).toBeNull();
+    expect(h.runtime.deferNavigationRender(50)).toBe(false);
+    h.runtime.dispose();
+  });
+
+  it('refreshes animated effect padding and extension eligibility after time, edits and extension changes', () => {
+    const h = overlayHarness();
+    let time = 0, version = 0, safe = true;
+    h.api.transport.time = () => time; h.api.anim.version = () => version;
+    (h.api as any).effects = { get: () => ({ viewportSafe: safe, viewportPadding: ['radius'] }) };
+    h.api.anim.evP = (_layer: any, prop: any, at: number) => prop.v + at * 100;
+    const radius = { v: 10, kf: [], expr: null };
+    h.api.project.get().layers = [{ type: 'shape', fx: [{ id: 'blur', type: 'blur', on: true, p: { radius } }] }] as any;
+    h.runtime.setZoom(2);
+    const initial = (h.api.render.gl.previewViewport as PreviewViewport).renderWidth;
+    time = 1; h.runtime.layout(true);
+    expect(h.api.render.gl.previewViewport!.renderWidth).toBeGreaterThan(initial);
+    radius.v = 100; version++; h.runtime.layout(true);
+    expect(h.api.render.gl.previewViewport!.renderWidth).toBeGreaterThan(initial + 200);
+    safe = false; h.handlers.get('extensions:changed')?.();
+    expect(h.api.render.gl.previewViewport).toBeNull();
+    h.runtime.dispose();
+  });
+
+  it('still draws paused scrub and selection changes without a compositor event', () => {
+    const h = overlayHarness();
+    h.handlers.get('time')?.(2);
+    h.flush();
+    expect(h.context.clearRect).toHaveBeenCalledTimes(1);
+    h.handlers.get('selection')?.();
+    expect(h.context.clearRect).toHaveBeenCalledTimes(2);
+    h.flush();
+    expect(h.context.clearRect).toHaveBeenCalledTimes(2);
+    h.runtime.dispose();
+  });
+
+  it('keeps selected-layer outlines on the latest animated position while scrubbing', () => {
+    const h = overlayHarness();
+    let time = 0;
+    const layer = { id: 'moving', type: 'shape', lock: false } as any;
+    h.api.project.get().layers.push(layer);
+    h.api.selection.layers = () => [layer.id];
+    h.api.transport.time = () => time;
+    h.api.render.gl.bounds = () => ({ x0: 0, y0: 0, x1: 100, y1: 100 });
+    h.api.anim.worldMatrix = (_layer, t) => [1, 0, 0, 1, t * 100, 0];
+    for (const next of [1, 4, 2]) {
+      time = next;
+      h.handlers.get('time')?.(time);
+      h.handlers.get('overlay')?.();
+      expect(h.context.arc).toHaveBeenCalledWith(time * 100, 0, 5 / h.runtime.shown, 0, Math.PI * 2);
+      h.context.arc!.mockClear();
+      h.flush();
+    }
+    expect(h.context.clearRect).toHaveBeenCalledTimes(3);
+    expect(h.stageRead).not.toHaveBeenCalled();
+    h.runtime.dispose();
+  });
+
   it('detects a fully lost composition without firing while any pixels remain visible', () => {
     const stage = { left: 0, top: 0, right: 1000, bottom: 700, width: 1000, height: 700 };
     expect(compositionIsOutOfView(stage, {
@@ -161,6 +360,17 @@ describe('viewer runtime', () => {
     });
     expect(viewport!.renderWidth).toBeLessThan(1920 * 8);
     expect(previewRenderViewport(1920, 1080, 1, 1200, 800, 0, 0, 2, 1)).toBeNull();
+  });
+  it('allows registered viewport-safe effects and budgets their sample radius', () => {
+    const api = viewerApi() as any;
+    api.effects = { get: (id: string) => id === 'blur'
+      ? { viewportSafe: true, viewportPadding: ['amount'] }
+      : undefined };
+    const layer = { fx: [{ id: 'fx', type: 'blur', on: true, p: { amount: { v: 24 } } }] };
+    expect(effectViewportSafe(api, layer, 0)).toBe(true);
+    expect(effectViewportPadding(api, { layers: [layer] }, 0)).toBe(24);
+    layer.fx[0]!.type = 'unknown';
+    expect(effectViewportSafe(api, layer, 0)).toBe(false);
   });
   it('retains the presented viewport through pans covered by its overscan', () => {
     const first = previewRenderViewport(1920, 1080, 8, 1200, 800, -7080, -3920, 2, 1)!;
@@ -522,5 +732,48 @@ describe('canvas selection contrast', () => {
     expect(selectionOutlineColor({bg:'#FFFFFF'})).toBe('#000000');
     expect(selectionOutlineColor({bg:'#000000'})).toBe('#ffffff');
     expect(selectionOutlineColor({bg:'#000000',backgroundFill:{type:'solid',stops:[{color:'#123456'}]}})).toBe('#edcba9');
+  });
+});
+
+describe('group-aware pick targets', () => {
+  // outer > inner > leaf, plus a sibling in outer and a loose layer.
+  const outer: any = { id: 'outer', type: 'group' };
+  const inner: any = { id: 'inner', type: 'group', group: 'outer' };
+  const leaf: any = { id: 'leaf', type: 'shape', group: 'inner' };
+  const sibling: any = { id: 'sibling', type: 'shape', group: 'outer' };
+  const loose: any = { id: 'loose', type: 'shape' };
+  const layers = [outer, inner, leaf, sibling, loose];
+  const chain = (layer: any): any[] => {
+    const result: any[] = [];
+    for (let g = layer.group && layers.find(l => l.id === layer.group); g; g = g.group && layers.find(l => l.id === g.group)) result.push(g);
+    return result;
+  };
+  const apiWith = (selected: string[]) => ({
+    selection: { layers: () => selected },
+    groups: { ancestors: chain },
+    model: { layer: (id: string) => layers.find(l => l.id === id) },
+  }) as unknown as PowermoveAPI;
+
+  it('selects the outermost group first and the leaf when deep', () => {
+    expect(resolvePickTarget(apiWith([]), leaf)?.id).toBe('outer');
+    expect(resolvePickTarget(apiWith([]), leaf, { deep: true })?.id).toBe('leaf');
+    expect(resolvePickTarget(apiWith([]), loose)?.id).toBe('loose');
+    expect(resolvePickTarget(apiWith([]), null)).toBeNull();
+  });
+
+  it('opens the groups that already contain the selection', () => {
+    expect(resolvePickTarget(apiWith(['sibling']), leaf)?.id).toBe('inner');
+    expect(resolvePickTarget(apiWith(['leaf']), sibling)?.id).toBe('sibling');
+    expect(resolvePickTarget(apiWith(['inner']), leaf)?.id).toBe('inner');
+    expect(resolvePickTarget(apiWith(['outer']), leaf)?.id).toBe('outer');
+    expect(resolvePickTarget(apiWith(['loose']), leaf)?.id).toBe('outer');
+  });
+
+  it('drills one level below the deepest selected ancestor', () => {
+    expect(drillTarget(apiWith(['outer']), leaf)?.id).toBe('inner');
+    expect(drillTarget(apiWith(['inner']), leaf)?.id).toBe('leaf');
+    expect(drillTarget(apiWith(['leaf']), leaf)).toBeNull();
+    expect(drillTarget(apiWith(['loose']), leaf)).toBeNull();
+    expect(drillTarget(apiWith([]), leaf)).toBeNull();
   });
 });

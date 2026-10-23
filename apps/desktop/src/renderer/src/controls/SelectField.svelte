@@ -1,7 +1,7 @@
 <script lang="ts">
   import { sel } from '../state/selection.svelte';
   import { doc } from '../state/document.svelte';
-  import { transport } from '../state/transport.svelte';
+  import { controlTime } from '../state/transport.svelte';
   import { EditGesture, type EditBinding } from './gesture';
   import { rowLabelId } from './context';
   import './controls.css';
@@ -24,13 +24,15 @@
     edit: EditBinding;
     options: SelectOption[];
     label?: string;
-    onChange?: (value: unknown) => void;
+    /** Return false to keep the selection as a UI-only action (for example,
+     * an "Import…" command that opens a picker instead of editing a value). */
+    onChange?: (value: unknown) => void | boolean;
     mixed?: (edit: EditBinding, value: unknown) => boolean;
   } = $props();
 
   const labelledBy = rowLabelId();
-  const value = $derived((doc.tick.values, doc.proj, transport.time, get()));
-  const isMixed=$derived((sel.layers,doc.tick.values,doc.proj,transport.time,mixed?.(edit,value)??false));
+  const value = $derived((doc.tick.values, doc.proj, controlTime(), get()));
+  const isMixed=$derived((sel.layers,doc.tick.values,doc.proj,controlTime(),mixed?.(edit,value)??false));
   const gesture = $derived(new EditGesture(api, edit));
   const optionValue = (option: SelectOption): unknown => typeof option === 'string' ? option : option.v;
   const optionLabel = (option: SelectOption): string => typeof option === 'string' ? option : option.label;
@@ -41,9 +43,14 @@
     const option = options[Number((event.currentTarget as HTMLSelectElement).value)];
     if (!option) return;
     const next = optionValue(option);
+    if (onChange?.(next) === false) {
+      // Command-like options (such as Import…) must not leave the native
+      // select displaying a value that is not part of the bound document.
+      (event.currentTarget as HTMLSelectElement).value = String(selectedIndex);
+      return;
+    }
     gesture.once(next);
     api.transport.invalidate();
-    onChange?.(next);
   }
 </script>
 

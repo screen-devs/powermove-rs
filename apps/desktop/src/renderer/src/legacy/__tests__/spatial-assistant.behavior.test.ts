@@ -1,13 +1,17 @@
 // @ts-nocheck -- faithful behavioral transplant of exported spatial pure/adapter seams.
+import { installBridgeForTests, resetBridgeForTests } from '../../kernel/bridge';
 import assert from 'node:assert/strict';
 import { afterEach, expect, it, vi } from 'vitest';
 
 import { makePM } from './make-pm';
+const repairPopup = vi.hoisted(() => vi.fn(() => true));
+vi.mock('../../panels/repair-agent.svelte', () => ({ openRepairAgent: repairPopup }));
 import { install as installElectronShim } from '../host/electron-shim';
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  resetBridgeForTests();
 });
 
 function spatialHarness(adapterFactory) {
@@ -50,33 +54,6 @@ function spatialHarness(adapterFactory) {
 function spatialModel(adapterFactory) {
   return spatialHarness(adapterFactory).assistant;
 }
-
-function sampledShake(step) {
-  const turns = [0, 60, 0, 60, 0];
-  const out = [];
-  for (let t = 0; t <= 480; t += step) {
-    const segment = Math.min(3, Math.floor(t / 120));
-    const f = (t - segment * 120) / 120;
-    out.push({ x: turns[segment] + (turns[segment + 1] - turns[segment]) * f, y: 80, t });
-  }
-  return out;
-}
-
-it('shake activation uses timestamp-normalized inertia and repeated reversals', () => {
-  const math = spatialModel().math;
-  const deliberate60hz = sampledShake(16);
-  const deliberate120hz = sampledShake(8);
-  const slow = sampledShake(80).map(point => ({ ...point, t: point.t * 4 }));
-  const sweep = Array.from({ length: 14 }, (_, i) => ({ x: i * 24, y: 80, t: i * 24 }));
-  const jitter = Array.from({ length: 80 }, (_, i) => ({ x: i % 2 ? 3 : 0, y: 80, t: i * 5 }));
-  assert.equal(math.shakeReady(deliberate60hz), true, 'short deliberate shake activates');
-  assert.equal(math.shakeReady(deliberate120hz), true, 'sampling rate does not change the outcome');
-  assert.equal(math.shakeReady(slow), false, 'slow navigation does not activate');
-  assert.equal(math.shakeReady(sweep), false, 'one fast sweep has no repeated reversals');
-  assert.equal(math.shakeReady(jitter), false, 'high-frequency tiny jitter lacks useful span');
-  assert.ok(math.motionProfile(deliberate60hz).reversals >= 3);
-  assert.equal(math.shakeIntent(deliberate60hz.slice(0, 14)), true, 'early intentional inertia prewarms Ripple');
-});
 
 it('selected regions become cropped visual attachments with workspace semantics', () => {
   const math = spatialModel().math;
@@ -326,6 +303,17 @@ it('normalizes only valid typed extension changes', () => {
   ]);
 });
 
+it('keeps markdown line breaks in autonomous summaries and notes', () => {
+  const { PM, assistant } = spatialHarness();
+  PM.proj = { id: 'project-1' };
+  const result = assistant.math.normalizeAutonomousResult({
+    summary: 'Updated callouts.\r\n\r\n**Seven** are ready.',
+    notes: ['Callouts:\r\n- 01 Auto mode\r\n- 02 HEPA 13', 'Check the timing.'],
+  }, []);
+  assert.equal(result.summary, 'Updated callouts.\n\n**Seven** are ready.');
+  assert.deepEqual(result.notes, ['Callouts:\n- 01 Auto mode\n- 02 HEPA 13', 'Check the timing.']);
+});
+
 it('caps normalized extension changes at 32 entries', () => {
   const { PM, assistant } = spatialHarness();
   PM.proj = { id: 'project-1' };
@@ -486,10 +474,15 @@ it('keeps the prose the model streamed as the reply instead of replacing it with
   const conversation = PM.AgentUI.state.conversation;
   const trace = conversation.find(turn => turn.role === 'trace');
   assert.ok(trace, 'the run archives its trail');
+  assert.ok(Number.isFinite(trace.durationMs) && trace.durationMs >= 0, 'the completed work keeps its elapsed time');
   assert.deepEqual(trace.steps.map((step) => step.kind), ['tool', 'text']);
   assert.equal(trace.steps[1].text, spoken);
   assert.ok(!conversation.some(turn => turn.role === 'assistant' && turn.text === 'Updated the panel.'), 'no duplicate summary turn');
   assert.equal(PM.AgentUI.state.run.summary, 'Updated the panel.');
+  PM.AgentUI.submit('Continue the previous work');
+  await vi.waitFor(() => assert.equal(PM.CodexBridge.request.mock.calls.length, 2));
+  assert.ok(PM.CodexBridge.request.mock.calls[1][0].includes(JSON.stringify(spoken)));
+  await vi.waitFor(() => assert.equal(PM.AgentUI.state.phase, 'result'));
 });
 
 it('falls back to the structured summary when the run streamed no prose', async () => {
@@ -613,8 +606,9 @@ it('imports autonomous artifacts even when the project changed during the run', 
   const media = new File(['clip'], 'clip.mp4', { type: 'video/mp4' });
   PM.AgentArtifacts = { load: vi.fn(async () => media) };
   PM.assetKind = vi.fn(() => 'video');
-  PM.importFiles = vi.fn(async () => {});
+  PM.importFiles = vi.fn(async () => { PM.proj.layers.push({ id: 'imported-clip', name: 'clip.mp4' }); });
   PM.CodexBridge.request = vi.fn(async () => {
+    if (PM.CodexBridge.request.mock.calls.length > 1) return emptyAgentResult;
     PM.proj.revision = 1;
     return {
       text: JSON.stringify({
@@ -628,10 +622,76 @@ it('imports autonomous artifacts even when the project changed during the run', 
   PM.AgentUI.submit('Create and import a clip');
   await vi.waitFor(() => assert.equal(PM.AgentUI.state.phase, 'result'));
 
-  assert.equal(PM.CodexBridge.request.mock.calls.length, 1, 'an import does not need command reconciliation');
+  assert.equal(PM.CodexBridge.request.mock.calls.length, 2, 'continue after import without command reconciliation');
+  assert.match(PM.CodexBridge.request.mock.calls[1][0], /imported-clip/);
+  assert.match(PM.CodexBridge.request.mock.calls[1][0], /grouping/);
   assert.equal(PM.importFiles.mock.calls.length, 1);
   assert.equal(PM.AgentUI.state.run.artifacts[0].imported, true);
   assert.equal(PM.AgentUI.state.run.reviewError, '');
+});
+
+it.each([false, true])('verifies media imports alongside live edits (%s) without duplicate imports', async liveEditsApplied => {
+  const { PM, jobs } = placementHarness();
+  const media = new File(['png'], 'screen.png', { type: 'image/png' });
+  PM.AgentArtifacts = { load: vi.fn(async () => media) };
+  PM.assetKind = vi.fn(() => 'image');
+  PM.importFiles = vi.fn(async () => { PM.proj.layers.push({ id: 'screen-layer' }); });
+  PM.AgentHarness.rollback = vi.fn(() => true);
+  const artifact = { path: 'run/screen.png', importToTimeline: true };
+  const importedResult = {
+    text: JSON.stringify({ summary: 'Prepared screen', commands: [], artifacts: [artifact], notes: [], externalActions: [] }),
+    liveEditsApplied, liveEditHistoryId: liveEditsApplied ? 'native-edits' : undefined,
+  };
+  PM.AgentUI.submit('Import the screen, align it, and group it');
+  await vi.waitFor(() => assert.equal(jobs.length, 1));
+  jobs[0].resolve(importedResult);
+  await vi.waitFor(() => assert.equal(jobs.length, 2));
+  assert.equal(PM.AgentUI.state.phase, 'running');
+  assert.match(jobs[1].prompt, /screen-layer/);
+  assert.match(jobs[1].prompt, /render_frames/);
+  assert.equal(jobs[1].options.threadId, jobs[0].options.threadId);
+  jobs[1].resolve({ ...importedResult, liveEditsApplied: false });
+  await vi.waitFor(() => assert.equal(PM.AgentUI.state.phase, 'result'));
+  assert.equal(PM.importFiles.mock.calls.length, 1);
+  assert.deepEqual(PM.importFiles.mock.calls[0][1].placement, { at: 0 });
+  assert.equal(PM.AgentUI.state.run.artifacts[0].imported, true);
+  await PM.AgentUI.undoSceneRun();
+  assert.equal(PM.AgentHarness.rollback.mock.calls.length, liveEditsApplied ? 2 : 1);
+  if (liveEditsApplied) assert.equal(PM.AgentHarness.rollback.mock.calls[1][0].historyId, 'native-edits');
+});
+
+it('reports imports that return without creating a layer and supplies the failure to continuation', async () => {
+  const { PM, jobs } = placementHarness();
+  PM.AgentArtifacts = { load: vi.fn(async () => new File(['bad'], 'bad.png', { type: 'image/png' })) };
+  PM.assetKind = vi.fn(() => 'image');
+  PM.importFiles = vi.fn(async () => {});
+  PM.AgentUI.submit('Import this image');
+  await vi.waitFor(() => assert.equal(jobs.length, 1));
+  jobs[0].resolve({ text: JSON.stringify({ summary: 'Prepared image', commands: [], artifacts: [{ path: 'bad.png', importToTimeline: true }], notes: [], externalActions: [] }) });
+  await vi.waitFor(() => assert.equal(jobs.length, 2));
+  assert.match(jobs[1].prompt, /import did not create any timeline layers/);
+  jobs[1].resolve(emptyAgentResult);
+  await vi.waitFor(() => assert.equal(PM.AgentUI.state.phase, 'result'));
+  assert.equal(PM.AgentUI.state.run.artifacts[0].imported, false);
+  assert.match(PM.AgentUI.state.run.reviewError, /did not create/);
+});
+
+it('does not continue an agent stopped while media is importing', async () => {
+  const { PM, jobs } = placementHarness();
+  PM.AgentArtifacts = { load: vi.fn(async () => new File(['png'], 'screen.png', { type: 'image/png' })) };
+  PM.assetKind = vi.fn(() => 'image');
+  let finishImport;
+  PM.importFiles = vi.fn(() => new Promise(resolve => { finishImport = resolve; }));
+  PM.AgentUI.submit('Import screen');
+  await vi.waitFor(() => assert.equal(jobs.length, 1));
+  jobs[0].resolve({ text: JSON.stringify({ summary: 'Prepared', commands: [], artifacts: [{ path: 'screen.png', importToTimeline: true }], notes: [], externalActions: [] }) });
+  await vi.waitFor(() => assert.equal(PM.importFiles.mock.calls.length, 1));
+  PM.AgentUI.stop();
+  PM.proj.layers.push({ id: 'screen-layer' });
+  finishImport();
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(jobs.length, 1);
+  assert.notEqual(PM.AgentUI.state.phase, 'result');
 });
 
 it('reconciles stale autonomous commands against the latest project before applying them', async () => {
@@ -741,8 +801,6 @@ it('keeps thread history, drafts and Codex sessions separate; ignores late stopp
   PM.AgentUI.submit('First thread request');
   await vi.waitFor(() => assert.equal(jobs.length, 1));
   assert.equal(jobs[0].options.threadId, first);
-  PM.AgentUI.newThread();
-  assert.equal(PM.AgentUI.state.threadId, first, 'switching must not interrupt the active run');
   PM.AgentUI.stop();
   PM.AgentUI.setDraft('First draft');
   PM.AgentUI.newThread();
@@ -769,6 +827,65 @@ it('keeps thread history, drafts and Codex sessions separate; ignores late stopp
   assert.ok(jobs[2].prompt.includes('First thread request'));
   assert.ok(!jobs[2].prompt.includes('Second thread request'));
   jobs[2].resolve(emptyAgentResult);
+});
+
+it('keeps a thread working in the background while you prompt a new one', async () => {
+  const { PM, jobs } = placementHarness();
+  PM.AgentUI.update({ flush: true });
+  const first = PM.AgentUI.state.threadId;
+  PM.AgentUI.submit('Long running first request');
+  await vi.waitFor(() => assert.equal(jobs.length, 1));
+
+  // Leaving a working thread neither stops it nor drags its run along.
+  PM.AgentUI.newThread();
+  const second = PM.AgentUI.state.threadId;
+  assert.notEqual(second, first);
+  assert.equal(PM.AgentUI.state.phase, 'idle', 'the new thread opens clean');
+  assert.equal(PM.AgentUI.state.conversation.length, 0);
+  assert.equal(PM.AgentUI.state.backgroundRuns, 1);
+  assert.equal(PM.AgentUI.state.threads.find(thread => thread.id === first).busy, true);
+  assert.equal(PM.AgentUI.state.threadSwitchBlocked, false);
+
+  // Both agents run at once, each against its own thread.
+  PM.AgentUI.submit('Second request');
+  await vi.waitFor(() => assert.equal(jobs.length, 2));
+  assert.equal(jobs[1].options.threadId, second);
+  assert.ok(!jobs[1].prompt.includes('Long running first request'));
+  // The view's vocabulary, not the legacy one: 'working' reaches the panel as 'running'.
+  assert.equal(PM.AgentUI.state.phase, 'running');
+  assert.equal(PM.AgentUI.state.threads.filter(thread => thread.busy).length, 2);
+
+  // The background run lands in its own thread without disturbing this one.
+  jobs[0].options.onProgress('background progress');
+  jobs[0].resolve(emptyAgentResult);
+  await vi.waitFor(() => assert.equal(PM.AgentUI.state.threads.find(t => t.id === first).busy, false));
+  assert.equal(PM.AgentUI.state.threadId, second, 'a finished background run never steals the view');
+  assert.equal(PM.AgentUI.state.backgroundRuns, 0);
+  assert.ok(!PM.AgentUI.state.conversation.some(m => m.text === 'Long running first request'));
+  assert.equal(PM.AgentUI.state.activity, '', 'background progress stays out of the visible thread');
+
+  jobs[1].resolve(emptyAgentResult);
+  await vi.waitFor(() => assert.equal(PM.AgentUI.state.phase, 'result'));
+
+  // Returning to the first thread shows the run that finished while away.
+  PM.AgentUI.switchThread(first);
+  assert.ok(PM.AgentUI.state.conversation.some(m => m.text === 'Long running first request'));
+  assert.ok(!PM.AgentUI.state.conversation.some(m => m.text === 'Second request'));
+});
+
+it('deleting a working thread stops its run', async () => {
+  const { PM, jobs } = placementHarness();
+  PM.AgentUI.update({ flush: true });
+  const first = PM.AgentUI.state.threadId;
+  PM.AgentUI.submit('Doomed request');
+  await vi.waitFor(() => assert.equal(jobs.length, 1));
+  PM.AgentUI.newThread();
+  assert.equal(PM.AgentUI.state.backgroundRuns, 1);
+
+  PM.AgentUI.deleteThread(first);
+  assert.equal(PM.AgentUI.state.backgroundRuns, 0);
+  assert.ok(!PM.AgentUI.state.threads.some(thread => thread.id === first));
+  assert.equal(jobs[0].options.signal.aborted, true, 'the deleted thread’s run is aborted');
 });
 
 it('replaces the temporary first-request label with a generated thread title', async () => {
@@ -830,7 +947,7 @@ it('binds the first typed draft to the boot project before it can target an olde
 
   assert.equal(PM.AgentUI.state.threadId, 'existing-thread');
   assert.deepEqual(PM.AgentUI.state.threads, [{
-    id: 'existing-thread', title: 'Existing conversation', updatedAt: PM.AgentUI.state.threads[0].updatedAt,
+    id: 'existing-thread', title: 'Existing conversation', updatedAt: PM.AgentUI.state.threads[0].updatedAt, busy: false,
   }]);
   assert.equal(PM.AgentUI.state.composerDraft, 'A genuinely new request');
   assert.ok(PM.AgentUI.state.conversation.some(message => message.text === 'Earlier request'));
@@ -910,6 +1027,7 @@ it('keeps the current run alive when its transport accepts live steering', async
   await vi.waitFor(() => assert.equal(jobs.length, 1));
   const firstSignal = jobs[0].options.signal;
   PM.CodexBridge.steer = vi.fn(async () => true);
+  jobs[0].options.onTrace({ kind: 'thought', text: 'Before live steering' });
 
   PM.AgentUI.submit('continue');
   await vi.waitFor(() => assert.equal(PM.CodexBridge.steer.mock.calls.length, 1));
@@ -917,6 +1035,7 @@ it('keeps the current run alive when its transport accepts live steering', async
   assert.equal(firstSignal.aborted, false, 'steering must not abort the active run');
   assert.equal(PM.AgentUI.state.conversation.at(-1)?.steering, true);
   assert.equal(PM.AgentUI.state.conversation.at(-1)?.text, 'continue');
+  assert.equal(PM.AgentUI.state.conversation.find(message => message.role === 'trace')?.steering, true);
 
   jobs[0].resolve(emptyAgentResult);
   await vi.waitFor(() => assert.equal(PM.AgentUI.state.phase, 'result'));
@@ -977,6 +1096,7 @@ it('continues the same agent to repair and verify loaded extensions before finis
   assert.ok(!PM.AgentUI.state.conversation.some(m => m.fixExtensionId));
   const restoreChangeSet = vi.fn(async () => {});
   (window as any).powermove = { codex: { restoreChangeSet } };
+  installBridgeForTests((window as any).powermove);
   await PM.AgentUI.undoSceneRun();
   assert.deepEqual(restoreChangeSet.mock.calls.map(([arg]) => arg.changeSetId), ['repaired', 'created']);
 });
@@ -1015,12 +1135,13 @@ it('stops an automatic verification and ignores its late result', async () => {
   assert.equal(jobs.length, 2);
 });
 
-it('builds and automatically submits an extension Fix-it prompt in project mode', async () => {
+it('hands repair to an independent popup without replacing the project composer', async () => {
   const { PM, assistant } = spatialHarness();
   const files = [{ path: 'index.ts', text: 'throw new Error()' }];
   const readSource = vi.fn(async () => files);
   const fixPrompt = vi.fn(async () => 'Fix broken-mod without changing its public id.');
   (window as any).powermove = { extensions: { readSource }, codex: { fixPrompt } };
+  installBridgeForTests((window as any).powermove);
   PM.Kernel = { loader: { records: () => [{
     id: 'broken-mod', manifest: { name: 'Broken Mod' },
     health: { state: 'build-error', error: 'Build failed\nstack' },
@@ -1031,9 +1152,14 @@ it('builds and automatically submits an extension Fix-it prompt in project mode'
 
   assert.deepEqual(readSource.mock.calls, [[{ id: 'broken-mod' }]]);
   assert.deepEqual(fixPrompt.mock.calls, [[{ id: 'broken-mod', error: 'Build failed\nstack', files }]]);
-  assert.equal(PM.store.get('agentAccessMode', ''), 'project');
-  assert.deepEqual(PM.AgentUI.setDraft.mock.calls, [['Fix broken-mod without changing its public id.', true]]);
-  assert.deepEqual(PM.AgentUI.submit.mock.calls, [['Fix broken-mod without changing its public id.']]);
+  assert.equal(PM.AgentUI.setDraft.mock.calls.length, 0);
+  assert.equal(PM.AgentUI.submit.mock.calls.length, 0);
+  const options = repairPopup.mock.calls.at(-1)[1];
+  assert.equal(options.id, 'broken-mod');
+  assert.match(options.prompt, /Repair extension broken-mod/);
+  assert.match(options.prompt, /Build failed/);
+  assert.match(options.prompt, /Fix broken-mod without changing its public id/);
+  assert.equal(await options.connected(), false);
 });
 
 it('warns and no-ops when the Fix-it bridge is absent', async () => {
@@ -1124,6 +1250,7 @@ it('seals live thoughts and marks running tools continued when stopped', () => {
   PM.AgentUI.submit('Inspect this');
   assistant.lifecycle.reduceTrace({ kind: 'thought', text: 'Inspecting' });
   assistant.lifecycle.reduceTrace({ kind: 'tool-start', itemId: 'live-tool', toolName: 'edit', label: 'edit · app.ts' });
+  assistant.lifecycle.reduceTrace({ kind: 'answer', text: 'Working on it' });
   PM.AgentUI.update({ flush: true });
 
   PM.AgentUI.stop();
@@ -1134,6 +1261,7 @@ it('seals live thoughts and marks running tools continued when stopped', () => {
   assert.ok(archived, 'stop archives the trace as a conversation entry');
   assert.equal(archived.steps.find(step => step.kind === 'thought')?.live, false);
   assert.equal(archived.steps.find(step => step.kind === 'tool')?.status, 'continued');
+  assert.equal(archived.steps.find(step => step.kind === 'text')?.text, 'Working on it');
 });
 
 it('caps traces at 200 steps by dropping old thought and tool rows before text', () => {
@@ -1183,6 +1311,7 @@ it('preserves traces arriving while a steering request falls back to a new run',
   await vi.waitFor(() => assert.equal(jobs.length, 2));
   const conversation = PM.AgentUI.state.conversation;
   assert.deepEqual(conversation.filter(message => message.role === 'trace').flatMap(message => message.steps).map(step => step.label), ['Before steering', 'While steering']);
+  assert.ok(conversation.filter(message => message.role === 'trace').every(message => message.steering === true));
   assert.equal(conversation.filter(message => message.text === 'New direction').length, 1);
   PM.AgentUI.stop();
   jobs.forEach(job => job.resolve(emptyAgentResult));
@@ -1216,6 +1345,7 @@ it('forwards typed extension changes through the Electron shim payload', async (
       documentElement: { classList: { add() {} } },
     },
   });
+  installBridgeForTests((window as any).powermove);
   const PM = { CodexBridge: { resolve, progress: vi.fn() }, toast: vi.fn() };
   installElectronShim(PM as any);
 
@@ -1238,4 +1368,26 @@ it('sending an agent message does not clone or rewrite the saved Takes archive',
   expect(PM.takes.save).not.toHaveBeenCalled();
   expect(PM.takes.all).not.toHaveBeenCalled();
   expect(JSON.stringify(PM.AgentUI.state.run.checkpoint)).not.toContain('layers');
+});
+
+
+it('retains all artifacts beyond 80 in the agent result', () => {
+  const artifacts = Array.from({ length: 85 }, (_, index) => ({ path: `result-${index}.png`, importToTimeline: true }));
+  const result = spatialModel().math.normalizeAutonomousResult({ artifacts });
+  expect(result.artifacts).toHaveLength(85);
+  expect(result.artifacts.at(-1).path).toBe('result-84.png');
+});
+
+it.each(['bytes', 'base64'])('loads artifact files from %s without changing the payload', async format => {
+  const { PM } = spatialHarness();
+  window.File = File;
+  window.webkit = { messageHandlers: { pmAgentArtifact: { postMessage: request => {
+    PM.AgentArtifacts.resolve(request.id, {
+      ok: true, name: 'result.bin', mime: 'application/octet-stream',
+      ...(format === 'bytes' ? { data: new Uint8Array([0, 123, 255]) } : { dataBase64: 'AHv/' }),
+    });
+  } } } };
+  const file = await PM.AgentArtifacts.load({ projectId: 'p', path: 'result.bin' });
+  expect(file.name).toBe('result.bin');
+  expect([...new Uint8Array(await file.arrayBuffer())]).toEqual([0, 123, 255]);
 });

@@ -122,15 +122,19 @@ export interface CommandDefinition {
   /** Display hint only; bind keys with `keybindings.bind`. */
   kb?: string | null;
   run: (...args: unknown[]) => unknown;
-  /** Return false to hide from palette/menus (still runnable by id). */
-  when?: () => boolean;
+  /** Return false to hide from palette/menus (still runnable by id). A
+   *  sandboxed extension's may return a Promise: the palette asks it on every
+   *  open, and every other reader gets its last answer (`true` before any). */
+  when?: () => boolean | Promise<boolean>;
 }
 
 export interface CommandsAPI {
   register(def: CommandDefinition): Disposable;
+  /** Returns a Promise when the extension runs sandboxed (Store installs). */
   run(id: string, ...args: unknown[]): unknown;
   has(id: string): boolean;
-  list(): CommandDefinition[];
+  /** Every command; `when` here always answers synchronously, so `!c.when || c.when()` filters. */
+  list(): Array<CommandDefinition & { when?: () => boolean }>;
 }
 
 /**
@@ -176,7 +180,12 @@ export type EffectParamDefinition =
  * Fragment shader body contract (GLSL ES 3.00). The kernel prepends the common
  * preamble (`v_uv`, `v_st`, `u_tex`, `u_res`, `u_texel`, `u_time`, helpers) and
  * a `uniform` declaration for every param named `u_<k>` (float for numbers and
- * toggles, vec3 for colors), plus `u_pass` (int) and, when `keepOrig`, `u_orig`.
+ * toggles, vec3 for colors), plus `u_pass` (int), `u_orig` when `keepOrig`, and
+ * `u_backdrop` when `backdrop` is enabled. `u_backdrop` contains the pixels
+ * accumulated beneath the layer before the effect is applied.
+ * `v_uv` is composition-normalized and `v_px` is in composition pixels even
+ * when the editor is rendering a cropped high-zoom viewport; `u_coordRes` is
+ * the full composition size in those pixels.
  * Output is `o` (vec4). Provide only the body of `main()` in `frag`, or a full
  * shader with `void main` when `rawShader` is true (legacy positional u_p<i>
  * uniforms remain supported for raw shaders).
@@ -191,7 +200,16 @@ export interface EffectDefinition {
   frag: string;
   passes?: number; // 1..8
   keepOrig?: boolean;
+  /** Expose the already-composited pixels beneath this layer as `u_backdrop`. */
+  backdrop?: boolean;
   rawShader?: boolean;
+  /**
+   * The shader can run on a cropped high-zoom viewport. Viewport-safe effects
+   * must use the supplied `v_uv`/`v_px` coordinates for spatial calculations.
+   */
+  viewportSafe?: boolean;
+  /** Numeric parameter keys whose values are sampled outside the viewport. */
+  viewportPadding?: string[];
 }
 
 /**
@@ -277,8 +295,17 @@ export interface AssetsAPI {
   pick(options?: { accept?: string; multiple?: boolean }): Promise<File[]>;
   /** Import into Powermove's durable project media store. The file remains after layer Undo. */
   import(file: File, options?: { layerDefinition?: string }): Promise<AssetRecord>;
+  /**
+   * Download an https image, video or audio file (at most 512 MiB) and import it
+   * like `import`; resolves to the new asset's id. Sandboxed, it needs `assets`
+   * and `network` and runs one download at a time. Powermove fetches it without
+   * credentials or cookies, from public addresses only, following at most 5
+   * https redirects, and imports it only if it decodes as media.
+   */
+  importUrl(url: string): Promise<string>;
+  /** Returns a Promise when the extension runs sandboxed (Store installs). */
   get(id: string): AssetRecord | undefined;
-  /** Read a text asset from the live cache or durable media store (64 MB maximum). */
+  /** Read a text asset from the live cache or durable media store. */
   readText(id: string): Promise<string>;
 }
 
@@ -302,9 +329,11 @@ export interface ThemeDefinition {
 export interface ThemeAPI {
   register(def: ThemeDefinition): Disposable;
   activate(id: string): void;
+  /** Reactive (see {@link ProjectAPI}): re-runs its readers when the theme changes. */
   active(): string;
   list(): ThemeDefinition[];
-  /** Kernel scheme preference (System/Light/Dark) as chosen in Settings. */
+  /** Kernel scheme preference (System/Light/Dark) as chosen in Settings; sandboxed, the scheme the panel shows
+   * (`light` or `dark`). Reactive (see {@link ProjectAPI}). */
   scheme(): 'light' | 'dark' | 'system';
   setScheme(mode: 'light' | 'dark' | 'system'): void;
 }
@@ -318,7 +347,9 @@ export interface PaletteEntry {
   kb?: string | null;
   run(): unknown;
 }
-export type PaletteProvider = (query: string) => PaletteEntry[];
+/** Called for every query. A Promise lands in the palette when it settles,
+ *  if the palette still shows the query it was asked for. */
+export type PaletteProvider = (query: string) => PaletteEntry[] | Promise<PaletteEntry[]>;
 
 export type MenuLocation = 'titlebar:right' | 'panel:context' | 'layer:context' | 'timeline:context' | 'viewer:context';
 
@@ -328,9 +359,15 @@ export type MenuContribution =
   | { label: string; icon?: string; kb?: string | null; on?: boolean; disabled?: boolean; run?: () => unknown };
 
 export interface MenusAPI {
-  contribute(location: MenuLocation, items: (ctx: Record<string, unknown>) => MenuContribution[]): Disposable;
-  /** Everything contributed for a location, in registration order. */
+  /** Called on every open with that open's `ctx`. A Promise is waited for at
+   *  most 100 ms; items that arrive later are left out of that open. */
+  contribute(location: MenuLocation, items: (ctx: Record<string, unknown>) => MenuContribution[] | Promise<MenuContribution[]>): Disposable;
+  /** Everything contributed for a location, in registration order. Only
+   *  synchronous contributions: asynchronous ones answer the menus they open. */
   collect(location: MenuLocation, ctx?: Record<string, unknown>): MenuContribution[];
+  /** Everything contributed for one open, asynchronous contributions
+   *  included, once they answered or 100 ms passed. Hand it to `ui.menu`. */
+  gather(location: MenuLocation, ctx?: Record<string, unknown>): Promise<MenuContribution[]>;
 }
 
 export interface StatusItem {
@@ -360,20 +397,49 @@ export interface Selection {
   chan: string | null;
 }
 
+/**
+ * Reactive reads: `latest`, `time`, `playing`, `revision` and `selection` here, `time` and `playing` on
+ * `transport`, `active` and `scheme` on `theme`. Read inside a Svelte template, `$derived` or `$effect`, one
+ * re-runs that reader whenever its value changes, so there is no `events.on` + `$state` to wire by hand; the
+ * subscription starts with the first such reader and ends with the last. Called anywhere else it returns the
+ * plain value and subscribes nothing.
+ *
+ * `time()` re-runs its readers on every frame during playback, like the editor's own playhead. Narrow what
+ * depends on it with `$derived` (`const second = $derived(Math.floor(api.project.time()))` updates its readers
+ * once a second), or sample it on an interval outside a reactive context while `playing()`.
+ */
 export interface ProjectAPI {
-  /** Current project object graph. Treat as read-only; mutate through `apply`. */
+  /** Current project object graph; mutate through `apply`. Returns a Promise when the extension runs sandboxed
+   * (Store installs): a deep-frozen snapshot without `edits`, asset blob/source fields or `library`/`notes`
+   * secrets, cached until the project changes. Needs no permission. */
   get(): Project;
+  /** The project, reactively. In-realm the live object `get()` returns (edited in place, so read the fields you
+   * need in the same reactive expression); readers re-run on every `project:changed`. Sandboxed, the snapshot
+   * this document pulled last, `undefined` until the first pull (or while the project is too large to
+   * snapshot): a reader starts a pull and re-runs when it lands, and each change pulls once more while one
+   * reads. Always synchronous; needs no permission. */
+  latest(): Project | undefined;
+  /** Reactive; synchronous in the sandbox; needs no permission. */
   revision(): number;
-  /** Typed, validated, undoable edit. `meta.origin` is forced to `ext:<id>`. */
+  /** Typed, validated, undoable edit. `meta.origin` is forced to `ext:<id>`. Returns a Promise when sandboxed. */
   apply(commands: EditCommand | EditCommand[], meta?: Omit<EditMeta, 'origin'>): EditResult;
+  /** Reactive; synchronous in the sandbox; needs no permission. */
   selection(): Selection;
+  /** Returns a Promise when the extension runs sandboxed (Store installs). */
   select(layerIds: string[], add?: boolean): void;
+  /** Reactive (every frame during playback); synchronous in the sandbox; needs no permission. */
   time(): number;
+  /** Returns a Promise when the extension runs sandboxed (Store installs). */
   setTime(t: number): void;
+  /** Returns a Promise when the extension runs sandboxed (Store installs). */
   play(): void;
+  /** Returns a Promise when the extension runs sandboxed (Store installs). */
   pause(): void;
+  /** Reactive; synchronous in the sandbox; needs no permission. */
   playing(): boolean;
+  /** Returns a Promise when the extension runs sandboxed (Store installs). */
   undo(): void;
+  /** Returns a Promise when the extension runs sandboxed (Store installs). */
   redo(): void;
   /** Render the current composition at `t` to a JPEG data URL (≤ maxWidth px). */
   snapshot(t?: number, maxWidth?: number): Promise<string>;
@@ -480,12 +546,19 @@ export interface SetTimeOptions { raw?: boolean; force?: boolean }
  * Transport owns mutable playhead, playback and preview-quality state. Changing time or playback emits the backing transport events and invalidates rendering/UI; `invalidate` preserves the legacy immediate-render and coalesced UI invalidation behavior.
  */
 export interface TransportAPI {
+  /** Reactive (every frame during playback; see {@link ProjectAPI}). */
   time(): number;
+  /** Transport controls return Promises when the extension runs sandboxed (Store installs). */
   setTime(time: number, options?: SetTimeOptions): void;
+  /** Returns a Promise when the extension runs sandboxed (Store installs). */
   play(): void;
+  /** Returns a Promise when the extension runs sandboxed (Store installs). */
   pause(): void;
+  /** Returns a Promise when the extension runs sandboxed (Store installs). */
   toggle(): void;
+  /** Reactive (see {@link ProjectAPI}). */
   playing(): boolean;
+  /** Returns a Promise when the extension runs sandboxed (Store installs). */
   step(frames: number): void;
   quality: number;
   readonly perf: TransportPerformance;
@@ -522,7 +595,22 @@ export interface EditAPI {
 }
 
 export interface ImportPlacement { at: number; index?: number }
-export interface ImportFilesOptions { project?: Project; placement?: ImportPlacement | null; sequence?: boolean }
+/** Normalized anchor within imported visual content: 0 = start, 0.5 = center, 1 = end. */
+export interface ImportDefaults { anchor: { x: number; y: number } }
+export interface InspectorSectionContext { layerIds: string[] }
+export interface InspectorSectionDefinition {
+  id: string;
+  title: string;
+  after?: 'content' | 'transform' | 'effects';
+  when?(context: InspectorSectionContext): boolean;
+  /** Mount controls; return cleanup. Rebuilt when the selection changes. */
+  build(target: HTMLElement, context: InspectorSectionContext): void | (() => void) | Disposable;
+}
+export interface InspectorAPI {
+  registerSection(section: InspectorSectionDefinition): Disposable;
+  sections(): InspectorSectionDefinition[];
+}
+export interface ImportFilesOptions { project?: Project; placement?: ImportPlacement | null; sequence?: boolean; replaceAssetId?: string }
 export interface RuntimeAsset extends AssetRecord { blob?: Blob; sourceText?: string; [key: string]: unknown }
 export interface WaveformOptions { [key: string]: unknown }
 export interface FontCatalog {
@@ -538,20 +626,31 @@ export interface FontCatalog {
  * Media exposes timing queries, file import, layer-command creation, waveform drawing, runtime raster assets and fonts. Imports/assets/fonts may perform asynchronous I/O and invalidate caches; command creation and timing helpers do not mutate the project by themselves.
  */
 export interface MediaAPI {
+  /** Only import defaults are sandbox-safe; live media members require full access. */
+  /** Applies to future image, video and SVG imports and asset-to-timeline additions. */
+  registerImportDefaults(defaults: ImportDefaults): Disposable;
+  /** Latest active mod's override, or null for the native import behavior. Returns a Promise when sandboxed. */
+  getImportDefaults(): ImportDefaults | null;
   readonly timing: { isTimed(layer: Layer): boolean; rate(layer: Layer): number; earliestStart(layer: Layer): number };
+  /** Requires the full-access permission for Store extensions. */
   importFiles(files: FileList | File[], options?: ImportFilesOptions): Promise<unknown>;
   commandForAsset(id?: string, at?: number): EditCommand | undefined;
+  /** Requires the full-access permission for Store extensions. */
   readonly audio: { drawWaveform(ctx: CanvasRenderingContext2D, layer: Layer, options?: WaveformOptions): boolean };
+  /** Requires the full-access permission for Store extensions. */
   readonly assets: {
     get(id: string): RuntimeAsset | undefined;
     add(file: File, options?: Record<string, unknown>): Promise<RuntimeAsset>;
     kind(file: File): 'image' | 'video' | 'audio' | 'model' | null;
   };
+  /** Requires the full-access permission for Store extensions. */
   readonly fonts: FontCatalog;
 }
 
 export interface PreviewViewport { x: number; y: number; width: number; height: number; [key: string]: unknown }
 export interface RasterWindow { x?: number; y?: number; w?: number; h?: number; [key: string]: unknown }
+export interface TextCaretLine { text: string; start: number; x: number; y: number; baseline: number; width: number; boundaries: { index: number; x: number }[] }
+export interface TextCaretLayout { lines: TextCaretLine[]; lineHeight: number; size: number; length: number; align: 'left' | 'center' | 'right'; boxWidth: number; boxHeight: number }
 export interface RasterSurface { cv?: HTMLCanvasElement; canvas?: HTMLCanvasElement; bitmap?: ImageBitmap; anchorX?: number; anchorY?: number; x?: number; y?: number; w?: number; h?: number; [key: string]: unknown }
 
 /**
@@ -568,6 +667,9 @@ export interface RenderAPI {
     readonly context: WebGL2RenderingContext | null;
   };
   raster(layer: Layer, scale?: number, time?: number, uploaded?: (key: string) => unknown, crop?: RasterWindow): RasterSurface | null;
+  /** Caret geometry for a text layer in its local space, produced by the same
+      measuring and wrapping as the rasterizer. */
+  textLayout(layer: Layer, time?: number): TextCaretLayout | null;
   renderFrameTo(time: number, width: number, height: number, options?: Record<string, unknown>): HTMLCanvasElement;
   snapshot(time: number, maxWidth?: number): string;
 }
@@ -579,6 +681,8 @@ export interface ShaderMeta { [key: string]: unknown }
  * UI state stores non-project disclosure, graph-handle, reveal and shader metadata. Setters mutate only the backing UI-state caches and compatibility fields; they do not create project history entries or render output directly.
  */
 export interface UIStateAPI {
+  /** Changes when timeline disclosure, property reveal, or shader fields change. */
+  timelineVersion?(): number;
   getLayerCollapsed(layer: Layer): boolean;
   setLayerCollapsed(layer: Layer, collapsed: boolean): boolean;
   getGroupCollapsed(layer: Layer): boolean;
@@ -651,6 +755,7 @@ export interface UtilAPI {
   tc(seconds: number, fps?: number, showFrames?: boolean): string;
   parseTc(value: string, fps?: number): number | null;
   uid(prefix?: string): string;
+  /** Red, green and blue as 0–1; alpha digits (#RGBA, #RRGGBBAA) are ignored. */
   hex2rgb(hex: string): number[];
   rgb2hex(red: number, green: number, blue: number): string;
 }
@@ -721,17 +826,27 @@ export interface ControlsAPI {
  * UI exposes kernel controls, overlays, menus and pointer helpers. Most members only mutate transient interface state; parent picking can apply an edit, shader opening mutates workspace state, and gesture coordinates the backing edit/history transaction.
  */
 export interface UIAPI {
+  /** Only toast, confirm, openExternal, icon and copy are sandbox-safe; other UI members require full access. */
+  /** Requires the full-access permission for Store extensions. */
   readonly controls: ControlsAPI;
   toast(
     text: string,
     opts?: {
+      /** Which family the notice belongs to. An extension raises a `status` or
+          an `alert`; it cannot raise an editor error, and the kernel attributes
+          whatever it sends to the extension by name. */
+      kind?: 'status' | 'alert';
+      /** State the outcome rather than letting the message text be sniffed, so a
+          success that quotes a user-chosen name stays a success. A failure the
+          extension states becomes its alert, not an editor error. */
+      error?: boolean;
       sticky?: boolean;
       dismissible?: boolean;
       icon?: string;
       /** Replace an earlier toast with the same key instead of stacking. */
       key?: string;
-      /** Persistent notices sit top-right; status toasts stay bottom-center. */
-      corner?: 'top-right';
+      /** Persistent notices sit in a corner; status toasts stay bottom-center. */
+      corner?: 'top-right' | 'bottom-right';
       /** One primary action rendered inside the toast. */
       action?: { label: string; run: () => void };
       /** Called only on explicit user dismissal. */
@@ -739,16 +854,32 @@ export interface UIAPI {
     }
   ): void;
   confirm(title: string, body?: string): Promise<boolean>;
-  menu(anchor: HTMLElement | { x: number; y: number }, items: MenuContribution[]): void;
+  /**
+   * Open an https URL (at most 2 KB, no credentials) in the person's browser.
+   * Resolves false when they decline. Sandboxed, one call may be pending and
+   * at most one runs every 2 s; origins in the manifest's `links` open without
+   * asking when the extension declares `network`, and any other URL is shown
+   * in full for the person to confirm first.
+   */
+  openExternal(url: string): Promise<boolean>;
+  /** Store extensions only: writes plain text to the clipboard from a panel that has focus. Needs the clipboard permission; at most once a second. */
+  copy?(text: string): Promise<void>;
+  /** Requires the full-access permission for Store extensions. A Promise of
+   *  items opens the menu when it settles with any, unless another menu
+   *  opened or menus closed first. */
+  menu(anchor: HTMLElement | { x: number; y: number }, items: MenuContribution[] | Promise<MenuContribution[]>): void;
+  /** Requires the full-access permission for Store extensions. */
   modal(opts: { title?: string; body?: HTMLElement | string; width?: number; actions?: Array<{ label: string; pri?: boolean; run?: () => unknown }> }): { close(): void; body: HTMLElement };
-  /** Icon SVG markup by name from the kernel set. */
+  /** Icon SVG markup by name from the kernel set. Returns a Promise when sandboxed. */
   icon(name: string): string;
+  /** Requires the full-access permission for Store extensions. */
   drag(event: PointerEvent, options: DragOptions): { cancel(): void };
   closeMenus(): void;
   showLayerMenu(layer: Layer, event: { clientX: number; clientY: number }, origin?: string): void;
   showParentMenu(ids: string[], event: { clientX: number; clientY: number }): HTMLElement | undefined;
   beginParentPick(event: PointerEvent, ids: string[]): void;
   openShaderEditor(layer?: Layer): void;
+  /** Requires the full-access permission for Store extensions. */
   readonly gesture: EditGestureConstructor;
 }
 
@@ -824,14 +955,18 @@ export interface ServicesAPI {
 /* ── storage ─────────────────────────────────────────────── */
 
 export interface StorageAPI {
+  /** Returns a Promise when the extension runs sandboxed (Store installs). */
   get<T = unknown>(key: string): T | undefined;
+  /** Returns a Promise when the extension runs sandboxed (Store installs). */
   set(key: string, value: unknown): void;
+  /** Returns a Promise when the extension runs sandboxed (Store installs). */
   delete(key: string): void;
 }
 
 /* ── events ──────────────────────────────────────────────── */
 
 export interface KernelEvents {
+  'inspector:changed': undefined;
   'project:changed': { kind: 'values' | 'structure' | 'project' | 'assets' | 'library' | 'history' | 'replace' };
   selection: Selection;
   time: number;
@@ -843,6 +978,7 @@ export interface KernelEvents {
   'extension:loaded': { id: string };
   'extension:unloaded': { id: string };
   /** Any extension record changed (health, enablement, rebuild) — re-read `extensions.list()`. */
+  'extensions:ready': undefined;
   'extensions:changed': { ids: string[]; reason: string };
   /** The compositor presented a frame. `viewport` is the exact preview viewport
    * object it drew into (identity-comparable with `render.gl.previewViewport`),
@@ -858,6 +994,8 @@ export interface KernelEvents {
 }
 
 export interface EventsAPI {
+  /** Sandboxed, listeners run in the extension's document and occurrences arrive batched once per host flush
+   * (`time` and `selection` keep the latest value). */
   on<K extends keyof KernelEvents>(event: K, fn: (payload: KernelEvents[K]) => void): Disposable;
   emit<K extends keyof KernelEvents>(event: K, payload: KernelEvents[K]): void;
 }
@@ -865,6 +1003,7 @@ export interface EventsAPI {
 /* ── extensions (introspection) ──────────────────────────── */
 
 export interface ExtensionsAPI {
+  /** Returns a Promise and omits local paths when the extension runs sandboxed (Store installs). */
   list(): ExtensionRecord[];
   fork(id: string): Promise<{ id: string }>;
   setEnabled(id: string, enabled: boolean): Promise<void>;
@@ -875,6 +1014,43 @@ export interface ExtensionsAPI {
   requestFix(id: string): void;
   /** Ask the agent to rebase a stale user fork onto its newly shipped built-in. */
   rebase(id: string): void;
+  /** Open the sheet where the user enters an extension's declared `vars` values. */
+  setUp(id: string): void;
+}
+
+/* ── vars (values the user entered) ──────────────────────── */
+
+/**
+ * `api.vars`: values the user entered for this extension, such as an API key
+ * or an account id. Read them here; never write a credential into source.
+ *
+ * Declare every value in `manifest.json` (this needs `"apiVersion": 2`):
+ *
+ *   "vars": [
+ *     { "key": "OPENAI_API_KEY", "label": "OpenAI API key", "secret": true, "required": true },
+ *     { "key": "MODEL", "label": "Model", "hint": "Defaults to gpt-image-1" }
+ *   ]
+ *
+ * `key` is `^[A-Z][A-Z0-9_]{1,63}$`. The user enters values in Settings ›
+ * Extensions › Set up. An extension with a `required` value stays off
+ * ("Needs setup") until it is set, so `get` of a required key is always a
+ * string inside `activate`. Values are fetched once per activation; setting
+ * or removing one reloads the extension.
+ *
+ * Values live in the app profile, never in the extension folder, so they are
+ * never published or shared with the source. A key, token or private key
+ * written into the source blocks the change from being saved.
+ *
+ * Extensions share one renderer: a value delivered here is readable by any
+ * running extension. Treat it as belonging to this Powermove profile, not to
+ * this extension alone.
+ */
+export interface VarsAPI {
+  /** The value for a declared key, or undefined when it is not set. */
+  get(key: string): string | undefined;
+  has(key: string): boolean;
+  /** Declared keys that have a value. */
+  keys(): string[];
 }
 
 /* ── the API object ──────────────────────────────────────── */
@@ -903,11 +1079,13 @@ export interface HostAPI {
   };
   /** Mount a Svelte component into an element (kernel-provided svelte runtime). */
   mount<P extends Record<string, unknown>>(component: Component<P>, target: HTMLElement, props: P): () => void;
+  /** Native haptic feedback (the Mac trackpad's snap tick). Does nothing where there is none. */
+  readonly haptic: { alignment(): void };
 }
 
 export interface PowermoveAPI {
   readonly id: string; // extension id
-  readonly apiVersion: 1;
+  readonly apiVersion: 1 | 2 | 3;
   readonly manifest: ExtensionManifest;
 
   readonly panels: PanelsAPI;
@@ -922,26 +1100,43 @@ export interface PowermoveAPI {
   readonly menus: MenusAPI;
   readonly status: StatusAPI;
   readonly project: ProjectAPI;
+  /** Requires the full-access permission for Store extensions. */
   readonly anim: AnimAPI;
+  /** Requires the full-access permission for Store extensions. */
   readonly model: ModelAPI;
+  /** Live graph helpers require the full-access permission for Store extensions. */
   readonly selection: SelectionAPI;
+  /** Requires the full-access permission for Store extensions. */
   readonly groups: GroupsAPI;
   readonly transport: TransportAPI;
+  /** Requires the full-access permission for Store extensions. */
   readonly history: HistoryAPI;
+  /** Requires the full-access permission for Store extensions. */
   readonly edit: EditAPI;
   readonly media: MediaAPI;
+  /** Requires the full-access permission for Store extensions. */
+  readonly inspector: InspectorAPI;
+  /** Requires the full-access permission for Store extensions. */
   readonly render: RenderAPI;
+  /** Requires the full-access permission for Store extensions. */
   readonly uiState: UIStateAPI;
   readonly ui: UIAPI;
+  /** Requires the full-access permission for Store extensions. */
   readonly dnd: DndAPI;
+  /** Requires the full-access permission for Store extensions. */
   readonly workspace: WorkspaceAPI;
   readonly util: UtilAPI;
   readonly ease: EaseAPI;
+  /** Pure helpers are sandbox-safe; methods that inspect live layers require full access. */
   readonly space3d: Space3DAPI;
+  /** Requires the full-access permission for Store extensions. */
   readonly services: ServicesAPI;
   readonly storage: StorageAPI;
   readonly events: EventsAPI;
   readonly extensions: ExtensionsAPI;
+  /** Values the user entered for this extension's declared `vars`. See VarsAPI. */
+  readonly vars: VarsAPI;
+  /** Requires the full-access permission for Store extensions. */
   readonly host: HostAPI;
 
   /** Shorthand for events.on. */

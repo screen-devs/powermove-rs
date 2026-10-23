@@ -1,5 +1,6 @@
 /* Ported from js/core/util.js — behavior-preserving. */
 import type { PMRegistry } from '../registry';
+import { bridge as hostBridge } from '../../kernel/bridge';
 
 export function install(PM: PMRegistry): void {
 /* Powermove — util: dom, bus, math, time, persistence. */
@@ -75,6 +76,8 @@ PM.icon = (name: any) => {
 };
 /* Phosphor Icons 2.1.1, regular weight. MIT licensed. */
 PM.ICONS = {
+  // Phosphor arrows-out-simple, regular: shared aspect-ratio control glyph.
+  aspectRatio: '<path d="M216,48V96a8,8,0,0,1-16,0V67.31l-50.34,50.35a8,8,0,0,1-11.32-11.32L188.69,56H160a8,8,0,0,1,0-16h48A8,8,0,0,1,216,48ZM106.34,138.34,56,188.69V160a8,8,0,0,0-16,0v48a8,8,0,0,0,8,8H96a8,8,0,0,0,0-16H67.31l50.35-50.34a8,8,0,0,0-11.32-11.32Z"/>',
   music: '<g fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"><path d="M56 128v0m0-16v32m36-64v96m36-128v160m36-128v96m36-64v32"/></g>',
   film: '<g fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"><rect x="32" y="40" width="192" height="176" rx="16"/><path d="M72 40v176m112-176v176M32 88h40m-40 80h40m112-80h40m-40 80h40m-116-68 48 28-48 28z"/></g>',
   image: '<g fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"><rect x="32" y="40" width="192" height="176" rx="16"/><circle cx="92" cy="92" r="16"/><path d="m32 176 56-48 40 32 40-48 56 64"/></g>',
@@ -85,6 +88,7 @@ PM.ICONS = {
   timeline: '<g fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"><path d="M40 32v192m-16-56h16m-16-80h16"/><rect x="72" y="48" width="144" height="32" rx="8"/><rect x="72" y="112" width="88" height="32" rx="8"/><rect x="112" y="176" width="104" height="32" rx="8"/></g>',
   tools: '<g fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"><path d="m152 48 32 32 40-40a64 64 0 0 1-80 80L64 200a24 24 0 0 1-34-34l80-80a64 64 0 0 1 80-80z"/></g>',
   dot: '<path d="M140,128a12,12,0,1,1-12-12A12,12,0,0,1,140,128Z"/>',
+  download: '<g fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"><path d="M128 32v128m-48-48 48 48 48-48M48 176v40h160v-40"/></g>',
   missing: '<path d="M140,180a12,12,0,1,1-12-12A12,12,0,0,1,140,180ZM128,72c-22.06,0-40,16.15-40,36v4a8,8,0,0,0,16,0v-4c0-11,10.77-20,24-20s24,9,24,20-10.77,20-24,20a8,8,0,0,0-8,8v8a8,8,0,0,0,16,0v-.72c18.24-3.35,32-17.9,32-35.28C168,88.15,150.06,72,128,72Zm104,56A104,104,0,1,1,128,24,104.11,104.11,0,0,1,232,128Zm-16,0a88,88,0,1,0-88,88A88.1,88.1,0,0,0,216,128Z"/>',
   play: '<path d="M232.4,114.49,88.32,26.35a16,16,0,0,0-16.2-.3A15.86,15.86,0,0,0,64,39.87V216.13A15.94,15.94,0,0,0,80,232a16.07,16.07,0,0,0,8.36-2.35L232.4,141.51a15.81,15.81,0,0,0,0-27ZM80,215.94V40l143.83,88Z"/>',
   pause: '<path d="M200,32H160a16,16,0,0,0-16,16V208a16,16,0,0,0,16,16h40a16,16,0,0,0,16-16V48A16,16,0,0,0,200,32Zm0,176H160V48h40ZM96,32H56A16,16,0,0,0,40,48V208a16,16,0,0,0,16,16H96a16,16,0,0,0,16-16V48A16,16,0,0,0,96,32Zm0,176H56V48H96Z"/>',
@@ -108,6 +112,11 @@ PM.ICONS = {
   more: '<path d="M140,128a12,12,0,1,1-12-12A12,12,0,0,1,140,128Zm56-12a12,12,0,1,0,12,12A12,12,0,0,0,196,116ZM60,116a12,12,0,1,0,12,12A12,12,0,0,0,60,116Z"/>',
   chev: '<path d="M181.66,133.66l-80,80a8,8,0,0,1-11.32-11.32L164.69,128,90.34,53.66a8,8,0,0,1,11.32-11.32l80,80A8,8,0,0,1,181.66,133.66Z"/>',
   chevD: '<path d="M213.66,101.66l-80,80a8,8,0,0,1-11.32,0l-80-80A8,8,0,0,1,53.66,90.34L128,164.69l74.34-74.35a8,8,0,0,1,11.32,11.32Z"/>',
+  // Phosphor warning, regular: an alert an extension raised, where the editor
+  // itself is intact — told apart from the failure marker by its shape.
+  caution: '<path d="M236.8,188.09,149.35,36.22h0a24.76,24.76,0,0,0-42.7,0L19.2,188.09a23.51,23.51,0,0,0,0,23.72A24.35,24.35,0,0,0,40.55,224h174.9a24.35,24.35,0,0,0,21.33-12.19A23.51,23.51,0,0,0,236.8,188.09ZM222.93,203.8a8.5,8.5,0,0,1-7.48,4.2H40.55a8.5,8.5,0,0,1-7.48-4.2,7.59,7.59,0,0,1,0-7.72L120.52,44.21a8.75,8.75,0,0,1,15,0l87.45,151.87A7.59,7.59,0,0,1,222.93,203.8ZM120,144V104a8,8,0,0,1,16,0v40a8,8,0,0,1-16,0Zm20,36a12,12,0,1,1-12-12A12,12,0,0,1,140,180Z"/>',
+  // Phosphor warning-circle, regular: the shared marker for a failed operation.
+  warning: '<path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm0,192a88,88,0,1,1,88-88A88.1,88.1,0,0,1,128,216Zm-8-80V80a8,8,0,0,1,16,0v56a8,8,0,0,1-16,0Zm20,36a12,12,0,1,1-12-12A12,12,0,0,1,140,172Z"/>',
   eye: '<path d="M247.31,124.76c-.35-.79-8.82-19.58-27.65-38.41C194.57,61.26,162.88,48,128,48S61.43,61.26,36.34,86.35C17.51,105.18,9,124,8.69,124.76a8,8,0,0,0,0,6.5c.35.79,8.82,19.57,27.65,38.4C61.43,194.74,93.12,208,128,208s66.57-13.26,91.66-38.34c18.83-18.83,27.3-37.61,27.65-38.4A8,8,0,0,0,247.31,124.76ZM128,192c-30.78,0-57.67-11.19-79.93-33.25A133.47,133.47,0,0,1,25,128,133.33,133.33,0,0,1,48.07,97.25C70.33,75.19,97.22,64,128,64s57.67,11.19,79.93,33.25A133.46,133.46,0,0,1,231.05,128C223.84,141.46,192.43,192,128,192Zm0-112a48,48,0,1,0,48,48A48.05,48.05,0,0,0,128,80Zm0,80a32,32,0,1,1,32-32A32,32,0,0,1,128,160Z"/>',
   lock: '<path d="M208,80H176V56a48,48,0,0,0-96,0V80H48A16,16,0,0,0,32,96V208a16,16,0,0,0,16,16H208a16,16,0,0,0,16-16V96A16,16,0,0,0,208,80ZM96,56a32,32,0,0,1,64,0V80H96ZM208,208H48V96H208V208Zm-68-56a12,12,0,1,1-12-12A12,12,0,0,1,140,152Z"/>',
   link: '<path d="M240,88.23a54.43,54.43,0,0,1-16,37L189.25,160a54.27,54.27,0,0,1-38.63,16h-.05A54.63,54.63,0,0,1,96,119.84a8,8,0,0,1,16,.45A38.62,38.62,0,0,0,150.58,160h0a38.39,38.39,0,0,0,27.31-11.31l34.75-34.75a38.63,38.63,0,0,0-54.63-54.63l-11,11A8,8,0,0,1,135.7,59l11-11A54.65,54.65,0,0,1,224,48,54.86,54.86,0,0,1,240,88.23ZM109,185.66l-11,11A38.41,38.41,0,0,1,70.6,208h0a38.63,38.63,0,0,1-27.29-65.94L78,107.31A38.63,38.63,0,0,1,144,135.71a8,8,0,0,0,16,.45A54.86,54.86,0,0,0,144,96a54.65,54.65,0,0,0-77.27,0L32,130.75A54.62,54.62,0,0,0,70.56,224h0a54.28,54.28,0,0,0,38.64-16l11-11A8,8,0,0,0,109,185.66Z"/>',
@@ -131,9 +140,13 @@ PM.ICONS = {
   bezier: '<g fill="none" stroke="currentColor" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"><path d="M40 200C40 120 136 56 216 56"/><path opacity=".58" d="M40 200V120M216 56H136"/><circle cx="40" cy="120" r="9" fill="var(--bg-panel, #111)"/><circle cx="136" cy="56" r="9" fill="var(--bg-panel, #111)"/><path fill="currentColor" stroke="none" d="m40 184 16 16-16 16-16-16Zm176-144 16 16-16 16-16-16Z"/></g>',
   gear: '<path d="M128,80a48,48,0,1,0,48,48A48.05,48.05,0,0,0,128,80Zm0,80a32,32,0,1,1,32-32A32,32,0,0,1,128,160Zm88-29.84q.06-2.16,0-4.32l14.92-18.64a8,8,0,0,0,1.48-7.06,107.21,107.21,0,0,0-10.88-26.25,8,8,0,0,0-6-3.93l-23.72-2.64q-1.48-1.56-3-3L186,40.54a8,8,0,0,0-3.94-6,107.71,107.71,0,0,0-26.25-10.87,8,8,0,0,0-7.06,1.49L130.16,40Q128,40,125.84,40L107.2,25.11a8,8,0,0,0-7.06-1.48A107.6,107.6,0,0,0,73.89,34.51a8,8,0,0,0-3.93,6L67.32,64.27q-1.56,1.49-3,3L40.54,70a8,8,0,0,0-6,3.94,107.71,107.71,0,0,0-10.87,26.25,8,8,0,0,0,1.49,7.06L40,125.84Q40,128,40,130.16L25.11,148.8a8,8,0,0,0-1.48,7.06,107.21,107.21,0,0,0,10.88,26.25,8,8,0,0,0,6,3.93l23.72,2.64q1.49,1.56,3,3L70,215.46a8,8,0,0,0,3.94,6,107.71,107.71,0,0,0,26.25,10.87,8,8,0,0,0,7.06-1.49L125.84,216q2.16.06,4.32,0l18.64,14.92a8,8,0,0,0,7.06,1.48,107.21,107.21,0,0,0,26.25-10.88,8,8,0,0,0,3.93-6l2.64-23.72q1.56-1.48,3-3L215.46,186a8,8,0,0,0,6-3.94,107.71,107.71,0,0,0,10.87-26.25,8,8,0,0,0-1.49-7.06Zm-16.1-6.5a73.93,73.93,0,0,1,0,8.68,8,8,0,0,0,1.74,5.48l14.19,17.73a91.57,91.57,0,0,1-6.23,15L187,173.11a8,8,0,0,0-5.1,2.64,74.11,74.11,0,0,1-6.14,6.14,8,8,0,0,0-2.64,5.1l-2.51,22.58a91.32,91.32,0,0,1-15,6.23l-17.74-14.19a8,8,0,0,0-5-1.75h-.48a73.93,73.93,0,0,1-8.68,0,8,8,0,0,0-5.48,1.74L100.45,215.8a91.57,91.57,0,0,1-15-6.23L82.89,187a8,8,0,0,0-2.64-5.1,74.11,74.11,0,0,1-6.14-6.14,8,8,0,0,0-5.1-2.64L46.43,170.6a91.32,91.32,0,0,1-6.23-15l14.19-17.74a8,8,0,0,0,1.74-5.48,73.93,73.93,0,0,1,0-8.68,8,8,0,0,0-1.74-5.48L40.2,100.45a91.57,91.57,0,0,1,6.23-15L69,82.89a8,8,0,0,0,5.1-2.64,74.11,74.11,0,0,1,6.14-6.14A8,8,0,0,0,82.89,69L85.4,46.43a91.32,91.32,0,0,1,15-6.23l17.74,14.19a8,8,0,0,0,5.48,1.74,73.93,73.93,0,0,1,8.68,0,8,8,0,0,0,5.48-1.74L155.55,40.2a91.57,91.57,0,0,1,15,6.23L173.11,69a8,8,0,0,0,2.64,5.1,74.11,74.11,0,0,1,6.14,6.14,8,8,0,0,0,5.1,2.64l22.58,2.51a91.32,91.32,0,0,1,6.23,15l-14.19,17.74A8,8,0,0,0,199.87,123.66Z"/>',
   sparkle: '<path d="M128,16a6,6,0,0,1,5.9,4.9C143.6,72.4,159,96,183.5,105.5c14.3,5.6,32.1,9.9,51.6,16.6a6,6,0,0,1,0,11.8c-19.5,6.7-37.3,11-51.6,16.6C159,160,143.6,183.6,133.9,235.1a6,6,0,0,1-11.8,0C112.4,183.6,97,160,72.5,150.5c-14.3-5.6-32.1-9.9-51.6-16.6a6,6,0,0,1,0-11.8c19.5-6.7,37.3-11,51.6-16.6C97,96,112.4,72.4,122.1,20.9A6,6,0,0,1,128,16Z"/>',
+  // Phosphor basket, regular: the Store's row in the home sidebar.
+  basket: '<path d="M136,120v56a8,8,0,0,1-16,0V120a8,8,0,0,1,16,0ZM239.86,98.11,226,202.12A16,16,0,0,1,210.13,216H45.87A16,16,0,0,1,30,202.12l-13.87-104A16,16,0,0,1,32,80H68.37L122,18.73a8,8,0,0,1,12,0L187.63,80H224a16,16,0,0,1,15.85,18.11ZM89.63,80h76.74L128,36.15ZM224,96H32L45.87,200H210.13Zm-51.16,23.2-5.6,56A8,8,0,0,0,174.4,184a7.44,7.44,0,0,0,.81,0,8,8,0,0,0,7.95-7.2l5.6-56a8,8,0,0,0-15.92-1.6Zm-89.68,0a8,8,0,0,0-15.92,1.6l5.6,56a8,8,0,0,0,8,7.2,7.44,7.44,0,0,0,.81,0,8,8,0,0,0,7.16-8.76Z"/>',
   sun: '<path d="M120,40V16a8,8,0,0,1,16,0V40a8,8,0,0,1-16,0Zm72,88a64,64,0,1,1-64-64A64.07,64.07,0,0,1,192,128Zm-16,0a48,48,0,1,0-48,48A48.05,48.05,0,0,0,176,128ZM58.34,69.66A8,8,0,0,0,69.66,58.34l-16-16A8,8,0,0,0,42.34,53.66Zm0,116.68-16,16a8,8,0,0,0,11.32,11.32l16-16a8,8,0,0,0-11.32-11.32ZM192,72a8,8,0,0,0,5.66-2.34l16-16a8,8,0,0,0-11.32-11.32l-16,16A8,8,0,0,0,192,72Zm5.66,114.34a8,8,0,0,0-11.32,11.32l16,16a8,8,0,0,0,11.32-11.32ZM48,128a8,8,0,0,0-8-8H16a8,8,0,0,0,0,16H40A8,8,0,0,0,48,128Zm80,80a8,8,0,0,0-8,8v24a8,8,0,0,0,16,0V216A8,8,0,0,0,128,208Zm112-88H216a8,8,0,0,0,0,16h24a8,8,0,0,0,0-16Z"/>',
   moon: '<path d="M233.54,142.23a8,8,0,0,0-8-2,88.08,88.08,0,0,1-109.8-109.8,8,8,0,0,0-10-10,104.84,104.84,0,0,0-52.91,37A104,104,0,0,0,136,224a103.09,103.09,0,0,0,62.52-20.88,104.84,104.84,0,0,0,37-52.91A8,8,0,0,0,233.54,142.23ZM188.9,190.34A88,88,0,0,1,65.66,67.11a89,89,0,0,1,31.4-26A106,106,0,0,0,96,56,104.11,104.11,0,0,0,200,160a106,106,0,0,0,14.92-1.06A89,89,0,0,1,188.9,190.34Z"/>',
   eyeoff: '<path d="M53.92,34.62A8,8,0,1,0,42.08,45.38L61.32,66.55C25,88.84,9.38,123.2,8.69,124.76a8,8,0,0,0,0,6.5c.35.79,8.82,19.57,27.65,38.4C61.43,194.74,93.12,208,128,208a127.11,127.11,0,0,0,52.07-10.83l22,24.21a8,8,0,1,0,11.84-10.76Zm47.33,75.84,41.67,45.85a32,32,0,0,1-41.67-45.85ZM128,192c-30.78,0-57.67-11.19-79.93-33.25A133.16,133.16,0,0,1,25,128c4.69-8.79,19.66-33.39,47.35-49.38l18,19.75a48,48,0,0,0,63.66,70l14.73,16.2A112,112,0,0,1,128,192Zm6-95.43a8,8,0,0,1,3-15.72,48.16,48.16,0,0,1,38.77,42.64,8,8,0,0,1-7.22,8.71,6.39,6.39,0,0,1-.75,0,8,8,0,0,1-8-7.26A32.09,32.09,0,0,0,134,96.57Zm113.28,34.69c-.42.94-10.55,23.37-33.36,43.8a8,8,0,1,1-10.67-11.92A132.77,132.77,0,0,0,231.05,128a133.15,133.15,0,0,0-23.12-30.77C185.67,75.19,158.78,64,128,64a118.37,118.37,0,0,0-19.36,1.57A8,8,0,1,1,106,49.79,134,134,0,0,1,128,48c34.88,0,66.57,13.26,91.66,38.35,18.83,18.83,27.3,37.62,27.65,38.41A8,8,0,0,1,247.31,131.26Z"/>',
+  dopeSheet: '<path fill="currentColor" d="m68 40 36 36-36 36-36-36Zm120 0 36 36-36 36-36-36ZM104 144l36 36-36 36-36-36Zm104 0 32 32-32 32-32-32Z"/>',
+  dopeGraph: '<g fill="none" stroke="currentColor" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"><path fill="currentColor" stroke="none" d="m68 32 34 34-34 34-34-34Zm120 0 34 34-34 34-34-34Z"/><path d="M28 220C92 220 100 140 148 140s52 36 80 0"/></g>',
   diamond: '<path d="M235.33,116.72,139.28,20.66a16,16,0,0,0-22.56,0l-96,96.06a16,16,0,0,0,0,22.56l96.05,96.06h0a16,16,0,0,0,22.56,0l96.05-96.06a16,16,0,0,0,0-22.56ZM128,224h0L32,128,128,32,224,128Z"/>',
   enter: '<path d="M184,104v32a8,8,0,0,1-8,8H99.31l10.35,10.34a8,8,0,0,1-11.32,11.32l-24-24a8,8,0,0,1,0-11.32l24-24a8,8,0,0,1,11.32,11.32L99.31,128H168V104a8,8,0,0,1,16,0Zm48-48V200a16,16,0,0,1-16,16H40a16,16,0,0,1-16-16V56A16,16,0,0,1,40,40H216A16,16,0,0,1,232,56ZM216,200V56H40V200H216Z"/>',
   return: '<path d="M216,48a8,8,0,0,0-8,8v56a24,24,0,0,1-24,24H67.31l34.35-34.34a8,8,0,0,0-11.32-11.32l-48,48a8,8,0,0,0,0,11.32l48,48a8,8,0,0,0,11.32-11.32L67.31,152H184a40,40,0,0,0,40-40V56A8,8,0,0,0,216,48Z"/>',
@@ -141,9 +154,16 @@ PM.ICONS = {
   copy: '<g fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"><rect x="88" y="88" width="136" height="136" rx="12"/><path d="M168 88V44a12 12 0 0 0-12-12H44a12 12 0 0 0-12 12v112a12 12 0 0 0 12 12h44"/></g>',
   cube: '<g fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"><path d="M128 24 40 72v112l88 48 88-48V72z"/><path d="M40 72l88 48 88-48M128 120v112"/></g>',
   stack: '<g fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"><path d="M128 40 32 88l96 48 96-48z"/><path d="M32 136l96 48 96-48M32 184l96 48 96-48"/></g>',
+  mask: '<g fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"><path d="M40 64h96a24 24 0 0 1 24 24v96a24 24 0 0 1-24 24H40a24 24 0 0 1-24-24V88a24 24 0 0 1 24-24Z"/><path d="M88 40h96a24 24 0 0 1 24 24v96a24 24 0 0 1-24 24h-24"/></g>',
   scissors: '<g fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"><circle cx="64" cy="72" r="32"/><circle cx="64" cy="184" r="32"/><path d="M92 90l132 78M92 166l132-78"/></g>',
   speaker: '<g fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"><path d="M80 96H40a8 8 0 0 0-8 8v48a8 8 0 0 0 8 8h40l64 48V48zM184 104a34 34 0 0 1 0 48M208 80a68 68 0 0 1 0 96"/></g>',
   headphones: '<g fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"><path d="M40 176v-40a88 88 0 0 1 176 0v40"/><rect x="40" y="144" width="48" height="72" rx="12"/><rect x="168" y="144" width="48" height="72" rx="12"/></g>',
+  // Phosphor user-circle, regular: the signed-out account row.
+  userCircle: '<path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24ZM74.08,197.5a64,64,0,0,1,107.84,0,87.83,87.83,0,0,1-107.84,0ZM96,120a32,32,0,1,1,32,32A32,32,0,0,1,96,120Zm97.76,66.41a79.66,79.66,0,0,0-36.06-28.75,48,48,0,1,0-59.4,0,79.66,79.66,0,0,0-36.06,28.75,88,88,0,1,1,131.52,0Z"/>',
+  // Phosphor brand logos, fill weight: sign-in providers.
+  apple: '<path d="M128.23,30A40,40,0,0,1,167,0h1a8,8,0,0,1,0,16h-1a24,24,0,0,0-23.24,18,8,8,0,1,1-15.5-4ZM223.3,169.59a8.07,8.07,0,0,0-2.8-3.4C203.53,154.53,200,134.64,200,120c0-17.67,13.47-33.06,21.5-40.67a8,8,0,0,0,0-11.62C208.82,55.74,187.82,48,168,48a72.23,72.23,0,0,0-40,12.13,71.56,71.56,0,0,0-90.71,9.09A74.63,74.63,0,0,0,16,123.4a127,127,0,0,0,40.14,89.73A39.8,39.8,0,0,0,83.59,224h87.68a39.84,39.84,0,0,0,29.12-12.57,125,125,0,0,0,17.82-24.6C225.23,174,224.33,172,223.3,169.59Z"/>',
+  google: '<path d="M128,24A104,104,0,1,0,232,128,104,104,0,0,0,128,24Zm0,184A80,80,0,1,1,181.34,68.37a8,8,0,0,1-10.67,11.92A64,64,0,1,0,191.5,136H128a8,8,0,0,1,0-16h72a8,8,0,0,1,8,8A80.09,80.09,0,0,1,128,208Z"/>',
+  github: '<path d="M216,104v8a56.06,56.06,0,0,1-48.44,55.47A39.8,39.8,0,0,1,176,192v40a8,8,0,0,1-8,8H104a8,8,0,0,1-8-8V216H72a40,40,0,0,1-40-40A24,24,0,0,0,8,152a8,8,0,0,1,0-16,40,40,0,0,1,40,40,24,24,0,0,0,24,24H96v-8a39.8,39.8,0,0,1,8.44-24.53A56.06,56.06,0,0,1,56,112v-8a58.14,58.14,0,0,1,7.69-28.32A59.78,59.78,0,0,1,69.07,28,8,8,0,0,1,76,24a59.75,59.75,0,0,1,48,24h24a59.75,59.75,0,0,1,48-24,8,8,0,0,1,6.93,4,59.74,59.74,0,0,1,5.37,47.68A58,58,0,0,1,216,104Z"/>',
 };
 
 /* ── math ──────────────────────────────────────────────── */
@@ -153,10 +173,19 @@ const round = (v: any, n = 2) => { const p = 10 ** n; return Math.round(v * p) /
 PM.clamp = clamp; PM.lerp = lerp; PM.round = round;
 PM.uid = (p = 'l') => p + Math.random().toString(36).slice(2, 9);
 
+/* Colours are #RGB, #RRGGBB, or with alpha #RGBA / #RRGGBBAA. Channels are
+   read by position so eight digits never overflow into the wrong channel. */
+const hexDigits = (hex: any): string => {
+  const s = String(hex ?? '').replace('#', '');
+  return s.length === 3 || s.length === 4 ? s.split('').map(c => c + c).join('') : s;
+};
 PM.hex2rgb = (hex: any) => {
-  const s = hex.replace('#', '');
-  const n = parseInt(s.length === 3 ? s.split('').map((c: any) => c + c).join('') : s, 16);
-  return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+  const s = hexDigits(hex);
+  return [0, 2, 4].map(i => (parseInt(s.slice(i, i + 2), 16) || 0) / 255);
+};
+PM.hexAlpha = (hex: any) => {
+  const s = hexDigits(hex);
+  return s.length === 8 ? (parseInt(s.slice(6, 8), 16) || 0) / 255 : 1;
 };
 PM.rgb2hex = (r: any, g: any, b: any) => '#' + [r, g, b].map(v => clamp(Math.round(v * 255), 0, 255).toString(16).padStart(2, '0')).join('');
 
@@ -248,7 +277,6 @@ PM.drag = (e: any, { move, up, cancel, cursor, infinite = false }: any) => {
     window.removeEventListener('pointermove', mv, true);
     window.removeEventListener('pointerup', fin, true);
     window.removeEventListener('pointercancel', pc, true);
-    captureEl?.removeEventListener?.('lostpointercapture', lostCapture);
     window.removeEventListener('mousemove', lockMove, true);
     window.removeEventListener('mouseup', fin, true);
     window.removeEventListener('blur', pc);
@@ -265,7 +293,7 @@ PM.drag = (e: any, { move, up, cancel, cursor, infinite = false }: any) => {
     dx = ev.clientX - sx; dy = ev.clientY - sy;
     move?.(dx, dy, ev);
     // Wait for a real drag so clicking still enters the numeric editor.
-    if (!done && !requested && lockEl?.requestPointerLock && Math.abs(dx) >= 3) {
+    if (!done && !requested && lockEl?.requestPointerLock && Math.hypot(dx, dy) >= 3) {
       requested = true;
       try {
         Promise.resolve(lockEl.requestPointerLock()).then(() => {
@@ -280,9 +308,10 @@ PM.drag = (e: any, { move, up, cancel, cursor, infinite = false }: any) => {
     if (stop() && up) up(finalX, finalY, ev);
   };
   const pc = () => { if (stop() && cancel) cancel(); };
-  const lostCapture = () => { if (!requested) pc(); };
   try { captureEl?.setPointerCapture(pointerId); } catch { }
-  captureEl?.addEventListener?.('lostpointercapture', lostCapture);
+  /* Capture can be lost when a live panel reparents its canvas. That is not a
+     cancelled gesture: the window listeners still receive its moves/release.
+     Rolling back here makes a valid canvas move snap back to its old position. */
   /* WKWebView can stop bubbling pointer movement while a canvas owns the
      gesture. Capture-phase listeners plus explicit pointer capture keep direct
      manipulation alive until the matching up/cancel event. */
@@ -290,8 +319,8 @@ PM.drag = (e: any, { move, up, cancel, cursor, infinite = false }: any) => {
     doc.addEventListener?.('pointerlockchange', lockChange);
     window.addEventListener('mousemove', lockMove, true);
     window.addEventListener('mouseup', fin, true);
-    window.addEventListener('blur', pc);
   }
+  window.addEventListener('blur', pc);
   window.addEventListener('pointermove', mv, true);
   window.addEventListener('pointerup', fin, true);
   window.addEventListener('pointercancel', pc, true);
@@ -299,6 +328,18 @@ PM.drag = (e: any, { move, up, cancel, cursor, infinite = false }: any) => {
 };
 
 PM.download = (blob: any, name: any) => {
+  const upload = hostBridge()?.fileUpload;
+  if (upload) return (async () => {
+    const token = await upload.begin(blob.size);
+    try {
+      for (let offset = 0; offset < blob.size; offset += 1024 * 1024) {
+        await upload.chunk(token, new Uint8Array(await blob.slice(offset, offset + 1024 * 1024).arrayBuffer()));
+      }
+      const result = await upload.finish(token, { name: String(name || 'powermove.bin') });
+      if (!result.ok && !result.cancelled) throw new Error(result.error || 'Save failed');
+      return result;
+    } finally { await upload.abort(token).catch(() => undefined); }
+  })();
   /* Native WKWebView has no browser download shelf — route through the AppKit save bridge. */
   const bridge = (window as any).webkit && (window as any).webkit.messageHandlers && (window as any).webkit.messageHandlers.saveFile;
   if (bridge) {

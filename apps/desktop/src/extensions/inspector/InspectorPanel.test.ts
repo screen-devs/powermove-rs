@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 import { flushSync, mount, tick, unmount } from 'svelte';
+import { createSubscriber } from 'svelte/reactivity';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ControlsAPI, InspectorService, PowermoveAPI, ShaderHooks } from 'powermove';
 import type { InspectorRuntimeService } from './context';
@@ -180,6 +181,7 @@ function apiFor(runtime: InspectorTestBackend, register = vi.fn()): PowermoveAPI
       drag: runtime.drag ?? vi.fn(), beginParentPick: runtime.beginParentPick ?? vi.fn(),
       openShaderEditor: runtime.openShaderEditor ?? vi.fn(), closeMenus: runtime.closeMenus ?? vi.fn()
     },
+    inspector: { sections: () => [] },
     media: { fonts: runtime.Fonts ?? { options: (value: string) => [value], ensure: vi.fn() } },
     util: { round: runtime.round ?? ((value: number) => value), clamp: runtime.clamp ?? ((value: number, min: number, max: number) => Math.max(min, Math.min(max, value))), uid: runtime.uid ?? (() => 'test-id') },
     services: {
@@ -278,7 +280,8 @@ function setup(
     TYPE_META: { solid: { label: 'Solid' }, text: { label: 'Text' }, shape: { label: 'Shape' }, null: { label: 'Null' }, group: { label: 'Group', transform: true } },
     FX: {
       blur: { label: 'Gaussian Blur', group: 'Blur', params: [{ k: 'amount', label: 'Amount', step: 1, min: 0, max: 100 }] },
-      duotone: { label: 'Duotone', group: 'Color', params: [{ k: 'shadow', label: 'Shadow', type: 'color' }] }
+      duotone: { label: 'Duotone', group: 'Color', params: [{ k: 'shadow', label: 'Shadow', type: 'color' }] },
+      gradient: { label: 'Gradient Ramp', group: 'Generate', params: [{ k: 'radial', label: 'Radial', type: 'toggle' }] }
     },
     ICONS: Object.fromEntries(['layers', 'plus', 'clock', 'diamond', 'chev', 'eye', 'x'].map((name) => [name, '<path/>'])),
     sel: { layers: [...selected], keys: [], chan: null },
@@ -394,6 +397,90 @@ afterEach(async () => {
 });
 
 describe('InspectorPanel', () => {
+  it('limits playback property evaluation and shows the exact stopped value immediately', () => {
+    const { api } = setup([layer('L0')], ['L0']);
+    let playing = true, time = 0, now = 0;
+    api.transport.playing = () => playing;
+    api.transport.time = () => time;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const evaluate = vi.spyOn(api.anim, 'ev').mockImplementation((candidate, channel, at) =>
+      channel === 'rotation' ? at * 10 : ((candidate as TestLayer).p[channel]?.v ?? null));
+    for (let frame = 1; frame <= 120; frame++) {
+      time = frame / 120; now = frame * 1000 / 120;
+      api.events.emit('time', time);
+      flushSync();
+    }
+    const rotationEvaluations = evaluate.mock.calls.filter(call => call[1] === 'rotation').length;
+    expect(rotationEvaluations).toBeGreaterThanOrEqual(12);
+    expect(rotationEvaluations).toBeLessThanOrEqual(16);
+    // Pointer editing must start from the live value between readout ticks.
+    time = 2;
+    labelledSpinbutton('Rotation').dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0 }));
+    expect(evaluate.mock.calls.filter(call => call[1] === 'rotation').at(-1)?.[2]).toBe(2);
+    playing = false; time = .975;
+    api.events.emit('transport', { playing });
+    flushSync();
+    expect(labelledSpinbutton('Rotation').value).toBe('9.8');
+    time = .2;
+    api.events.emit('time', time);
+    flushSync();
+    expect(labelledSpinbutton('Rotation').value).toBe('2');
+  });
+
+  it('checks a multi-selection for mixed values on the readout clock, never on a playback frame', () => {
+    const { api, runtime } = setup([layer('L0', 50), layer('L1', 80)]);
+    let time = 0, now = 0;
+    // The host's transport.time is reactive: a reader in $derived re-runs on every `time` event.
+    const frames = createSubscriber(update => { const off = api.events.on('time', update); return () => off.dispose(); });
+    api.transport.time = () => { frames(); return time; };
+    api.transport.playing = () => true;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    api.events.emit('transport', { playing: true });
+    flushSync();
+    const evaluate = vi.mocked(runtime.evP);
+    evaluate.mockClear();
+    for (let frame = 1; frame <= 120; frame++) {
+      time = frame / 120; now = frame * 1000 / 120;
+      api.events.emit('time', time);
+      flushSync();
+    }
+    // Frames alone re-run nothing that evaluates the selection...
+    expect(evaluate).not.toHaveBeenCalled();
+    // ...the controls' readout clock (15 Hz while playing) does, once per field.
+    transport.time = 1;
+    flushSync();
+    expect(evaluate).toHaveBeenCalled();
+  });
+
+  it('updates animated values on time events without rebuilding parenting choices', () => {
+    const candidates = Array.from({ length: 40 }, (_, i) => layer(`L${i}`));
+    const { api, runtime } = setup(candidates, ['L0']);
+    let time = 0;
+    api.transport.time = () => time;
+    vi.spyOn(api.anim, 'ev').mockImplementation((candidate, channel, at) =>
+      channel === 'rotation' ? at * 10 : ((candidate as TestLayer).p[channel]?.v ?? null));
+    const cycles = vi.mocked(runtime.wouldCycle);
+    cycles.mockClear();
+    for (time of [1, 2, .5, 0]) {
+      api.events.emit('time', time);
+      flushSync();
+      expect(labelledSpinbutton('Rotation').value).toBe(String(time * 10));
+    }
+    expect(cycles).not.toHaveBeenCalled();
+
+    candidates[1]!.name = 'Renamed parent';
+    api.events.emit('project:changed', { kind: 'structure' });
+    flushSync();
+    expect(cycles).toHaveBeenCalled();
+    expect([...labelledSelect('Parent').options].some(option => option.textContent === 'Renamed parent')).toBe(true);
+    cycles.mockClear();
+    runtime.sel.layers = ['L1'];
+    api.events.emit('selection', runtime.sel);
+    flushSync();
+    expect(target.querySelector('[data-inspector-layer="L1"]')).not.toBeNull();
+    expect(cycles).toHaveBeenCalled();
+  });
+
   it('exposes the compact footprint of a transparent null object', () => {
     const candidate = layer('N'); candidate.type = 'null'; candidate.name = 'Null';
     candidate.d = { color: '#6A6A70', w: 100, h: 100, radius: 0 };
@@ -425,8 +512,8 @@ describe('InspectorPanel', () => {
     expect(headings).toContain('Masks');
     expect(target.querySelector('[aria-label="Add effect"]')).not.toBeNull();
     expect(labelledSelect('Blend mode')).not.toBeNull();
-    expect([...target.querySelectorAll('button[aria-labelledby]')].some((button) =>
-      document.getElementById(button.getAttribute('aria-labelledby')!)?.textContent?.trim() === 'Motion blur'
+    expect([...target.querySelectorAll('button[aria-labelledby], [role="radiogroup"][aria-labelledby]')].some((control) =>
+      document.getElementById(control.getAttribute('aria-labelledby')!)?.textContent?.trim() === 'Motion blur'
     )).toBe(true);
     expect(labelledSelect('Track matte')).not.toBeNull();
 
@@ -566,7 +653,10 @@ describe('InspectorPanel', () => {
     expect(row.getAttribute('aria-label')).toBe('Scale property');
     expect(row.querySelectorAll('[role="spinbutton"]')).toHaveLength(2);
     expect(target.querySelector('[data-channel="scale.y"]')).toBeNull();
-    const link = row.querySelector<HTMLButtonElement>('[aria-label="Link Scale X and Y"]')!;
+    const link = row.querySelector<HTMLButtonElement>('[aria-label="Lock aspect ratio"]')!;
+    expect(link.querySelector('[data-icon="aspectRatio"]')).not.toBeNull();
+    expect(link.title).toBe('Unlock aspect ratio');
+    expect(link.getAttribute('aria-pressed')).toBe('true');
     link.click();
     expect(apply).toHaveBeenCalledExactlyOnceWith(
       { type: 'set_layer', target: 'A', patch: { scaleLinked: false } },
@@ -583,6 +673,7 @@ describe('InspectorPanel', () => {
     expect(labelledSpinbutton('Scale X').value).toBe('180%');
     expect(labelledSpinbutton('Scale Y').value).toBe('90%');
     expect(link.getAttribute('aria-pressed')).toBe('false');
+    expect(link.title).toBe('Lock aspect ratio');
     candidate.scaleLinked = true;
     bump('values');
     flushSync();
@@ -765,6 +856,41 @@ describe('InspectorPanel', () => {
     );
   });
 
+  it('reorders effects by drag and by option-arrow', () => {
+    const candidate = layer('A');
+    candidate.fx.push(
+      { id: 'fx-1', type: 'blur', on: true, p: {} },
+      { id: 'fx-2', type: 'blur', on: true, p: {} },
+      { id: 'fx-3', type: 'blur', on: true, p: {} }
+    );
+    const { apply } = setup([candidate], ['A']);
+    const row = (id: string) => target.querySelector<HTMLElement>(`[data-effect-id="${id}"]`)!;
+
+    row('fx-1').dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'ArrowDown', altKey: true, bubbles: true, cancelable: true
+    }));
+    expect(apply).toHaveBeenCalledExactlyOnceWith(
+      { type: 'set_effect', target: 'A', effect: 'fx-1', patch: { index: 1 } },
+      { label: 'Reorder effect', origin: 'inspector' }
+    );
+
+    apply.mockClear();
+    const drag = (type: string, element: HTMLElement, clientY = 0) => {
+      const event = new Event(type, { bubbles: true, cancelable: true }) as DragEvent;
+      Object.defineProperty(event, 'clientY', { value: clientY });
+      element.dispatchEvent(event);
+    };
+    drag('dragstart', row('fx-3'));
+    drag('dragover', row('fx-1'), -1);
+    flushSync();
+    expect(row('fx-1').classList.contains('drop-before')).toBe(true);
+    drag('drop', row('fx-1'), -1);
+    expect(apply).toHaveBeenCalledExactlyOnceWith(
+      { type: 'set_effect', target: 'A', effect: 'fx-3', patch: { index: 0 } },
+      { label: 'Reorder effect', origin: 'inspector' }
+    );
+  });
+
   it('selects multiple effects and routes copy, paste, and delete before layer shortcuts', () => {
     const candidate = layer('A');
     const channel = (value: number, id: string) => ({
@@ -903,11 +1029,12 @@ describe('InspectorPanel', () => {
     );
   });
 
-  it('exposes direct keyframe controls for numeric and color effect parameters', () => {
+  it('exposes direct keyframe controls for numeric, color, and toggle effect parameters', () => {
     const candidate = layer('A');
     candidate.fx.push(
       { id: 'fx-blur', type: 'blur', on: true, p: { amount: { v: 5, kf: [], expr: null } } },
-      { id: 'fx-duotone', type: 'duotone', on: true, p: { shadow: { v: '#1B2A4A', kf: [], expr: null } } }
+      { id: 'fx-duotone', type: 'duotone', on: true, p: { shadow: { v: '#1B2A4A', kf: [], expr: null } } },
+      { id: 'fx-gradient', type: 'gradient', on: true, p: { radial: { v: false, kf: [], expr: null } } }
     );
     const { apply, runtime } = setup([candidate], ['A'], { fxOpen: true });
     runtime.findProp = (_layer: any, path: string) => { const [id, key] = path.split('.'); return candidate.fx.find((fx: any) => fx.id === id)?.p[key!]; };
@@ -924,6 +1051,18 @@ describe('InspectorPanel', () => {
     shadow!.click();
     expect(apply).toHaveBeenCalledWith([expect.objectContaining({type:'set_property',path:'fx-blur.amount',value:5,mode:'keyframe',time:2})],expect.objectContaining({origin:'inspector'}));
     expect(apply).toHaveBeenCalledWith([expect.objectContaining({ type: 'set_property', path: 'fx-duotone.shadow', value: '#1B2A4A', mode: 'keyframe', time: 2 })], expect.objectContaining({ origin: 'inspector' }));
+
+    /* Toggle params get a switch rather than a numeric scrubber. */
+    const radial = target.querySelector<HTMLButtonElement>('[aria-label="Add keyframe for Radial"]');
+    expect(radial).not.toBeNull();
+    const radialRow = [...target.querySelectorAll<HTMLElement>('.row')]
+      .find((row) => row.querySelector('.k')?.textContent === 'Radial');
+    apply.mockClear();
+    [...radialRow!.querySelectorAll<HTMLButtonElement>('button[role="radio"]')].find(button => button.textContent === 'On')!.click();
+    expect(apply).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'set_property', path: 'fx-gradient.radial', value: true }),
+      expect.objectContaining({ origin: 'inspector' })
+    );
   });
 
   it('uses set_effect for toggles and exposes one controlled expansion button', () => {

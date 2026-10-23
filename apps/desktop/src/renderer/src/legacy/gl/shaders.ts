@@ -11,6 +11,7 @@ precision highp float;
 in vec2 a_pos;
 uniform mat3 u_m;
 uniform vec2 u_res;
+uniform vec2 u_pxOrigin;
 uniform vec4 u_uv;           // xy = offset, zw = scale
 out vec2 v_uv;               // content space (top-left origin)
 out vec2 v_st;               // fbo space
@@ -19,7 +20,7 @@ void main(){
   v_uv = u_uv.xy + a_pos * u_uv.zw;
   v_st = vec2(a_pos.x, 1.0 - a_pos.y);
   vec3 p = u_m * vec3(a_pos, 1.0);
-  v_px = p.xy / p.z;
+  v_px = p.xy / p.z + u_pxOrigin;
   gl_Position = vec4((p.x / u_res.x) * 2.0 - p.z, p.z - (p.y / u_res.y) * 2.0, 0.0, p.z);
 }`;
 
@@ -28,6 +29,8 @@ precision highp float;
 in vec2 v_uv; in vec2 v_st; in vec2 v_px;
 uniform sampler2D u_tex;
 uniform vec2 u_res;
+uniform vec2 u_coordRes;     // full composition pixel size for cropped effects
+uniform vec2 u_pxOrigin;     // cropped viewport origin in composition pixels
 uniform vec2 u_texel;
 uniform float u_time;
 uniform float u_prog;
@@ -90,7 +93,27 @@ void main(){
   o = c * u_alpha;
 }`;
 
+// Keep interpolation in the original bitmap's UV space. Remapping in the
+// vertex shader amplifies rounding at large zooms and changes glyph edges.
+PM.FRAG_DRAW_WINDOW = PRE + `
+uniform float u_alpha;
+uniform vec4 u_sourceWindow;
+void main(){
+  vec2 uv = (v_uv * u_sourceWindow.zw - u_sourceWindow.xy) / vec2(textureSize(u_tex, 0));
+  vec4 c = texture(u_tex, uv);
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) c = vec4(0.);
+  o = c * u_alpha;
+}`;
+
 PM.FRAG_COPY = PRE + `void main(){ o = texture(u_tex, v_st); }`;
+
+// Fuse row orientation and opaque alpha into the existing RGBA8 capture pass.
+// Integer coordinates read each source pixel once without filtering neighbors.
+PM.FRAG_CAPTURE_OPAQUE = PRE + `void main(){
+  ivec2 at = ivec2(gl_FragCoord.xy);
+  at.y = textureSize(u_tex, 0).y - 1 - at.y;
+  o = vec4(texelFetch(u_tex, at, 0).rgb, 1.0);
+}`;
 
 PM.FRAG_SOLID = PRE + `uniform vec4 u_color; void main(){ o = u_color; }`;
 PM.FRAG_BACKGROUND_FILL = PRE + `

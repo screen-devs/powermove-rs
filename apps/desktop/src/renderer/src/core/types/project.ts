@@ -121,7 +121,22 @@ export interface Transition {
 /** Editable paths and text controls use the same channels as transforms. */
 export interface PathVertex { id:string; p:Record<'x'|'y'|'inX'|'inY'|'outX'|'outY',Channel<number>> }
 export interface VectorPath { id:string; name:string; parent:string|null; vertices:PathVertex[]; p:Record<string,Channel> }
-export interface TextAnimator { id:string; name:string; p:Record<string,Channel> }
+export interface TextAnimator {
+  id:string; name:string; p:Record<string,Channel>;
+  enabled?:boolean;
+  /** Absent on animators saved before selector modes: those are range selectors. */
+  mode?:'stagger'|'range'|'wave';
+  /** Older animators store the unit in a `unit` channel instead. */
+  unit?:'characters'|'words'|'lines';
+  order?:'forward'|'reverse'|'center'|'edges'|'random';
+  seed?:number;
+  /** Stagger mode: `in` settles from the animated values, `out` leaves toward them. */
+  direction?:'in'|'out';
+  easing?:string;
+  shape?:'square'|'rampUp'|'rampDown'|'triangle'|'round';
+  /** Set on split pieces so they keep their position in the source's sequence. */
+  unitOffset?:number; unitTotal?:number;
+}
 export interface TextStyleRange { id:string; start:number; end:number; p:Record<string,Channel> }
 
 export interface SolidContent {
@@ -158,6 +173,14 @@ export interface ShapeContent {
   w: number;
   h: number;
   radius: number;
+  /** Per-corner radii apply when `independentCorners` is on; a missing corner uses `radius`. */
+  independentCorners?: boolean;
+  radiusTL?: number;
+  radiusTR?: number;
+  radiusBR?: number;
+  radiusBL?: number;
+  /** Corner smoothing percentage, 0 (circular arcs) to 100. */
+  smoothing?: number;
   stroke: number;
   strokeColor: string;
   points: number;
@@ -410,4 +433,9 @@ export interface Comp {
   notes?: string;
 }
 
-export interface Project extends Comp {}
+export interface Project extends Comp {
+  /** Id of the composition open in the Timeline; the other compositions live in `comps`. */
+  compId?: string;
+  /** Name of the open composition (`name` is the project's). */
+  compName?: string;
+}

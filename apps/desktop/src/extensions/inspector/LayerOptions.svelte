@@ -18,16 +18,20 @@
   const parentingLayers = () => (api.selection.layers().includes(layer.id) ? selectedLayers() : [layer])
     .filter((item: any) => (api.model.TYPE_META as Record<string, { transform?: boolean }>)[item.type]?.transform !== false);
   const parentEdit: EditBinding = { mode:'command', label:'Parent layers', origin:'inspector', command: (parent) => parentingLayers().map((item: any) => ({ type:'set_layer', target:item.id, patch:{parent: parent == null ? null : String(parent)} })) };
-  const parentOptions = $derived<SelectOption[]>((doc.tick.structure, doc.proj, sel.layers, [
-    { v: null, label: 'None' },
-    ...api.project.get().layers.filter((candidate: any) => (api.model.TYPE_META as Record<string, { transform?: boolean }>)[candidate.type]?.transform !== false && parentingLayers().every((item: any) => item.id !== candidate.id && !api.anim.wouldCycle(item, candidate.id)))
-      .map((candidate: any) => ({v:candidate.id,label:String(candidate.name)}))
-  ]));
+  const parentOptions = $derived.by<SelectOption[]>(() => {
+    doc.tick.structure; doc.proj; sel.layers;
+    // Resolve this fixed selection once, rather than once per possible parent.
+    const children = parentingLayers();
+    return [
+      { v: null, label: 'None' },
+      ...api.project.get().layers.filter((candidate: any) => (api.model.TYPE_META as Record<string, { transform?: boolean }>)[candidate.type]?.transform !== false && children.every((item: any) => item.id !== candidate.id && !api.anim.wouldCycle(item, candidate.id)))
+        .map((candidate: any) => ({ v: candidate.id, label: String(candidate.name) }))
+    ];
+  });
 </script>
 
 <Section {api} title="Layer" />
 <Row {api} label="Solo"><ToggleField {api} {mixed} get={() => layer.solo ?? false} edit={edit('solo','Solo layer')} label="Solo layer" /></Row>
-<Row {api} label="Shy"><ToggleField {api} {mixed} get={() => layer.shy} edit={edit('shy','Shy layer')} label="Shy layer" /></Row>
 
 <Row {api} label="Visible"><ToggleField {api} {mixed} get={() => value('on')} edit={edit('visible', 'Visibility')} label="Visibility" /></Row>
 

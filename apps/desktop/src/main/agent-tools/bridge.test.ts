@@ -64,6 +64,20 @@ describe('native Powermove agent tool bridge', () => {
       fs.rm(directory, { recursive: true, force: true })));
   });
 
+  it('launches the fixed app entrypoint without requiring Electron Node mode', async () => {
+    const ipc = new FakeIpcMain();
+    const bridge = new PowermoveAgentToolBridge(ipc as any, {
+      mcpServerPath: '/resources/agent-tools/mcp-server.mjs',
+      command: '/Applications/Powermove.app/Contents/MacOS/Powermove',
+      commandArgs: ['--powermove-agent-tools']
+    });
+    bridges.push(bridge);
+    const session = await bridge.openSession({ runId: 'packaged-tools', owner: new FakeWebContents(ipc) as any, baseRevision: 0 });
+    expect(session.mcpConfig.args).toEqual(['--powermove-agent-tools']);
+    expect(session.mcpConfig.env).not.toHaveProperty('ELECTRON_RUN_AS_NODE');
+    expect(session.mcpConfig.env.POWERMOVE_AGENT_RUN_ID).toBe('packaged-tools');
+  });
+
   it('serves the shared tools through the standalone MCP shim and finalizes one history entry', async () => {
     const ipc = new FakeIpcMain();
     const owner = new FakeWebContents(ipc);
@@ -87,7 +101,8 @@ describe('native Powermove agent tool bridge', () => {
 
     const listed = await rpc(child, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
     expect(listed.result.tools.map((tool: any) => tool.name)).toEqual([
-      'fork_builtin_extension', 'get_project_state', 'get_panel_layout', 'open_panel', 'get_panel_state', 'interact_panel', 'capture_panel', 'computer_use_panel', 'get_workspace_state', 'render_frames', 'apply_commands', 'edit_video', 'rollback_changes', 'validate_effect', 'stage_fork_rebase'
+      'fork_builtin_extension', 'get_project_state', 'select_layers', 'get_panel_layout', 'open_panel', 'get_panel_state', 'interact_panel', 'capture_panel', 'computer_use_panel', 'get_workspace_state', 'render_frames', 'apply_commands', 'edit_video', 'rollback_changes', 'validate_effect', 'stage_fork_rebase',
+      'store_search', 'store_extension', 'store_source', 'store_library', 'store_install', 'store_update', 'store_uninstall', 'store_publish_prepare', 'store_publish'
     ]);
 
     const state = await rpc(child, {
@@ -107,6 +122,75 @@ describe('native Powermove agent tool bridge', () => {
     const finish = await session.finish(true);
     expect(finish).toEqual({ changed: true, revision: 1, historyId: 'agent-history-1' });
     expect(owner.requests.at(-1)?.tool).toBe('__finish_run');
+  });
+
+  it('rejects forged composition calls in an app-only extension run', async () => {
+    const ipc = new FakeIpcMain();
+    const owner = new FakeWebContents(ipc);
+    const bridge = new PowermoveAgentToolBridge(ipc as never, {
+      command: process.execPath,
+      mcpServerPath: path.join(__dirname, 'mcp-server.mjs'),
+      timeoutMs: 2_000
+    });
+    bridges.push(bridge);
+    const session = await bridge.openSession({ runId: 'app-extension-run', owner: owner as never, baseRevision: 0, context: 'app' });
+    const child = spawn(session.mcpConfig.command, session.mcpConfig.args, {
+      env: { ...process.env, ...session.mcpConfig.env },
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    children.push(child);
+    await rpc(child, { jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } } });
+    const listed = await rpc(child, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+    expect(listed.result.tools.map((tool: any) => tool.name)).toEqual([
+      'fork_builtin_extension', 'validate_effect', 'stage_fork_rebase',
+      'store_search', 'store_extension', 'store_source', 'store_library', 'store_install', 'store_update', 'store_uninstall', 'store_publish_prepare', 'store_publish'
+    ]);
+    for (const name of ['get_project_state', 'apply_commands']) {
+      const denied = await rpc(child, { jsonrpc: '2.0', id: name, method: 'tools/call',
+        params: { name, arguments: name === 'apply_commands' ? { commands: ['{}'] } : {} } });
+      expect(denied.result.isError).toBe(true);
+      await expect(bridge.callTool(session, name, {})).rejects.toThrow('no project attached');
+    }
+    expect(owner.requests).toEqual([]);
+    const allowed = await bridge.callTool(session, 'validate_effect', { definition: {} });
+    expect(allowed.ok).toBe(true);
+    expect(owner.requests.map(item => item.tool)).toEqual(['validate_effect']);
+  });
+
+  it('routes store tools to the gateway in main, never the renderer', async () => {
+    const ipc = new FakeIpcMain();
+    const owner = new FakeWebContents(ipc);
+    const search = vi.fn().mockResolvedValue({ items: [{ handle: 'ada', slug: 'glow' }], nextCursor: null });
+    const bridge = new PowermoveAgentToolBridge(ipc as never, {
+      mcpServerPath: '/resources/agent-tools/mcp-server.mjs',
+      storeAgent: { search } as never
+    });
+    bridges.push(bridge);
+    const session = await bridge.openSession({ runId: 'store-run-1', owner: owner as never, baseRevision: 0 });
+
+    const response = await bridge.callTool(session, 'store_search', { query: 'glow' });
+
+    expect(search).toHaveBeenCalledWith({ query: 'glow' });
+    expect(response.ok).toBe(true);
+    expect(owner.requests).toHaveLength(0);
+    const item = response.content?.[0];
+    expect(item).toMatchObject({ type: 'text' });
+    expect(JSON.parse((item as { text: string }).text)).toEqual({ items: [{ handle: 'ada', slug: 'glow' }], nextCursor: null });
+  });
+
+  it('reports a clear error when the store is unavailable', async () => {
+    const ipc = new FakeIpcMain();
+    const owner = new FakeWebContents(ipc);
+    const bridge = new PowermoveAgentToolBridge(ipc as never, {
+      mcpServerPath: '/resources/agent-tools/mcp-server.mjs',
+      storeAgent: null
+    });
+    bridges.push(bridge);
+    const session = await bridge.openSession({ runId: 'store-run-2', owner: owner as never, baseRevision: 0 });
+
+    await expect(bridge.callTool(session, 'store_install', { handle: 'a', slug: 'b' })).rejects.toThrow(/Store is unavailable/);
+    expect(owner.requests).toHaveLength(0);
   });
 
   it('forks a built-in into the current run staging directory without calling the renderer', async () => {
@@ -300,6 +384,42 @@ describe('native Powermove agent tool bridge', () => {
     const session = await bridge.openSession({ runId: 'native-run-crash', owner: owner as never, baseRevision: 0 });
     await expect(bridge.callRenderer(session, 'interact_panel', {})).rejects.toThrow('outcome is unknown');
     expect(owner.listenerCount('render-process-gone')).toBe(0);
+    owner.destroyed = true;
+  });
+
+  it('marks the window driven by the agent in main and the renderer for all of computer_use_panel', async () => {
+    const ipc = new FakeIpcMain();
+    const log: string[] = [];
+    let driving = 0;
+    const input = { drive: vi.fn(() => { driving += 1; log.push('drive'); return () => { driving -= 1; log.push('release'); }; }) };
+    const owner = new FakeWebContents(ipc) as FakeWebContents & Record<string, unknown>;
+    owner.send = (channel: string, payload: AgentToolRequestEvent | boolean) => {
+      if (channel === IPC.agentToolInput) { log.push(`renderer ${payload}`); return; }
+      const request = payload as AgentToolRequestEvent;
+      log.push(request.tool);
+      const text = request.tool === '__prepare_panel_input' ? { points: [{ x: 5, y: 6 }] }
+        : request.tool === '__panel_bounds' ? { x: 0, y: 0, width: 10, height: 10 } : {};
+      queueMicrotask(() => ipc.emit(IPC.agentToolResponse, { sender: owner }, {
+        runId: request.runId, callId: request.callId, ok: true, revision: 1, content: [{ type: 'text', text: JSON.stringify(text) }]
+      }));
+    };
+    owner.sendInputEvent = (event: { type: string }) => log.push(`${event.type}${driving ? ' (driven)' : ''}`);
+    const image = { isEmpty: () => false, getSize: () => ({ width: 10, height: 10 }), toJPEG: () => Buffer.from('jpeg') };
+    owner.capturePage = async () => ({ ...image, resize: () => image });
+    const bridge = new PowermoveAgentToolBridge(ipc as never, { mcpServerPath: '', timeoutMs: 2_000, userInput: input });
+    bridges.push(bridge);
+    const session = await bridge.openSession({ runId: 'native-run-drive', owner: owner as never, baseRevision: 0 });
+    await bridge.callTool(session, 'computer_use_panel', { panelId: 'ext.panel', action: 'click', points: [{ x: 5, y: 6 }] });
+    expect(input.drive).toHaveBeenCalledExactlyOnceWith(owner);
+    expect(log).toEqual([
+      'drive', 'renderer true', '__prepare_panel_input',
+      'mouseMove (driven)', 'mouseDown (driven)', 'mouseUp (driven)',
+      'get_project_state', '__panel_bounds', 'release', 'renderer false'
+    ]);
+    log.length = 0;
+    owner.sendInputEvent = () => { throw new Error('no input'); };
+    await expect(bridge.callTool(session, 'computer_use_panel', { panelId: 'ext.panel', action: 'click', points: [{ x: 5, y: 6 }] })).rejects.toThrow('no input');
+    expect(log).toEqual(['drive', 'renderer true', '__prepare_panel_input', 'release', 'renderer false']);
     owner.destroyed = true;
   });
 

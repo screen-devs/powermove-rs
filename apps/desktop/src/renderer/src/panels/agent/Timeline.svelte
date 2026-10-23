@@ -1,10 +1,13 @@
 <script lang="ts">
   import { agentState } from './agent-state.svelte';
   import { activityRows, type TraceStep } from './activity-rows';
+  import Markdown from './Markdown.svelte';
+  import QuestionCard from './QuestionCard.svelte';
   import TextRow from './TextRow.svelte';
+  import ThoughtRow from './ThoughtRow.svelte';
   import ToolActivity from './ToolActivity.svelte';
 
-  let { PM: _PM }: { PM: Record<string, any> } = $props();
+  let { PM }: { PM: Record<string, any> } = $props();
 
   /* The live activity trail. Rows keep their stream order: prose streams with
      a caret; reasoning and tool calls share flat work groups that disclose
@@ -33,7 +36,7 @@
     {#each planSteps as step (step.id)}
       <div class="agent-step {step.status || 'pending'}">
         <i aria-hidden="true"></i>
-        <span>{step.title}</span>
+        <span><Markdown text={step.title} inline links={false} /></span>
         {#if step.status === 'error'}<em>Failed</em>{/if}
       </div>
     {/each}
@@ -44,7 +47,7 @@
   <div class="agent-trace">
     <p class="agent-trace-loading">
       <span class="agent-pixel-loader" aria-hidden="true">{#each Array(9) as _, cell (cell)}<i style="--cell-delay:{((cell % 3) + Math.abs(Math.floor(cell / 3) - 1)) * 90}ms"></i>{/each}</span>
-      <span class="agent-trace-thought shimmer-text">{fallback}</span>
+      <span class="agent-trace-thought shimmer-text"><Markdown text={fallback} inline links={false} /></span>
     </p>
   </div>
 {:else if rows.length}
@@ -52,6 +55,10 @@
     {#each rows as row, index (row.renderKey)}
       {#if row.kind === 'text'}
         <TextRow text={row.text} streaming={index === streamingIndex} animated />
+      {:else if row.kind === 'thought'}
+        <ThoughtRow text={row.text} streaming={running && row.pulsing} animated />
+      {:else if row.kind === 'question'}
+        <QuestionCard {PM} step={row} />
       {:else}
         <ToolActivity {row} animated live={running && index === rows.length - 1} />
       {/if}

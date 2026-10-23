@@ -1,9 +1,10 @@
+import { AUDIO_EXTENSIONS as ACCEPTED_EXTENSIONS } from '../../../../shared/media-formats';
 import { evaluatedValue, isProperty, resolveContent } from './content-properties';
 /* Ported from js/core/audio.js — behavior-preserving. */
 import type { PMRegistry } from '../registry';
 
 export function install(PM: PMRegistry): void {
-const AUDIO_EXTENSIONS: any = new Set(['wav', 'mp3', 'm4a', 'aac', 'ogg', 'oga', 'flac', 'aif', 'aiff']);
+const AUDIO_EXTENSIONS: any = new Set<string>(ACCEPTED_EXTENSIONS);
 const MAX_DECODED_BYTES: any = PM.Memory?.budget?.('audio') || 256 * 1024 * 1024;
 const MAX_PRECOMP_DEPTH: any = 8;
 const LIVE_LOOKAHEAD: any = 1;
@@ -57,7 +58,7 @@ function audioLayers(project: any = PM.proj) {
         });
         continue;
       }
-      if (layer.type === 'video' && layer.d?.embeddedAudio === true && !evaluatedValue(PM,layer,layer.d.timeRemap,PM.time,'c.timeRemap')) {
+      if (layer.type === 'video' && layer.d?.embeddedAudio === true && layer.d.audioMuted !== true && !evaluatedValue(PM,layer,layer.d.timeRemap,PM.time,'c.timeRemap')) {
         output.push({
           ...layer,
           type: 'audio',
@@ -241,7 +242,7 @@ async function decodeAsset(asset: any) {
   asset.audioDecoding = (async () => {
     try {
       const bytes: any = await asset.audioBlob.arrayBuffer();
-      const buffer: any = await decodeArrayBuffer(context(), bytes.slice(0));
+      const buffer: any = await decodeArrayBuffer(context(), bytes);
       if (!buffer || !(buffer.duration > 0)) throw new Error('The decoder returned an empty audio file');
       if (decodedBytes(buffer) > MAX_DECODED_BYTES) {
         const error: any = new Error('This audio file is too long to decode safely · use a shorter edit or split it first');
@@ -590,7 +591,10 @@ function drawWaveform(ctx: any, layer: any, options: any = {}) {
   const clipLeft: any = finite(options.clipLeft, x);
   const asset: any = layer && layer.d && PM.assets && PM.assets.get(layer.d.asset);
   const left: any = Math.max(x, clipLeft);
-  const right: any = x + width;
+  // Canvas clipping hides pixels but still submits every offscreen bar. At
+  // high zoom a long clip can span millions of columns; bound the iteration
+  // without changing width, which defines the source-time mapping below.
+  const right: any = Math.min(x + width, finite(options.clipRight, x + width));
   if (!(right > left && height > 2)) return false;
   if (!asset || !asset.peaks || !asset.peaks.length) {
     if (asset && asset.audioBlob && !asset.audioDecoding && !(asset.audioRetryAt > Date.now())) {

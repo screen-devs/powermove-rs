@@ -30,6 +30,66 @@ afterEach(async () => {
 });
 
 describe('file store', () => {
+  it('atomically migrates legacy history on load and preserves the original if the write fails', async () => {
+    const directory = await temporaryDirectory();
+    const original = JSON.stringify({ version: 1, index: -1, entries: [{ label: 'Add',
+      forward: [{ path: ['layers'], exists: true, value: [{ id: 'one' }] }], backward: [],
+    }] });
+    const file = path.join(directory, 'projectHistory.legacy.json');
+    await fs.writeFile(file, original);
+    const broken = createStore(directory, { fs: { ...fs, rename: async () => { throw new Error('Disk unavailable'); } } });
+    const errors: any[] = []; broken.onError(error => errors.push(error));
+    await broken.load(); await broken.flushAll();
+    expect(await fs.readFile(file, 'utf8')).toBe(original);
+    expect(errors).toHaveLength(1);
+    expect(broken.get!('projectHistory.legacy')).toEqual(JSON.parse(original));
+    const healthy = createStore(directory); await healthy.load(); await healthy.flushAll();
+    expect(JSON.parse(await fs.readFile(file, 'utf8')).format).toBe('powermove-history-dictionary');
+    const reopened = createStore(directory); await reopened.load();
+    expect(reopened.get!('projectHistory.legacy')).toEqual(JSON.parse(original));
+  });
+  it('keeps inactive payloads out of bootstrap and preserves compact history across reopening', async () => {
+    const directory = await temporaryDirectory(), store = createStore(directory);
+    await store.load();
+    const layer = { id: 'layer', d: { text: 'same pixels'.repeat(100) } };
+    const history = { version: 1, index: 0, entries: Array.from({ length: 3 }, (_, i) => ({ label: `Edit ${i}`,
+      forward: [{ path: ['layers'], exists: true, value: [structuredClone(layer)] }],
+      backward: [{ path: ['layers'], exists: true, value: [structuredClone(layer)] }],
+    })) };
+    store.set('projectHistory.saved', history);
+    store.set('agentAttachment.saved', { data: 'attachment bytes' });
+    store.set('theme', 'dark');
+    const bootstrap = store.bootstrapSerialized!();
+    expect(bootstrap.theme).toBe('"dark"');
+    expect(bootstrap['projectHistory.saved']).toBeUndefined();
+    expect(bootstrap['agentAttachment.saved']).toBeUndefined();
+    expect(JSON.parse(bootstrap.__powermoveLazyKeys!)).toEqual(['projectHistory.saved', 'agentAttachment.saved']);
+    expect(JSON.parse(store.getEncodedSerialized!('projectHistory.saved')!).records).toHaveLength(1);
+    await store.flushAll();
+    const reopened = createStore(directory); await reopened.load();
+    expect(reopened.get!('projectHistory.saved')).toEqual(history);
+    const copy: any = reopened.get!('projectHistory.saved');
+    copy.entries[0].forward[0].value[0].d.text = 'mutated';
+    expect(reopened.get!('projectHistory.saved')).toEqual(history);
+    expect(JSON.parse(reopened.getSerialized!('projectHistory.saved')!)).toEqual(history);
+  });
+  it('serializes individual reads and bootstrap without cloning unrelated project histories', async () => {
+    const store = createStore(await temporaryDirectory());
+    await store.load();
+    store.set('projects', [{ id: 'demo' }]);
+    store.set('projectHistory.demo', { entries: Array.from({ length: 1000 }, (_, i) => ({ i, label: 'Edit' })) });
+    const clone = vi.spyOn(globalThis, 'structuredClone');
+    expect(store.getSerialized!('projects')).toBe('[{"id":"demo"}]');
+    expect(store.getSerialized!('theme')).toBeNull();
+    expect(store.getSerialized!('../invalid')).toBeNull();
+    const snapshot = store.snapshotSerialized!();
+    expect(JSON.parse(snapshot['projectHistory.demo']!).entries).toHaveLength(1000);
+    expect(clone).not.toHaveBeenCalled();
+    snapshot.projects = '[]';
+    expect(store.getSerialized!('projects')).toBe('[{"id":"demo"}]');
+    await store.flushAll();
+  });
+
   it('preserves legacy undo history when a renderer updates metadata only', async () => {
     const directory = await temporaryDirectory(), store = createStore(directory);
     await store.load();
@@ -402,6 +462,52 @@ describe('store IPC and quit integration', () => {
       expect.objectContaining({ key: '', error: expect.stringContaining('expected { key, value }') })
     );
     expect(() => handlers.get(IPC.storeSnapshot)?.(untrustedEvent)).toThrow(IpcValidationError);
+  });
+
+  it('tells sibling windows which keys moved, coalesced, and never the writer', async () => {
+    const handlers = new Map<string, (...args: any[]) => unknown>();
+    const listeners = new Map<string, (...args: any[]) => unknown>();
+    const ipcMain = {
+      handle: (channel: string, handler: (...args: any[]) => unknown) => handlers.set(channel, handler),
+      on: (channel: string, listener: (...args: any[]) => unknown) => {
+        listeners.set(channel, listener);
+        return ipcMain;
+      }
+    };
+    const broadcastChange = vi.fn();
+    const store = storeStub({ snapshot: () => ({ projects: [{ id: 'P1' }] }) });
+    registerStoreIpc(ipcMain as unknown as Pick<IpcMain, 'handle' | 'on'>, store, {
+      isTrustedSender: (event) => Boolean((event as unknown as { trusted?: boolean }).trusted),
+      broadcastChange
+    });
+    const sender = { send: vi.fn() };
+    const event = { trusted: true, sender, returnValue: undefined as unknown };
+
+    // A rename touches the registry and the slot; siblings hear about it once.
+    listeners.get(IPC.storeSet)?.(event, { key: 'projects', value: [] });
+    listeners.get(IPC.storeSet)?.(event, { key: 'project.P1', value: {} });
+    listeners.get(IPC.storeDelete)?.(event, { key: 'projectJournal.P1' });
+    expect(broadcastChange).not.toHaveBeenCalled();
+    await Promise.resolve();
+    expect(broadcastChange).toHaveBeenCalledTimes(1);
+    expect(broadcastChange).toHaveBeenCalledWith(
+      ['projects', 'project.P1', 'projectJournal.P1'],
+      sender
+    );
+
+    // An untrusted write is not applied, so nothing is announced either.
+    listeners.get(IPC.storeSet)?.({ trusted: false, sender }, { key: 'projects', value: [] });
+    await Promise.resolve();
+    expect(broadcastChange).toHaveBeenCalledTimes(1);
+
+    // Refilling one invalidated key, and nothing at all for an untrusted asker.
+    listeners.get(IPC.storeGetSync)?.(event, { key: 'projects' });
+    expect(event.returnValue).toBe(JSON.stringify([{ id: 'P1' }]));
+    listeners.get(IPC.storeGetSync)?.(event, { key: 'openWindows' });
+    expect(event.returnValue).toBeNull();
+    const untrusted = { trusted: false, sender, returnValue: undefined as unknown };
+    listeners.get(IPC.storeGetSync)?.(untrusted, { key: 'projects' });
+    expect(untrusted.returnValue).toBeNull();
   });
 
   it('prevents the first quit until flushing completes, then quits once more', async () => {

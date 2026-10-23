@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -39,6 +39,8 @@ export type RendererDiagnostics = {
 export type LaunchOptions = {
   userData?: string;
   env?: Record<string, string>;
+  /** Use production window preferences while retaining an isolated test profile. */
+  normalWindow?: boolean;
 };
 
 export type LaunchedApp = {
@@ -79,15 +81,22 @@ export function ensureBuilt(force = false): Promise<void> {
 async function startElectron(
   userData: string,
   env: Record<string, string>,
-  diagnostics: RendererDiagnostics
+  diagnostics: RendererDiagnostics,
+  normalWindow = false,
 ): Promise<{ app: ElectronApplication; page: Page }> {
   await ensureBuilt();
   const launchEnv = {
     ...process.env,
+    // Offline UI regressions must not depend on the developer's subscription
+    // state (or race a real account check that replaces the composer).
+    ...(process.env.POWERMOVE_E2E_LIVE ? {} : {
+      CODEX_BINARY: path.join(repoRoot, 'src/main/codex/__fixtures__/fake-codex-app-server.sh'),
+      POWERMOVE_FAKE_CHATGPT_STATUS: 'connected',
+    }),
     ...env,
     POWERMOVE_USER_DATA: userData,
     POWERMOVE_DEVTOOLS: '0',
-    POWERMOVE_BACKGROUND_TEST: '1',
+    POWERMOVE_BACKGROUND_TEST: normalWindow ? '0' : '1',
   };
   // Codex and some Node launchers set this for their own Electron subprocesses.
   // Passing it through makes Electron run as plain Node, which rejects the
@@ -139,8 +148,20 @@ export async function launchApp(options: LaunchOptions = {}): Promise<LaunchedAp
     ? path.resolve(options.userData)
     : await mkdtemp(path.join(os.tmpdir(), 'powermove-e2e-'));
   const env = { ...(options.env ?? {}) };
+  if (options.normalWindow) {
+    const temporaryRoots = [os.tmpdir(), '/tmp', '/private/tmp'];
+    const isolated = temporaryRoots.some(root => {
+      const relative = path.relative(root, userData);
+      return !!relative && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+    });
+    if (!isolated) throw new Error('Normal-window tests require a copied profile in a temporary directory.');
+    // Start directly in the editor with ordinary BrowserWindow preferences;
+    // no post-launch mutation of throttling/focus can reproduce this path.
+    await mkdir(userData, { recursive: true });
+    await writeFile(path.join(userData, 'onboarding-v1.json'), '{"version":1}\n', { mode: 0o600 });
+  }
   const diagnostics: RendererDiagnostics = { console: [], pageErrors: [] };
-  let active = await startElectron(userData, env, diagnostics);
+  let active = await startElectron(userData, env, diagnostics, options.normalWindow);
   let closed = false;
 
   const session: LaunchedApp = {
@@ -150,13 +171,14 @@ export async function launchApp(options: LaunchOptions = {}): Promise<LaunchedAp
     diagnostics,
     async relaunch() {
       await active.app.close();
-      active = await startElectron(userData, env, diagnostics);
+      active = await startElectron(userData, env, diagnostics, options.normalWindow);
       session.app = active.app;
       session.page = active.page;
     },
     async openEditor() {
       const { page } = session;
       await page.waitForFunction(() => Boolean((window as any).PM?.ProjectsScreen && (window as any).PM?.mkProject));
+      await page.evaluate(async () => { await (window as any).PM.Kernel.loader.builtinsReady; });
       await page.evaluate(() => {
         const PM = (window as any).PM;
         if (!PM.ProjectsScreen.isOpen) return;
@@ -165,10 +187,17 @@ export async function launchApp(options: LaunchOptions = {}): Promise<LaunchedAp
       });
       await page.waitForFunction(() => !(window as any).PM.ProjectsScreen.isOpen);
       await page.waitForSelector('#body .dock', { state: 'visible' });
+      await page.waitForFunction(() => {
+        const PM = (window as any).PM;
+        return Boolean(PM.GL?.gl && PM.Kernel.services.get('viewer')?.stage?.isConnected);
+      });
     },
     async close() {
       if (closed) return;
       closed = true;
+      // A failed close-decision assertion must not leave its Cancel mock
+      // preventing cleanup of this disposable test process.
+      await active.app.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 2, checkboxChecked: false }); }).catch(() => undefined);
       await active.app.close().catch(() => undefined);
       if (ownsUserData) await rm(userData, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     }
@@ -206,14 +235,16 @@ export const test = base.extend<{ session: LaunchedApp; desktopLaunchOptions: La
 export { expect };
 
 /** Exercise the native menu IPC without showing an AppKit popup in hidden tests. */
-export async function chooseNativeMenu(session: LaunchedApp, label: string, trigger: () => Promise<unknown>): Promise<void> {
+export async function chooseNativeMenu(session: LaunchedApp, label: string | readonly string[], trigger: () => Promise<unknown>): Promise<string[]> {
   await session.app.evaluate(({ Menu }, label) => {
-    const state = { original: Menu.prototype.popup, result: 'waiting' };
+    const state = { original: Menu.prototype.popup, result: 'waiting', labels: [] as string[], choices: Array.isArray(label) ? [...label] : [label] };
     (globalThis as any).__testNativeMenu = state;
     Menu.prototype.popup = function (options) {
-      Menu.prototype.popup = state.original;
-      const item = this.items.find(item => item.label === label && item.enabled);
-      state.result = item ? 'selected' : `Missing enabled native menu item: ${label}; got ${this.items.map(item => item.label).join(', ')}`;
+      const choice = state.choices.shift();
+      if (!state.choices.length) Menu.prototype.popup = state.original;
+      state.labels = this.items.map(item => item.label);
+      const item = this.items.find(item => item.label === choice && item.enabled);
+      state.result = item ? (state.choices.length ? 'waiting' : 'selected') : `Missing enabled native menu item: ${choice}; got ${this.items.map(item => item.label).join(', ')}`;
       item?.click(item, options?.window, {} as any);
       options?.callback?.();
     };
@@ -221,11 +252,36 @@ export async function chooseNativeMenu(session: LaunchedApp, label: string, trig
   try {
     await trigger();
     await expect.poll(() => session.app.evaluate(() => (globalThis as any).__testNativeMenu.result)).toBe('selected');
+    return await session.app.evaluate(() => (globalThis as any).__testNativeMenu.labels);
   } finally {
     await session.app.evaluate(({ Menu }) => {
       const state = (globalThis as any).__testNativeMenu;
       if (state) Menu.prototype.popup = state.original;
       delete (globalThis as any).__testNativeMenu;
+    });
+  }
+}
+
+/** Inspect native menu labels and enabled states without opening an AppKit popup or running an action. */
+export async function inspectNativeMenu(session: LaunchedApp, trigger: () => Promise<unknown>): Promise<{ label: string; enabled: boolean }[]> {
+  await session.app.evaluate(({ Menu }) => {
+    const state = { original: Menu.prototype.popup, items: null as { label: string; enabled: boolean }[] | null };
+    (globalThis as any).__testNativeMenuInspection = state;
+    Menu.prototype.popup = function (options) {
+      Menu.prototype.popup = state.original;
+      state.items = this.items.filter(item => item.type !== 'separator').map(item => ({ label: item.label, enabled: item.enabled }));
+      options?.callback?.();
+    };
+  });
+  try {
+    await trigger();
+    await expect.poll(() => session.app.evaluate(() => (globalThis as any).__testNativeMenuInspection.items)).not.toBeNull();
+    return await session.app.evaluate(() => (globalThis as any).__testNativeMenuInspection.items);
+  } finally {
+    await session.app.evaluate(({ Menu }) => {
+      const state = (globalThis as any).__testNativeMenuInspection;
+      if (state) Menu.prototype.popup = state.original;
+      delete (globalThis as any).__testNativeMenuInspection;
     });
   }
 }

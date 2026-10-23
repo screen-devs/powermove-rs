@@ -99,7 +99,7 @@ export function clampDuration(value: unknown, fallback: number): number {
   return Math.min(MAX_DURATION, Math.max(MIN_DURATION, Math.round(number * 1000) / 1000));
 }
 
-interface SettingsRow {
+export interface SettingsRow {
   element: HTMLElement;
   /** Muted description line; rewritten live for context-dependent rows. */
   detail: HTMLElement;
@@ -107,7 +107,7 @@ interface SettingsRow {
   setEnabled(enabled: boolean): void;
 }
 
-function row(title: string, detail: string, control: HTMLElement): SettingsRow {
+export function row(title: string, detail: string, control: HTMLElement): SettingsRow {
   const element = document.createElement('div');
   element.className = 'settings-row';
   const copy = document.createElement('div');
@@ -131,7 +131,7 @@ function row(title: string, detail: string, control: HTMLElement): SettingsRow {
   };
 }
 
-function select(label: string): HTMLSelectElement {
+export function select(label: string): HTMLSelectElement {
   const element = document.createElement('select');
   element.className = 'settings-select';
   element.setAttribute('aria-label', label);
@@ -155,7 +155,7 @@ function fillOptions<T>(
   for (const item of extra ?? []) element.append(option(item.v, item.label));
 }
 
-function numberInput(label: string, min: number, max: number, step: number): HTMLInputElement {
+export function numberInput(label: string, min: number, max: number, step: number): HTMLInputElement {
   const element = document.createElement('input');
   element.type = 'number';
   element.className = 'settings-input';
@@ -226,7 +226,7 @@ export function createProjectSettingsControl(bridge: ProjectSettingsBridge): Pro
   const sizeRow = row('Size', 'Width and height of every frame, in pixels.', size);
   const durationRow = row('Duration', 'Total length of the composition, in seconds.', duration);
   composition.body.append(
-    row('Name', 'Shown on the project tab and used for exported file names.', name).element,
+    row('Name', 'Shown in the titlebar and used for exported file names.', name).element,
     row('Resolution', 'Pick a common size, or set your own pixel dimensions.', preset).element,
     sizeRow.element,
     row('Frame rate', 'Frames rendered per second of the composition — any rate from 1 to 240.', frameRate).element,
@@ -248,6 +248,8 @@ export function createProjectSettingsControl(bridge: ProjectSettingsBridge): Pro
     backgroundControl = backgroundSwatch;
   }
   if (backgroundControl) {
+    backgroundControl.classList.add('settings-background-control');
+    backgroundControl.style.width = '170px';
     composition.body.append(
       row('Background', 'Colour shown behind every layer of the composition.', backgroundControl).element
     );
@@ -474,6 +476,8 @@ export interface NewProjectFormOptions {
    * bounce back to an input inside a modal after it is dismissed.
    */
   backgroundField?(get: () => string, set: (value: string) => void): HTMLElement;
+  /** Accessible name of the name field (the form also serves Composition Settings). */
+  nameLabel?: string;
 }
 
 const NEW_PROJECT_DEFAULTS: NewProjectValues = {
@@ -486,7 +490,7 @@ export function createNewProjectForm(
   options: NewProjectFormOptions = {}
 ): NewProjectForm {
   const seed: NewProjectValues = { ...NEW_PROJECT_DEFAULTS, ...initial };
-  let backgroundValue = /^#[0-9a-f]{6}$/i.test(seed.bg) ? seed.bg.toUpperCase() : NEW_PROJECT_DEFAULTS.bg;
+  let backgroundValue = /^#[0-9a-f]{6}(?:[0-9a-f]{2})?$/i.test(seed.bg) ? seed.bg.toUpperCase() : NEW_PROJECT_DEFAULTS.bg;
   const element = document.createElement('div');
   element.className = 'new-project-form';
 
@@ -503,7 +507,7 @@ export function createNewProjectForm(
   name.type = 'text';
   name.className = 'settings-input is-wide';
   name.value = seed.name;
-  name.setAttribute('aria-label', 'Project name');
+  name.setAttribute('aria-label', options.nameLabel ?? 'Project name');
 
   const preset = select('Resolution preset');
   fillOptions(
@@ -530,7 +534,7 @@ export function createNewProjectForm(
   duration.value = String(seed.dur);
 
   const setBackground = (value: string): void => {
-    if (/^#[0-9a-f]{6}$/i.test(value)) backgroundValue = value.toUpperCase();
+    if (/^#[0-9a-f]{6}(?:[0-9a-f]{2})?$/i.test(value)) backgroundValue = value.toUpperCase();
   };
   const background = options.backgroundField?.(() => backgroundValue, setBackground)
     ?? document.createElement('input');
@@ -562,7 +566,7 @@ export function createNewProjectForm(
   height.addEventListener('change', syncPreset);
 
   element.append(
-    field('Name', name),
+    field(options.nameLabel ?? 'Name', name),
     field('Resolution', preset),
     field('Size', size),
     field('Frame rate', frameRate),

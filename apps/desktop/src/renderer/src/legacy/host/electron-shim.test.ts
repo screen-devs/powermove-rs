@@ -1,9 +1,11 @@
 // @vitest-environment happy-dom
 
+import { installBridgeForTests, resetBridgeForTests } from '../../kernel/bridge';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { PMRegistry } from '../registry';
 import { install } from './electron-shim';
+import { HistoryRecords, packHistory } from '../../../../shared/history-memory';
 
 function flush(): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, 0));
@@ -13,10 +15,12 @@ function decodeBase64(value: string): string {
   return Buffer.from(value, 'base64').toString('utf8');
 }
 
-function loadShim(options: { snapshotError?: Error; nativeAsyncStore?: boolean; serializedBridge?: boolean; snapshotJSON?: Record<string, string> } = {}) {
+function loadShim(options: { snapshotError?: Error; nativeAsyncStore?: boolean; serializedBridge?: boolean; snapshotJSON?: Record<string, string>; bootstrapJSON?: Record<string, string>; encodedValues?: Record<string, string>; windows?: boolean; storeSync?: boolean } = {}) {
+  const emitted: Array<[string, unknown]> = [];
   const PM: PMRegistry = {
     uid: vi.fn((prefix: string) => `${prefix}test`),
     toast: vi.fn(),
+    bus: { emit: (event: string, payload: unknown) => emitted.push([event, payload]), on: vi.fn() },
     CodexBridge: { progress: vi.fn(), trace: vi.fn(), resolve: vi.fn() },
     AgentArtifacts: { resolve: vi.fn() },
     WindowCapture: { resolve: vi.fn() },
@@ -36,12 +40,33 @@ function loadShim(options: { snapshotError?: Error; nativeAsyncStore?: boolean; 
         ? vi.fn(() => { throw options.snapshotError; })
         : vi.fn(() => ({ 'project.demo': { layers: [{ id: 'one' }] }, __powermoveAsyncStore: options.nativeAsyncStore === true })),
       ...(options.snapshotJSON !== undefined ? { snapshotSerializedSync: vi.fn(() => options.snapshotJSON) } : {}),
+      ...(options.bootstrapJSON ? {
+        bootstrapSerializedSync: vi.fn(() => options.bootstrapJSON),
+        getEncodedSync: vi.fn((key: string) => options.encodedValues?.[key] ?? null),
+      } : {}),
       ...(options.serializedBridge ? { setSerialized: vi.fn(async () => undefined) } : {}),
       set: vi.fn(),
       delete: vi.fn(),
       flush: vi.fn(),
       onError: vi.fn(),
+      ...(options.storeSync
+        ? {
+          getSync: vi.fn((key: string) => key === 'projects' ? JSON.stringify([{ id: 'from-sibling' }]) : null),
+          onChanged: vi.fn(),
+        }
+        : {}),
     },
+    ...(options.windows
+      ? {
+        windows: {
+          initialProject: vi.fn(() => ({ projectId: 'P1', taken: ['P2'] })),
+          claimProject: vi.fn(async () => ({ claimed: false, focused: true })),
+          openProject: vi.fn(async () => ({ opened: true, focused: false })),
+          create: vi.fn(async () => undefined),
+          close: vi.fn(),
+        }
+      }
+      : {}),
     setTheme: vi.fn(),
     log: vi.fn(),
     onMenuCommand: vi.fn(),
@@ -63,20 +88,103 @@ function loadShim(options: { snapshotError?: Error; nativeAsyncStore?: boolean; 
     setTimeout,
   };
   vi.stubGlobal('window', shimWindow);
+  installBridgeForTests(bridge);
 
   install(PM);
-  return { PM, bridge, window: shimWindow, addEventListener };
+  return { PM, bridge, window: shimWindow, addEventListener, emitted };
 }
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  resetBridgeForTests();
 });
 
 describe('legacy Electron shim install', () => {
+  it('loads deferred history only on demand and exposes isolated legacy values', () => {
+    const history = { version: 1, index: -1, entries: [{ label: 'Add',
+      forward: [{ path: ['layers'], exists: true, value: [{ id: 'one' }] }], backward: [],
+    }] };
+    const { PM, bridge } = loadShim({
+      bootstrapJSON: { __powermoveLazyKeys: JSON.stringify(['projectHistory.demo', 'agentAttachment.other']) },
+      encodedValues: { 'projectHistory.demo': JSON.stringify(packHistory(new HistoryRecords().share(history))) },
+      storeSync: true,
+    });
+    expect(bridge.store.snapshotSync).not.toHaveBeenCalled();
+    expect(bridge.store.getEncodedSync).not.toHaveBeenCalled();
+    const loaded = PM.store.get('projectHistory.demo', null);
+    expect(loaded).toEqual(history);
+    loaded.entries[0].forward[0].value[0].id = 'changed';
+    expect(PM.store.get('projectHistory.demo', null)).toEqual(history);
+    expect(bridge.store.getEncodedSync).toHaveBeenCalledTimes(1);
+    bridge.store.onChanged.mock.calls[0][0](['projectHistory.demo']);
+    expect(PM.store.get('projectHistory.demo', null)).toEqual(history);
+    expect(bridge.store.getEncodedSync).toHaveBeenCalledTimes(2);
+    expect(bridge.store.getEncodedSync).not.toHaveBeenCalledWith('agentAttachment.other');
+  });
+
+  it('retries a failed deferred read and lets a local write supersede it', () => {
+    const { PM, bridge } = loadShim({ bootstrapJSON: {
+      __powermoveLazyKeys: JSON.stringify(['project.demo']),
+    }, encodedValues: { 'project.demo': '{"id":"demo"}' } });
+    bridge.store.getEncodedSync.mockImplementationOnce(() => { throw new Error('IPC unavailable'); });
+    expect(PM.store.get('project.demo', null)).toBeNull();
+    expect(PM.store.get('project.demo', null)).toEqual({ id: 'demo' });
+    PM.store.set('project.demo', { id: 'local' });
+    expect(PM.store.get('project.demo', null)).toEqual({ id: 'local' });
+    expect(bridge.store.getEncodedSync).toHaveBeenCalledTimes(2);
+  });
   it('requires agreement from native storage and preload before migrating undo history', () => {
     expect(loadShim({ serializedBridge: true }).PM.store.separateHistory).toBe(false);
     expect(loadShim({ nativeAsyncStore: true }).PM.store.separateHistory).toBe(false);
     expect(loadShim({ nativeAsyncStore: true, serializedBridge: true }).PM.store.separateHistory).toBe(true);
+  });
+
+  it('re-reads a key a sibling window wrote, and only when it is next asked for', () => {
+    const { PM, bridge, emitted } = loadShim({ storeSync: true });
+    const changed = bridge.store.onChanged.mock.calls[0]![0] as (keys: string[]) => void;
+
+    changed(['projects', 'openWindows']);
+    // Invalidation is lazy: a neighbour's write costs nothing until it is read.
+    expect(bridge.store.getSync).not.toHaveBeenCalled();
+    expect(emitted).toContainEqual(['store:external', ['projects', 'openWindows']]);
+
+    expect(PM.store.get('projects', null)).toEqual([{ id: 'from-sibling' }]);
+    expect(bridge.store.getSync).toHaveBeenCalledWith('projects');
+    // The refreshed value is cached again, so a second read is free.
+    expect(PM.store.get('projects', null)).toEqual([{ id: 'from-sibling' }]);
+    expect(bridge.store.getSync).toHaveBeenCalledTimes(1);
+
+    // A key the store no longer holds falls back rather than serving a stale copy.
+    expect(PM.store.get('openWindows', 'fallback')).toBe('fallback');
+
+    // This window's own write settles the key; nothing is re-read behind it.
+    bridge.store.getSync.mockClear();
+    changed(['projects']);
+    PM.store.set('projects', [{ id: 'mine' }]);
+    expect(PM.store.get('projects', null)).toEqual([{ id: 'mine' }]);
+    expect(bridge.store.getSync).not.toHaveBeenCalled();
+  });
+
+  it('routes window work through the native bridge and degrades without one', async () => {
+    const { PM, bridge } = loadShim({ windows: true });
+    expect(PM.windows.supported).toBe(true);
+    expect(PM.windows.initialProject()).toEqual({ projectId: 'P1', taken: ['P2'] });
+    // A refused claim is reported as-is: the caller keeps the document it had.
+    await expect(PM.windows.claimProject('P2')).resolves.toEqual({ claimed: false, focused: true });
+    await expect(PM.windows.openProject('P2')).resolves.toEqual({ opened: true, focused: false });
+    await expect(PM.windows.create()).resolves.toBe(true);
+    PM.windows.close();
+    expect(bridge.windows.close).toHaveBeenCalledOnce();
+
+    // Without the bridge a claim still succeeds, so a lone window keeps working.
+    const plain = loadShim();
+    expect(plain.PM.windows.supported).toBe(false);
+    expect(plain.PM.windows.initialProject()).toEqual({ projectId: null, tabs: [], taken: [] });
+    await expect(plain.PM.windows.claimProject('P1')).resolves.toEqual({ claimed: true, focused: false });
+    // Closing and reordering tabs have no one to tell, and never fail the tab strip.
+    await expect(plain.PM.windows.releaseProject('P1')).resolves.toBe(true);
+    await expect(plain.PM.windows.reorderTabs(['P1'])).resolves.toBe(true);
+    await expect(plain.PM.windows.create()).resolves.toBe(false);
   });
 
   it('flushes the newest asynchronous history snapshot before native storage', async () => {
@@ -200,7 +308,7 @@ describe('legacy Electron shim install', () => {
     }));
   });
 
-  it('preserves exact artifact and window-capture base64 result shapes', async () => {
+  it('passes artifact bytes directly and preserves window-capture base64', async () => {
     const { PM, bridge, window } = loadShim();
     bridge.artifacts.read.mockResolvedValue({
       name: 'report.txt',
@@ -218,7 +326,7 @@ describe('legacy Electron shim install', () => {
       ok: true,
       name: 'report.txt',
       mime: 'text/plain',
-      dataBase64: 'aGk=',
+      data: new Uint8Array([104, 105]),
     });
     expect(PM.WindowCapture.resolve).toHaveBeenCalledWith('capture-1', {
       ok: true,
@@ -294,4 +402,21 @@ describe('legacy Electron shim install', () => {
     expect(window.webkit.messageHandlers.pmLog.postMessage).toBeTypeOf('function');
     expect(addEventListener).toHaveBeenCalledWith('DOMContentLoaded', expect.any(Function), { once: true });
   });
+});
+
+it('refreshes installed fonts on focus and invalidates cached text only when families change', async () => {
+  const { PM, bridge, window: win } = loadShim();
+  PM.Fonts = { setSystemFamilies: vi.fn() };
+  PM.rasterClear = vi.fn();
+  PM.invalidate = vi.fn();
+  bridge.fontFamilies = vi.fn(async () => ['Original']);
+  const focus = win.addEventListener.mock.calls.find(([event]: any[]) => event === 'focus')[1];
+  focus(); await flush();
+  expect(PM.Fonts.setSystemFamilies).toHaveBeenLastCalledWith(['Original']);
+  focus(); await flush();
+  expect(PM.Fonts.setSystemFamilies).toHaveBeenCalledTimes(1);
+  bridge.fontFamilies.mockResolvedValue(['Original', 'Newly installed']);
+  focus(); await flush();
+  expect(PM.Fonts.setSystemFamilies).toHaveBeenLastCalledWith(['Newly installed', 'Original']);
+  expect(PM.rasterClear).toHaveBeenCalledTimes(2);
 });

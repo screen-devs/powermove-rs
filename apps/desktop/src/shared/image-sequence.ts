@@ -1,5 +1,4 @@
 export const IMAGE_SEQUENCE_ACCEPT = '.png,.jpg,.jpeg,.webp,.bmp';
-export const MAX_SEQUENCE_FRAMES = 20_000;
 
 /** The last number before the extension is the frame index. Padding may vary. */
 export function sequenceFrame(name: string) {
@@ -11,8 +10,8 @@ export function sequenceFrame(name: string) {
 }
 
 export function orderedSequence<T extends { name: string }>(files: T[]): T[] {
-  if (files.length < 2 || files.length > MAX_SEQUENCE_FRAMES) {
-    throw new Error(`Choose between 2 and ${MAX_SEQUENCE_FRAMES.toLocaleString('en-US')} numbered image frames`);
+  if (files.length < 2) {
+    throw new Error('Choose at least 2 numbered image frames');
   }
   const first = sequenceFrame(files[0]!.name);
   if (!first || files.some(file => {
@@ -59,4 +58,19 @@ export function sequencePlaybackTime(asset: any, time: number): number | undefin
   if (!validSequenceFps(fps) || !Number.isSafeInteger(frames) || frames < 2) return undefined;
   const index = Math.max(0, Math.min(frames - 1, Math.floor((time + 1e-7) * fps)));
   return index / fps + .001;
+}
+
+/** Where a decoder running in real time should sit to present that frame.
+ *  A scrub seek snaps to the frame's first millisecond, which is right for a
+ *  still. A playing element cannot be placed that precisely: it starts a few
+ *  milliseconds after it is told to and then free-runs on its own clock, so
+ *  aiming at the frame's leading edge means any lag at all presents the frame
+ *  before — which is what holds a clip's first frame over two rendered frames
+ *  and leaves the rest of the clip one frame late. Aim at the middle instead,
+ *  which absorbs half a frame of error either way. */
+export function sequenceStreamTime(asset: any, time: number): number | undefined {
+  const { fps, frames } = asset.imageSequence || {};
+  if (!validSequenceFps(fps) || !Number.isSafeInteger(frames) || frames < 2) return undefined;
+  const index = Math.max(0, Math.min(frames - 1, Math.floor((time + 1e-7) * fps)));
+  return (index + .5) / fps;
 }

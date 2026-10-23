@@ -22,6 +22,7 @@ function harness(kernel: Kernel = createKernel()) {
   const applied: Array<{ commands: unknown; meta: unknown }> = [];
   const reported: Array<{ id: string; error: unknown }> = [];
   const toasts: string[] = [];
+  const toastCalls: Array<{ text: string; opts: unknown }> = [];
   const opened: string[] = [];
   const bag: Record<string, Record<string, unknown>> = {};
 
@@ -55,8 +56,9 @@ function harness(kernel: Kernel = createKernel()) {
     state: { doc: {}, sel: {}, transport: {}, perf: {} },
     ui: {
       controls: {} as HostDeps['ui']['controls'],
-      toast: (text) => void toasts.push(text),
+      toast: (text, opts) => { toasts.push(text); toastCalls.push({ text, opts }); },
       confirm: async () => true,
+      openExternal: async () => true,
       menu: vi.fn(),
       modal: () => ({ close: () => {}, body: document.createElement('div') }),
       icon: (name) => `<svg data-icon="${name}"></svg>`
@@ -66,7 +68,8 @@ function harness(kernel: Kernel = createKernel()) {
       pick: async () => [],
       import: async (file) => ({ id: 'asset-1', name: file.name, kind: 'model' }),
       get: () => undefined,
-      readText: async () => ''
+      readText: async () => '',
+      importUrl: async () => 'asset-1'
     },
     storage,
     extensions: { list: () => [], setEnabled: async () => {}, remove: async () => {}, reload: async () => {}, reveal: async () => {}, requestFix: vi.fn(), rebase: vi.fn() },
@@ -81,10 +84,70 @@ function harness(kernel: Kernel = createKernel()) {
     reportRuntimeError: (id, error) => void reported.push({ id, error })
   };
 
-  return { kernel, deps, applied, reported, toasts, opened, bag };
+  return { kernel, deps, applied, reported, toasts, toastCalls, opened, bag };
 }
 
 describe('createExtensionAPI', () => {
+  it('owns import defaults, copies inputs and restores prior overrides on unload', () => {
+    const { kernel, deps } = harness();
+    const first = createExtensionAPI(kernel, record('first'), deps);
+    const second = createExtensionAPI(kernel, record('second'), deps);
+    expect(first.api.media.getImportDefaults()).toBeNull();
+    const defaults = { anchor: { x: 0.5, y: 0.5 } };
+    const registration = first.api.media.registerImportDefaults(defaults);
+    defaults.anchor.x = 0;
+    const read = first.api.media.getImportDefaults()!;
+    read.anchor.y = 1;
+    expect(second.api.media.getImportDefaults()).toEqual({ anchor: { x: 0.5, y: 0.5 } });
+    second.api.media.registerImportDefaults({ anchor: { x: 0, y: 1 } });
+    expect(first.api.media.getImportDefaults()).toEqual({ anchor: { x: 0, y: 1 } });
+    second.disposeAll();
+    expect(first.api.media.getImportDefaults()).toEqual({ anchor: { x: 0.5, y: 0.5 } });
+    for (const x of [NaN, Infinity, -1, 2, '0.5']) {
+      expect(() => first.api.media.registerImportDefaults({ anchor: { x: x as number, y: 0.5 } })).toThrow('finite numbers');
+    }
+    registration.dispose();
+    expect(first.api.media.getImportDefaults()).toBeNull();
+  });
+
+  it('owns Properties sections, guards failures and disposes mounted controls once', () => {
+    const { kernel, deps, reported } = harness();
+    const changed = vi.fn();
+    kernel.events.on('inspector:changed', changed);
+    const handle = createExtensionAPI(kernel, record(), deps);
+    const cleanup = vi.fn();
+    handle.api.inspector.registerSection({ id: 'anchors', title: 'Anchor presets', build(target) {
+      target.textContent = 'Nine anchor presets';
+      return cleanup;
+    } });
+    const target = document.createElement('div');
+    const mounted = handle.api.inspector.sections()[0]!.build(target, { layerIds: ['a'] });
+    expect(target.textContent).toBe('Nine anchor presets');
+    handle.disposeAll();
+    if (mounted && typeof mounted !== 'function') mounted.dispose();
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(target.childNodes).toHaveLength(0);
+    expect(kernel.inspectorSections.list()).toEqual([]);
+    expect(changed).toHaveBeenCalledTimes(2);
+    const broken = createExtensionAPI(kernel, record('broken'), deps);
+    broken.api.inspector.registerSection({ id: 'broken', title: 'Broken', build() { throw new Error('bad control'); } });
+    expect(() => broken.api.inspector.sections()[0]!.build(target, { layerIds: [] })).not.toThrow();
+    expect(reported).toEqual([expect.objectContaining({ id: 'broken', error: expect.any(Error) })]);
+  });
+
+  it('attributes every notice to the extension that raised it', () => {
+    const { kernel, deps, toastCalls } = harness();
+    const handle = createExtensionAPI(kernel, record(), deps);
+
+    handle.api.ui.toast('Select a layer first');
+    expect(toastCalls[0]?.opts).toEqual({ source: { id: 'vhs', name: 'VHS effect' } });
+
+    // An extension cannot dress its notice up as the editor's own error, or
+    // claim to speak for another extension.
+    handle.api.ui.toast('Render failed', { error: true, source: { id: 'timeline', name: 'Timeline' } } as never);
+    expect(toastCalls[1]?.opts).toEqual({ error: true, source: { id: 'vhs', name: 'VHS effect' } });
+  });
+
   it('contains asynchronous command failures and ignores disposed callbacks', async () => {
     const { kernel, deps, reported } = harness();
     const handle = createExtensionAPI(kernel, record(), deps);
@@ -252,6 +315,25 @@ describe('createExtensionAPI', () => {
     // list() is the backend's view: kernel panels plus whatever legacy PM owns.
     expect(api.panels.list()).toEqual(['viewer']);
     expect(api.panels.isOpen('notes')).toBe(false);
+  });
+
+  it('an open() during activate() does not undo a panel the user closed', () => {
+    const { kernel, deps, opened } = harness();
+    const hidden = new Set(['notes']);
+    deps.panelsBackend.isHidden = (id) => hidden.has(id);
+    const handle = createExtensionAPI(kernel, record(), deps);
+    handle.api.panels.register({ id: 'notes', title: 'Notes', build: () => {} });
+    // Boot-time reveal of a panel the user hid: ignored.
+    handle.setActivating(true);
+    handle.api.panels.open('notes', 'left');
+    expect(opened).toEqual([]);
+    // A panel that was never hidden still opens during activation.
+    handle.api.panels.open('fresh', 'left');
+    expect(opened).toEqual(['fresh']);
+    // After activation, an explicit open (command, menu) brings the hidden panel back.
+    handle.setActivating(false);
+    handle.api.panels.open('notes', 'left');
+    expect(opened).toEqual(['fresh', 'notes']);
   });
 
   it('registrations made after disposal are dropped immediately', () => {

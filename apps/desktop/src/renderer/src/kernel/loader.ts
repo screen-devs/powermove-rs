@@ -9,10 +9,18 @@
  * The kernel keeps running with one fewer contributor and the Mods panel shows
  * why.
  */
-import type { Disposable, ExtensionModule } from './api';
+import type { Disposable, ExtensionModule, UIAPI } from './api';
 import type { ExtensionHealth, ExtensionManifest, ExtensionRecord, ExtensionsBridge, ExtensionsChangedEvent } from '../../../shared/extensions';
-import { MANIFEST_LIMITS } from '../../../shared/extensions';
+import type { VarsBridge } from '../../../shared/vars-ipc';
+import { MANIFEST_LIMITS, needsTrust } from '../../../shared/extensions';
 import { createExtensionAPI, type ExtensionHandle, type HostDeps } from './host';
+import { createSandboxRuntime, type SandboxRuntime } from './sandbox-host';
+import { extensionLoad, noticeSlowExtensions } from '../runtime/extension-load';
+
+/* The loader speaks about an extension rather than as one, so it stamps the
+   attribution itself. `source` is host-side and not part of the extension's
+   own toast options. */
+type ToastArgs = Parameters<UIAPI['toast']>[1];
 import type { Kernel } from './registries';
 import { activeIds as storeActiveIds, patchRecord, recordFor, records as storeRecords, setActiveIds, setHealth, setRecords } from './extensions.svelte';
 
@@ -21,6 +29,8 @@ export type BuiltinFactory = () => Promise<ExtensionModule>;
 export interface LoaderOptions {
   kernel: Kernel;
   bridge: ExtensionsBridge | null;
+  /** Delivers each extension's values to `api.vars` before it activates. */
+  vars?: Pick<VarsBridge, 'values'> | null;
   /** id → dynamic import of the built-in module. Key order IS the load order. */
   builtins: Record<string, BuiltinFactory>;
   deps: Omit<HostDeps, 'reportRuntimeError'>;
@@ -56,9 +66,11 @@ const DEFAULT_WINDOW = 10_000;
 const DEFAULT_LIMIT = 2;
 
 /** Health states that mean "there is nothing worth trying to import". */
-const BLOCKED = new Set(['build-error', 'manifest-error', 'needs-update']);
+const BLOCKED = new Set(['build-error', 'manifest-error', 'needs-update', 'needs-setup', 'needs-trust']);
 
 const nameOf = (record: ExtensionRecord | undefined, id: string): string => record?.manifest?.name ?? id;
+/** A sandbox that stopped responding (sandbox-host.ts): it is turned off at once. */
+const isFatal = (error: unknown): boolean => (error as { code?: unknown } | null)?.code === 'sandbox_fatal';
 
 export function errorText(error: unknown): string {
   const raw = error instanceof Error ? error.message || String(error) : String(error);
@@ -80,10 +92,17 @@ export function planLoad(records: ExtensionRecord[], builtinOrder: string[]): Lo
 
   for (const record of records) {
     if (record.enabled === false) {
-      skipped.push({ id: record.id, health: { state: 'disabled' } });
+      skipped.push({ id: record.id, health: record.health.state === 'runtime-error' ? record.health : { state: 'disabled' } });
       continue;
     }
     if (BLOCKED.has(record.health?.state)) continue; // main already recorded why
+    /* Someone else's code asking for full access runs only once trusted.
+       Main already withholds its bundle; this holds even if a record says
+       otherwise. */
+    if (needsTrust(record)) {
+      skipped.push({ id: record.id, health: { state: 'needs-trust' } });
+      continue;
+    }
     candidates.add(record.id);
   }
 
@@ -137,8 +156,9 @@ export function planLoad(records: ExtensionRecord[], builtinOrder: string[]): Lo
 
 interface ActiveEntry {
   record: ExtensionRecord;
-  module: ExtensionModule;
+  module: ExtensionModule | null;
   handle: ExtensionHandle;
+  sandbox?: SandboxRuntime;
 }
 
 export function createLoader(options: LoaderOptions): Loader {
@@ -215,6 +235,21 @@ export function createLoader(options: LoaderOptions): Loader {
     if (disposed || active.has(record.id)) return active.has(record.id);
     const id = record.id;
 
+    if (record.trust === 'store') {
+      try {
+        /* The sandbox keeps its own deadline: past it, it tears the runtime
+           down and tells a spinning one from a slow one, within this budget.
+           A second timer here would report the same failure twice. */
+        const sandbox = await createSandboxRuntime(kernel, record, hostDeps, await valuesFor(record), { timeoutMs });
+        active.set(id, { record, module: null, handle: sandbox.handle, sandbox });
+        activationFailures.delete(id);
+        syncActive();
+        reportHealth(id, { state: 'ok' });
+        kernel.events.emit('extension:loaded', { id });
+        return true;
+      } catch (error) { failActivation(record, error); return false; }
+    }
+
     let module: ExtensionModule;
     try {
       module = await withTimeout(importModule(record), timeoutMs, `import of "${id}" timed out`);
@@ -224,8 +259,27 @@ export function createLoader(options: LoaderOptions): Loader {
       return false;
     }
 
-    const handle = createExtensionAPI(kernel, record, hostDeps);
+    const handle = createExtensionAPI(kernel, record, hostDeps, await valuesFor(record));
     try {
+      // Compiled bundles expose inert CSS. The activation owns every style,
+      // including extracted Svelte styles, so cached modules can be re-enabled.
+      const bundle = module as ExtensionModule & {
+        __powermoveStyles?: string[];
+        __powermoveAcquireStyles?: (add: (css: string) => void) => () => void;
+      };
+      const addStyle = (css: string): void => {
+        const style = document.createElement('style');
+        style.dataset.powermoveExtension = id;
+        style.textContent = css;
+        handle.api.onDispose(() => style.remove());
+        document.head.appendChild(style);
+      };
+      if (bundle.__powermoveAcquireStyles) {
+        handle.api.onDispose(bundle.__powermoveAcquireStyles(addStyle));
+      } else {
+        for (const css of bundle.__powermoveStyles ?? []) addStyle(css);
+      }
+      handle.setActivating(true);
       const result = await withTimeout(Promise.resolve(module.default(handle.api)), timeoutMs, `activate() of "${id}" timed out`);
       const disposable = result as Disposable | void;
       if (disposable && typeof disposable.dispose === 'function') handle.api.onDispose(() => disposable.dispose());
@@ -233,6 +287,8 @@ export function createLoader(options: LoaderOptions): Loader {
       handle.disposeAll();
       failActivation(record, error);
       return false;
+    } finally {
+      handle.setActivating(false);
     }
 
     active.set(id, { record, module, handle });
@@ -243,13 +299,39 @@ export function createLoader(options: LoaderOptions): Loader {
     return true;
   }
 
+  /** Fetched once per activation. A declared value that is missing is simply absent. */
+  async function valuesFor(record: ExtensionRecord): Promise<Record<string, string>> {
+    const declared = new Set((record.manifest?.vars ?? []).map((decl) => decl.key));
+    if (!declared.size || record.scope === 'builtin' || !options.vars) return {};
+    try {
+      const values = await withTimeout(options.vars.values({ id: record.id }), timeoutMs, 'values timed out');
+      return Object.fromEntries(Object.entries(values ?? {})
+        .filter(([key, value]) => declared.has(key) && typeof value === 'string'));
+    } catch (error) {
+      console.warn(`[kernel] values for "${record.id}" are unavailable`, error);
+      return {};
+    }
+  }
+
   function failActivation(record: ExtensionRecord, error: unknown): void {
     const id = record.id;
     activationFailures.add(id);
     console.error(`[kernel] extension "${id}" failed to activate`, error);
     kernel.disposeOwner(id);
+    const name = nameOf(recordFor(id) ?? record, id);
+    /* A sandbox that spun while activating would spin again on every launch:
+       it is turned off, as when it stops responding later. */
+    if (isFatal(error)) {
+      const health = { state: 'runtime-error' as const, error: errorText(error) };
+      patchRecord(id, { enabled: false, health });
+      reportHealth(id, health);
+      stoppedToast(id, name);
+      return;
+    }
     reportHealth(id, { state: 'activation-error', error: errorText(error) });
-    deps.ui.toast(`${nameOf(recordFor(id) ?? record, id)} failed to load`, { sticky: true });
+    /* An extension that will not load is that extension's alert. The editor is
+       still whole, and the notice belongs to whoever broke. */
+    deps.ui.toast(`${name} failed to load`, { sticky: true, source: { id, name } } as ToastArgs);
   }
 
   async function deactivate(id: string): Promise<void> {
@@ -258,7 +340,8 @@ export function createLoader(options: LoaderOptions): Loader {
     syncActive();
     if (entry) {
       try {
-        await entry.module.deactivate?.();
+        if (entry.sandbox) entry.sandbox.dispose();
+        else await entry.module?.deactivate?.();
       } catch (error) {
         console.error(`[kernel] extension "${id}" deactivate() threw`, error);
       }
@@ -266,6 +349,7 @@ export function createLoader(options: LoaderOptions): Loader {
     }
     kernel.disposeOwner(id);
     failures.delete(id);
+    extensionLoad.forget(id);
     if (entry) kernel.events.emit('extension:unloaded', { id });
   }
 
@@ -317,15 +401,22 @@ export function createLoader(options: LoaderOptions): Loader {
     const stamps = (failures.get(id) ?? []).filter((t) => now - t < windowMs);
     stamps.push(now);
     failures.set(id, stamps);
-    if (stamps.length < limit) return;
+    // A sandbox that stopped responding is already gone: no second chance to count.
+    if (!isFatal(error) && stamps.length < limit) return;
     failures.delete(id);
     const name = nameOf(recordFor(id), id);
+    activationFailures.add(id);
     enqueue(async () => {
+      const health = { state: 'runtime-error' as const, error: errorText(error) };
+      patchRecord(id, { enabled: false, health });
       await deactivate(id);
-      patchRecord(id, { enabled: false });
-      reportHealth(id, { state: 'runtime-error', error: errorText(error) });
-      deps.ui.toast(`${name} stopped working — check Mods`, { sticky: true });
+      reportHealth(id, health);
+      stoppedToast(id, name);
     });
+  }
+
+  function stoppedToast(id: string, name: string): void {
+    deps.ui.toast(`${name} stopped working — check Mods`, { sticky: true, source: { id, name } } as ToastArgs);
   }
 
   function enqueue(task: () => Promise<void>): Promise<void> {
@@ -380,15 +471,32 @@ export function createLoader(options: LoaderOptions): Loader {
   }
 
   function onChanged(event: ExtensionsChangedEvent): void {
-    kernel.events.emit('extensions:changed', { ids: [...event.ids], reason: event.reason });
     enqueue(async () => {
       const list = await refreshRecords();
       /* Health events are round-trips from this renderer. Re-plan so a failed
          replacement can expose its fallback, but do not reload the reporting
          extension and start another report loop. */
       await reconcile(list, event.reason === 'health' ? [] : event.ids);
+      // List subscribers must observe the reconciled snapshot, not the state
+      // from before the asynchronous main-process registry read.
+      kernel.events.emit('extensions:changed', { ids: [...event.ids], reason: event.reason });
     });
   }
+
+  /* Name an extension the user added when it is costing the editor too much
+     (runtime/extension-load.ts). Built-ins are ours to fix, not theirs. */
+  const stopSlowNotices = noticeSlowExtensions({
+    nameOf: (id) => {
+      const record = recordFor(id);
+      return record && record.scope !== 'builtin' && active.has(id) ? nameOf(record, id) : null;
+    },
+    toast: (text, opts) => deps.ui.toast(text, opts as ToastArgs),
+    turnOff: async (id) => {
+      if (bridge) return void await bridge.setEnabled({ id, enabled: false });
+      patchRecord(id, { enabled: false });
+      await enqueue(() => deactivate(id));
+    }
+  });
 
   if (bridge) {
     try {
@@ -410,6 +518,7 @@ export function createLoader(options: LoaderOptions): Loader {
     whenIdle: () => queue,
     async dispose() {
       disposed = true;
+      stopSlowNotices();
       unsubscribe?.();
       unsubscribe = null;
       await queue;

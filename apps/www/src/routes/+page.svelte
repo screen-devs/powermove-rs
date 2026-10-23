@@ -1,13 +1,16 @@
 <script lang="ts">
-  import { ArrowUpRight, FileCode2, Layers2, Puzzle, Undo2 } from '@lucide/svelte';
+  import { ArrowUpRight } from '@lucide/svelte';
   import Header from '$lib/Header.svelte';
   import HeroAnimation from '$lib/HeroAnimation.svelte';
   import LogoCloud from '$lib/LogoCloud.svelte';
   import Features from '$lib/Features.svelte';
-  import Showcase from '$lib/Showcase.svelte';
+  import { GITHUB } from '$lib/links';
+  import { download, resolveDownload, stars } from '$lib/download.svelte';
 
 
   const year = new Date().getFullYear();
+
+  $effect(() => { resolveDownload(); });
 
   let stack = $state<HTMLElement | undefined>();
   let stackIn = $state(false);
@@ -24,45 +27,48 @@
 </script>
 
 <svelte:head>
-  <title>Powermove — Make your move.</title>
-  <meta name="description" content="A motion editor with AI in the loop and you in the driver’s seat. Real layers, editable keyframes, and an editor you can rewrite. In development." />
+  <title>Powermove</title>
+  <meta name="description" content="A motion editor with AI in the loop and you in the driver’s seat. Real layers, editable keyframes, and an editor you can rewrite." />
+  <link rel="canonical" href="https://trypowermove.com/" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="Powermove" />
+  <meta property="og:url" content="https://trypowermove.com/" />
+  <meta property="og:title" content="Powermove" />
+  <meta property="og:description" content="A motion editor with AI in the loop and you in the driver’s seat. Real layers, editable keyframes, and an editor you can rewrite." />
+  <meta property="og:image" content="https://trypowermove.com/og.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="The Powermove editor with a layer stack, inspector, agent panel, and keyframe timeline." />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Powermove" />
+  <meta name="twitter:description" content="A motion editor with AI in the loop and you in the driver’s seat. Real layers, editable keyframes, and an editor you can rewrite." />
+  <meta name="twitter:image" content="https://trypowermove.com/og.png" />
 </svelte:head>
 
 <Header />
 
 <main id="top">
   <section class="hero" aria-labelledby="headline">
-    <a class="eyebrow" href="https://github.com/motionerapp/Powermove" target="_blank" rel="noopener">Open source <span class="eyebrow-sep"></span><span class="muted">Star Powermove on GitHub</span> <ArrowUpRight size={13} aria-hidden="true" /></a>
+    <a class="eyebrow" href={GITHUB} target="_blank" rel="noopener">Free and open source{#if stars.label}<span class="eyebrow-sep" aria-hidden="true"></span><span class="muted">{stars.label} stars on GitHub</span>{/if}</a>
     <h1 id="headline" class="sr-only">Shape your video editor</h1>
     <HeroAnimation />
     <div class="wrap hero-intro">
-      <p class="lede">A motion editor with an agent in the loop and you in the driver’s seat. Real layers, editable keyframes, and an interface that rewrites itself around the work.</p>
+      <p class="lede">Powermove is a video editing app that lets you shape the featureset. Simply connect an agent and ask.</p>
       <div class="cta center">
-        <a class="button primary lg" href="mailto:hello@motioner.app?subject=Powermove%20waitlist">Join the waitlist <ArrowUpRight size={15} /></a>
-        <a class="button lg" href="#editor">See the editor</a>
+        <a class="button primary lg" href={download.href}>Download for macOS{#if download.version} <span class="muted">{download.version}</span>{/if}</a>
+        <a class="button lg" href={GITHUB} target="_blank" rel="noopener">Star on GitHub <ArrowUpRight size={15} /></a>
       </div>
     </div>
     <figure class="stage" id="editor">
-      <img src="/editor-hero.png" alt="Powermove editor over a desert night sky, with a cinematic title, layer stack, property inspector, agent panel, and keyframe timeline." width="1920" height="1280" fetchpriority="high" />
+      <img class="editor-screenshot" src="/editor-screenshot.png" alt="Powermove editor in a light theme, showing the Change literally anything composition, agent conversation, timeline, properties, and effects." width="1920" height="1305" fetchpriority="high" />
     </figure>
     <LogoCloud />
   </section>
 
-  <Showcase />
-
   <Features />
 
-  <section class="principles" aria-labelledby="principles-title">
+  <section class="principles" aria-label="The layers you can change">
     <div class="wrap principles-layout">
-      <div class="principles-copy">
-        <h2 id="principles-title"><span class="strong">Yours to change.</span><br />Every layer of it.</h2>
-        <ul class="principle-list">
-          <li><Undo2 size={16} strokeWidth={1.75} aria-hidden="true" /><div><span class="strong">Undoable.</span> Agent edits and yours share one history. Nothing happens off the record.</div></li>
-          <li><Layers2 size={16} strokeWidth={1.75} aria-hidden="true" /><div><span class="strong">Real layers.</span> Generated work is an ordinary composition, not a rendered clip.</div></li>
-          <li><Puzzle size={16} strokeWidth={1.75} aria-hidden="true" /><div><span class="strong">Personal software.</span> Built-in panels are mods. Fork one, or ask for a new one.</div></li>
-          <li><FileCode2 size={16} strokeWidth={1.75} aria-hidden="true" /><div><span class="strong">Yours on disk.</span> Projects save as files with embedded media and a kept backup.</div></li>
-        </ul>
-      </div>
       <div class="stack" bind:this={stack} data-in={stackIn ? '' : undefined} aria-hidden="true">
         <div class="slab yours" style="--i:4"><span class="slab-name">Your mods</span><span class="slab-note">Yours to add. Same API as everything below</span></div>
         <div class="slab" style="--i:3"><span class="slab-name">Panels</span><span class="slab-note">Timeline, inspector, agent, media</span></div>
@@ -75,26 +81,27 @@
 
   <section class="final" aria-labelledby="final-title">
     <div class="wrap">
-      <h2 id="final-title">Make your move.</h2>
+      <h2 id="final-title">Your move.</h2>
+      <p class="final-note">Free and open source for macOS.</p>
       <div class="cta center">
-        <a class="button primary lg" href="mailto:hello@motioner.app?subject=Powermove%20waitlist">Join the waitlist <ArrowUpRight size={15} /></a>
-        <a class="button lg" href="#editor">See the editor</a>
+        <a class="button primary lg" href={download.href}>Download for macOS</a>
+        <a class="button lg" href={GITHUB} target="_blank" rel="noopener">Star on GitHub{#if stars.label} <span class="muted">{stars.label}</span>{/if} <ArrowUpRight size={15} /></a>
       </div>
     </div>
   </section>
 
   <footer>
     <div class="wrap foot">
-      <a class="logo" href="#top" aria-label="Powermove home"><img src="/powermove-logo.svg" width="24" height="21" alt="" /></a>
+      <a class="logo" href="/#top" aria-label="Powermove home"><img src="/powermove-logo.svg" width="24" height="21" alt="" /></a>
       <div>
         <span class="foot-title">Product</span>
-        <ul><li><a href="#editor">Editor</a></li><li><a href="#agent">Agent</a></li><li><a href="#mods">Mods</a></li><li><a href="#export">Export</a></li></ul>
+        <ul><li><a href="#editor">Editor</a></li><li><a href="#agent">Agent</a></li><li><a href="#extensions">Extensions</a></li><li><a href="#export">Export</a></li></ul>
       </div>
       <div>
         <span class="foot-title">Company</span>
-        <ul><li><a href="https://github.com/motionerapp/Powermove" target="_blank" rel="noopener">GitHub</a></li><li><a href="mailto:hello@motioner.app">hello@motioner.app</a></li><li><a href="mailto:hello@motioner.app?subject=Powermove%20waitlist">Waitlist</a></li></ul>
+        <ul><li><a href={GITHUB} target="_blank" rel="noopener">GitHub</a></li><li><a href="mailto:hello@iterative.computer">hello@iterative.computer</a></li><li><a href="/privacy">Privacy</a></li><li><a href="/terms">Terms</a></li></ul>
       </div>
-      <div class="foot-copy">© Powermove {year}. Open source, in development.</div>
+      <div class="foot-copy">© Iterative Computer {year}. Open source.</div>
     </div>
   </footer>
 </main>

@@ -4,7 +4,7 @@ The Electron editor. This is the only supported application; the earlier root-pa
 
 ## Project files
 
-Use **Command+S** to save an editable `.pmv` project and **Shift+Command+S** for Save As. Subsequent saves update the same file, retain a `.pmv1` backup, and keep unsaved changes separate from local recovery. **Command+O** reopens projects with their embedded media. See [saving and recovery](docs/project-files.md) for details and the current file-size limit.
+Use **Command+S** to save an editable `.pmv` project and **Shift+Command+S** for Save As. Subsequent saves update the same file, keep the previous version in a hidden backup store, and keep unsaved changes separate from local recovery. **Command+O** reopens projects with their embedded media. See [saving and recovery](docs/project-files.md) for details and the current file-size limit.
 
 ## Kernel and extensions
 
@@ -49,6 +49,29 @@ Project expressions run through a bounded parser/interpreter, so the privileged
 editor document does not permit `unsafe-eval`. Generated JavaScript remains in
 its separate opaque-origin sandbox with no network or native bridge.
 
+## Agent tools
+
+Codex and Claude agents can use all enabled user-scoped MCP servers configured
+for that provider, alongside Powermove's built-in tools. Registrations are read
+again on each message; there is no Powermove-specific external-tool allowlist.
+Codex reads `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`). Claude reads
+`~/.claude.json` (or `$CLAUDE_CONFIG_DIR/.claude.json`). Configure Claude servers
+with `claude mcp add --scope user` to make them available across projects.
+
+The `powermove` server name is reserved for the live editor connection. Disabled
+servers stay disabled. Provider-level tool restrictions and authentication still
+apply; remote services may need their own login in Powermove's provider runtime.
+User skills, plugins, hooks, rules, custom commands, and agent definitions are
+available through the provider's normal resource discovery. Powermove shares the
+resource folders and imports their settings without sharing login or session
+files. Existing private resource folders are backed up before migration.
+Resource configuration refreshes when the provider runtime starts; restart
+Powermove after changing plugin settings. Project-local resources are discovered
+from the agent workspace, not from unrelated repositories.
+Existing Editor, Project, and Computer file-access modes continue to apply to
+built-in tools. External MCP servers run with their configured access, which may
+include files or services beyond the project workspace.
+
 ## Development
 
 Requirements: macOS on Apple Silicon and bun 1.3 or newer (the repo pins `bun@1.3.14`). Xcode command line tools are needed to build the native haptics addon. Agent features additionally require the Codex CLI or Claude Code to be installed and signed in.
@@ -86,6 +109,8 @@ macOS packaging is currently ad-hoc signed for development distribution; see the
 
 - Unsupported MOV/ProRes video is converted automatically to a durable H.264
   editing proxy while the original media stays embedded in the editable project.
+- Containers Chromium cannot open — MKV, AVI, WMV, FLV, MPEG-PS/TS, MXF and the
+  rest — convert on import through the same proxy path.
 - Export includes playable H.264/AAC MP4, frame-exact WebM/VP9/Opus,
   realtime WebM, still PNG, and PNG-sequence delivery.
 - Local builds remain ad-hoc signed. `bun run dist:release` is the guarded
@@ -113,6 +138,36 @@ project. The animation performance baseline now measures actual frame changes
 - [macOS release process](docs/release.md)
 - [Phase 6 deletion manifest](docs/phase6-deletions.md)
 - [e2e media fixtures](e2e/fixtures/README.md)
+
+## Supported media
+
+| Kind | Imports directly | Converted on import |
+| --- | --- | --- |
+| Still image | PNG, JPEG, WebP, AVIF, BMP, ICO, SVG | TIFF, HEIC/HEIF |
+| Animated image | — | GIF, APNG, animated WebP, animated AVIF |
+| Video | MP4, MOV, M4V, WebM | MKV, AVI, WMV, ASF, FLV, MPG/MPEG, M2V, TS/M2TS/MTS, 3GP/3G2, MXF, OGV, DV, VOB |
+| Audio | WAV, MP3, M4A, AAC, OGG/OGA, Opus, WEBA, FLAC, AIF/AIFF | — |
+| Model | OBJ | — |
+
+A MOV or MP4 holding a codec Chromium refuses (notably ProRes) also converts,
+after the decode attempt fails. Conversion happens in the main process with the
+bundled FFmpeg; HEIC and HEIF go through macOS `sips`, which reads the HEIF
+variants FFmpeg 6 cannot. Powermove stores the converted media in the project,
+so a saved `.pmv` never depends on the original file.
+
+## Animated images
+
+An animated GIF, APNG, WebP or AVIF imports as a video clip rather than a still,
+with the normal trim, speed, undo, playback, and export controls. Chromium
+decodes the frames — it is the only decoder here that reads all four containers —
+and the frames encode into the same transparent VP9 clip numbered image
+sequences produce, so transparency and frame order survive.
+
+Each frame is held for its own delay. When the delays share a divisor, the clip
+plays at exactly that rate; when they do not, the frames are oversampled onto a
+bounded rate instead, which keeps the total duration right. A still saved in one
+of these containers still imports as an image. Animations above 2,400 frames are
+rejected rather than encoded.
 
 ## Image sequences
 

@@ -15,15 +15,17 @@ import {
 import { EXTENSION_ID } from '../../shared/extensions';
 import { isArrayOf, isBytes, isOneOf, isRecord, isString } from '../../shared/guards';
 import { buildAutonomousArgv, buildEditorArgv } from './adapter';
-import { publishExtensionChanges } from './change-history';
+import { publishExtensionChanges, withStageSnapshot } from './change-history';
+import { AgentResultValidationError, repairAgentResult } from './result-repair';
+import { validateStagedExtensions } from './validate-staged-extensions';
 import { collectArtifacts } from './artifacts';
 import { consumeToken } from './consent';
 import { discoverCodexBinary } from './env';
 import { CodexEventParser } from './events';
 import { agentInstructions, agentResultSchema } from './instructions';
 import type { NativeMcpServerConfig } from '../agent-tools/spec';
+import { loadUserMcpServers, type UserMcpServers } from '../agent-tools/user-mcp';
 import {
-  discoverUserSkillFiles,
   isolatedCodexEnvironment,
   prepareIsolatedCodexHome
 } from './isolation';
@@ -40,10 +42,11 @@ import {
   type AgentApiPackFile,
   type CodexAuthority
 } from './workspace';
+import { imageExtension } from '../image-extension';
 
 const MODES = ['editor', 'autonomous'] as const;
 const ACCESS = ['editor', 'project', 'computer'] as const;
-const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+const EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
 const PROVIDERS = ['chatgpt', 'claude', 'compatible'] as const;
 const DEFAULT_TIMEOUT_MS = 3_600_000;
 const MAX_DIAGNOSTIC_BYTES = 2 * 1024 * 1024;
@@ -66,8 +69,8 @@ export interface CodexRunOptions {
   onWarning?: (text: string) => void;
   spawnProcess?: SpawnLike;
   consumeConsentToken?: (token: string) => boolean;
-  discoverDisabledSkillPaths?: () => Promise<string[]>;
   nativeTools?: NativeMcpServerConfig;
+  externalMcpServers?: UserMcpServers;
 }
 
 interface ActiveRun {
@@ -103,6 +106,8 @@ export function isCodexRunRequest(value: unknown): value is CodexRunRequest {
   if (value.provider !== undefined && !isOneOf(value.provider, PROVIDERS)) return false;
   if (value.threadId !== undefined && (!isString(value.threadId) || !/^[A-Za-z0-9_-]{1,120}$/.test(value.threadId))) return false;
   if (!isOneOf(value.mode, MODES)) return false;
+  if (value.context !== undefined && !isOneOf(value.context, ['app', 'project'] as const)) return false;
+  if (value.context === 'app' && (value.mode !== 'autonomous' || value.access !== 'project')) return false;
   if (!isString(value.prompt, LIMITS.codexPromptChars) || value.prompt.length === 0) return false;
   if (!(value.schema === null || isRecord(value.schema))) return false;
   if (!isArrayOf(value.images, LIMITS.codexImages, (image): image is Uint8Array =>
@@ -111,9 +116,11 @@ export function isCodexRunRequest(value: unknown): value is CodexRunRequest {
   if (!(value.reasoningEffort === null || isOneOf(value.reasoningEffort, EFFORTS))) return false;
   if (!isOneOf(value.access, ACCESS)) return false;
   if (!isString(value.projectId) || !PROJECT_ID.test(value.projectId)) return false;
+  if (value.context === 'app' && value.projectId !== 'powermove-global') return false;
   if (!isString(value.projectName)) return false;
   if (!(value.projectJSON === null || (isString(value.projectJSON) &&
     utf8Bytes(value.projectJSON) <= LIMITS.codexProjectJsonBytes))) return false;
+  if (value.context === 'app' && value.projectJSON !== '{}') return false;
   if (!isArrayOf(value.attachments, LIMITS.codexAttachments, (attachment): attachment is { name: string; data: Uint8Array } =>
     isRecord(attachment) && isString(attachment.name) &&
     isBytes(attachment.data))) return false;
@@ -306,7 +313,7 @@ async function writeEditorInputs(req: CodexRunRequest): Promise<{
   await writeFile(schemaPath, JSON.stringify(req.schema ?? { type: 'object' }, null, 2));
   const imagePaths: string[] = [];
   for (const [index, image] of req.images.entries()) {
-    const extension = image[0] === 0x89 && image[1] === 0x50 ? 'png' : 'jpg';
+    const extension = imageExtension(image);
     const imagePath = path.join(directory, `frame-${index}.${extension}`);
     await writeFile(imagePath, image);
     imagePaths.push(imagePath);
@@ -358,6 +365,7 @@ export class CodexRunner {
     };
     this.active.set(req.id, state);
     let editorDirectory: string | null = null;
+    let repairingResult = false;
     let timeout: NodeJS.Timeout | null = null;
 
     try {
@@ -365,9 +373,9 @@ export class CodexRunner {
 
       const binary = options.binary ?? await discoverCodexBinary(options.codexBinaryPref ?? null);
       if (this.cancelled.has(req.id)) return cancelledResult(state);
-      const [codexHome, disabledSkillPaths] = await Promise.all([
+      const [codexHome, externalMcpServers] = await Promise.all([
         prepareIsolatedCodexHome(options.userData),
-        (options.discoverDisabledSkillPaths ?? discoverUserSkillFiles)()
+        options.externalMcpServers ?? loadUserMcpServers('chatgpt')
       ]);
       if (this.cancelled.has(req.id)) return cancelledResult(state);
 
@@ -381,7 +389,7 @@ export class CodexRunner {
           imagePaths: input.imagePaths,
           model: req.model,
           reasoningEffort: req.reasoningEffort,
-          disabledSkillPaths
+          externalMcpServers
         });
         const attempt = await this.execute(req, state, binary, argv, input.directory, codexHome, null, options, (timer) => {
           timeout = timer;
@@ -420,8 +428,10 @@ export class CodexRunner {
 
       let resumeId = await readSession(layout.sessionPath);
       let attempt: AttemptResult | null = null;
-      for (let tryIndex = 0; tryIndex < 2; tryIndex += 1) {
-        const resuming = Boolean(resumeId);
+      const executeAutonomous = async (prompt: string, sessionId: string | null) => {
+        if (this.cancelled.has(req.id)) throw new Error('The Codex run was cancelled.');
+        // A repair must produce a new report, never reuse the rejected output.
+        await rm(layout.outputPath, { force: true });
         const argv = buildAutonomousArgv({
           schemaPath: layout.schemaPath,
           outputPath: layout.outputPath,
@@ -429,25 +439,29 @@ export class CodexRunner {
             projectName: req.projectName,
             artifactPath: `artifacts/${layout.runId}`,
             access: authority,
+            context: req.context,
             extensionsDir: layout.extensionsDir
           }),
-          prompt: req.prompt,
+          prompt,
           imagePaths: layout.imagePaths,
           model: req.model,
           reasoningEffort: req.reasoningEffort,
           access: authority,
+          shellNetwork: req.access === 'project',
           extensionsDir: layout.extensionsDir,
-          sessionId: resumeId,
-          disabledSkillPaths,
-          nativeTools: options.nativeTools
+          sessionId,
+          nativeTools: options.nativeTools,
+          externalMcpServers
         });
-        attempt = await this.execute(req, state, binary, argv, layout.root, codexHome, layout, options, (timer) => {
+        const result = await this.execute(req, state, binary, argv, layout.root, codexHome, layout, options, (timer) => {
           timeout = timer;
         });
-        if (this.cancelled.has(req.id)) {
-          await this.cleanupCancelled(state, options.userData);
-          return cancelledResult(state);
-        }
+        if (this.cancelled.has(req.id)) throw new Error('The Codex run was cancelled.');
+        return result;
+      };
+      for (let tryIndex = 0; tryIndex < 2; tryIndex += 1) {
+        const resuming = Boolean(resumeId);
+        attempt = await executeAutonomous(req.prompt, resumeId);
         const diagnostic = attemptOutput(attempt);
         const silentFailureBeforeTurn = attempt.code !== 0 &&
           !codexTurnStarted(attempt.stdout) && !attemptHasDiagnostic(attempt);
@@ -472,20 +486,38 @@ export class CodexRunner {
         return failure(attempt ? diagnosticText(attempt, 'The autonomous agent failed.') : 'The autonomous agent failed.');
       }
 
-      let parsed: Record<string, unknown>;
-      try {
-        const value: unknown = JSON.parse(await readFile(layout.outputPath, 'utf8'));
-        if (!isRecord(value)) throw new Error('not an object');
-        parsed = value;
-      } catch {
-        return failure('The autonomous agent returned an invalid result.');
-      }
-      const requested = Array.isArray(parsed.artifacts) ? parsed.artifacts : [];
-      parsed.artifacts = await collectArtifacts(layout.runDirectory, layout.runId, requested);
-      parsed.projectId = req.projectId;
-      parsed.access = authorityForAccess(req.access);
-      const extensions = parseAgentExtensionChanges(parsed.extensions);
-      const changeSet = await publishExtensionChanges(layout, extensions ?? []);
+      const { parsed, extensions, changeSet } = await repairAgentResult(async () => {
+        if (this.cancelled.has(req.id)) throw new Error('The Codex run was cancelled.');
+        let parsed: Record<string, unknown>;
+        try {
+          const value: unknown = JSON.parse(await readFile(layout.outputPath, 'utf8'));
+          if (!isRecord(value)) throw new Error('not an object');
+          parsed = value;
+        } catch {
+          throw new AgentResultValidationError('The autonomous agent returned an invalid result. Return a JSON object matching the result schema.');
+        }
+        if (req.context === 'app' && (Array.isArray(parsed.commands) && parsed.commands.length
+          || Array.isArray(parsed.artifacts) && parsed.artifacts.some((item: any) => item?.importToTimeline === true))) {
+          throw new AgentResultValidationError('No project is attached. Return commands: [] and do not import artifacts to a timeline.');
+        }
+        const requested = Array.isArray(parsed.artifacts) ? parsed.artifacts : [];
+        parsed.artifacts = await collectArtifacts(layout.runDirectory, layout.runId, requested);
+        parsed.projectId = req.projectId;
+        parsed.access = authority;
+        const extensions = parseAgentExtensionChanges(parsed.extensions);
+        // One private copy is checked and published; later stage writes cannot ship.
+        const changeSet = await withStageSnapshot(layout, async snapshot => {
+          await validateStagedExtensions(snapshot, extensions ?? []);
+          if (this.cancelled.has(req.id)) throw new Error('The Codex run was cancelled.');
+          return publishExtensionChanges(snapshot, extensions ?? []);
+        }, (extensions ?? []).map(change => change.id));
+        return { parsed, extensions, changeSet };
+      }, async prompt => {
+        repairingResult = true;
+        const repaired = await executeAutonomous(prompt, await readSession(layout.sessionPath));
+        if (repaired.code !== 0) throw new Error(diagnosticText(repaired, 'The agent could not correct its result.'));
+      }, options.onProgress);
+      repairingResult = false;
       await discardExtensionStage(layout);
       return {
         ok: true,
@@ -498,6 +530,9 @@ export class CodexRunner {
       if (this.cancelled.has(req.id)) {
         await this.cleanupCancelled(state, options.userData);
         return cancelledResult(state);
+      }
+      if ((error instanceof AgentResultValidationError || repairingResult) && state.layout) {
+        await preserveCancelledRun(state.layout).catch(checkpointError => options.onWarning?.(`Could not save the agent checkpoint: ${String(checkpointError)}`));
       }
       return failure(error instanceof Error ? error.message : String(error));
     } finally {

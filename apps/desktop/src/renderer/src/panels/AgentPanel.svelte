@@ -10,6 +10,7 @@
   import ThreadPicker from './agent/ThreadPicker.svelte';
   import { agentState } from './agent/agent-state.svelte';
   import { panelFocusContext } from './agent/panel-focus';
+  import { bridge } from '../kernel/bridge';
 
   let { panelId }: PanelProps = $props();
   const PM = window.PM as Record<string, any>;
@@ -25,7 +26,7 @@
   });
 
   /* The transcript owns its vertical scroll. Only edits awaiting review belong
-     in the footer; autonomous replies and their files stay in the thread. */
+     in the footer; autonomous replies stay in the thread. */
   let scroller = $state<HTMLDivElement>();
   let showJump = $state(false);
   let userScrolled = false;
@@ -49,7 +50,7 @@
     if (accountStatus.state !== 'checking') connectionRequired = accountStatus.state !== 'connected';
   });
   const showConnectionGate = $derived(accountStatus.state === 'checking' ? connectionRequired : accountStatus.state !== 'connected');
-  const showSetup = $derived(showConnectionGate && agentState.phase === 'idle' && !agentState.conversation.length && !agentState.activity);
+  const showSetup = $derived(showConnectionGate && agentState.phase === 'idle' && !agentState.conversation.length && !agentState.activity && !agentState.composerDraft);
 
   onMount(() => {
     // Panels mount before app.ts chooses the boot project. Synchronize on the
@@ -69,7 +70,7 @@
   }
 
   function providerApi() {
-    return agentState.provider === 'claude' ? window.powermove?.claude : window.powermove?.chatgpt;
+    return agentState.provider === 'claude' ? bridge()?.claude : bridge()?.chatgpt;
   }
 
   async function connectProvider(): Promise<void> {
@@ -136,11 +137,16 @@
 
   $effect(() => {
     agentState.revision;
-    if (!scroller || showSetup || hasConversationSelection()) return;
-    if (!userScrolled || distanceFromBottom() < 160) {
-      const el = scroller;
-      window.requestAnimationFrame(() => { if (!hasConversationSelection()) el.scrollTo({ top: el.scrollHeight }); });
-    }
+    if (!scroller || showSetup) return;
+    const el = scroller;
+    /* Selection and scroll geometry can force layout. Read them together on
+       the next frame, after a library view swap has finished changing DOM. */
+    const frame = window.requestAnimationFrame(() => {
+      if (!hasConversationSelection() && (!userScrolled || distanceFromBottom() < 160)) {
+        el.scrollTo({ top: el.scrollHeight });
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
   });
 
   $effect(() => {
@@ -149,7 +155,7 @@
     accountBusy = false;
     accountStatus = { state: 'checking', email: null, planType: null, detail: null };
     if (provider === 'compatible') {
-      const update = () => window.powermove?.compatible?.status().then(config => {
+      const update = () => bridge()?.compatible?.status().then(config => {
         if (alive) accountStatus = { state: config.model ? 'connected' : 'disconnected', email: null, planType: null,
           detail: config.model ? null : 'Connect an API, Ollama, or LM Studio in settings.' };
       }, error => { if (alive) accountStatus = unavailable(error); });
@@ -157,7 +163,7 @@
       window.addEventListener('pm-provider-connected', update);
       return () => { alive = false; window.removeEventListener('pm-provider-connected', update); };
     }
-    const api = provider === 'claude' ? window.powermove?.claude : window.powermove?.chatgpt;
+    const api = provider === 'claude' ? bridge()?.claude : bridge()?.chatgpt;
     if (!api) {
       accountStatus = unavailable(new Error(`Restart Powermove to finish installing ${provider === 'claude' ? 'Claude' : 'ChatGPT'} connection.`));
       return;

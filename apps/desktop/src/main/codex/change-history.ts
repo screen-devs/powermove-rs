@@ -4,10 +4,12 @@ import path from 'node:path';
 
 import type { AgentExtensionChange } from '../../shared/ipc';
 import { EXTENSION_ID, parseManifest } from '../../shared/extensions';
+import { AgentResultValidationError } from './result-repair';
 
 const MAX_FILES = 4_000;
 const MAX_BYTES = 32 * 1024 * 1024;
 const RECORD_FILE = 'change-set.json';
+const SNAPSHOT_PREFIX = '.snapshot-';
 
 export interface ExtensionStage {
   liveDirectory: string;
@@ -51,8 +53,45 @@ export async function prepareExtensionStage(options: {
   };
 }
 
-export async function publishExtensionChanges(
+/** A private stage copy; `unchanged` folders matched their baseline and were not copied. */
+export type StageSnapshot = ExtensionStage & { compiledDirectory: string; unchanged: readonly string[] };
+
+/**
+ * Run `use` on a private copy of the stage's extensions, taken once in the
+ * app-owned history folder that agent processes cannot write. Validate and
+ * publish the copy: a process that outlived its command can still rewrite
+ * the stage, but not what was checked and ships. Only changed and `reported`
+ * folders are copied; the rest publish as their baseline.
+ */
+export async function withStageSnapshot<T>(
   stage: ExtensionStage,
+  use: (snapshot: StageSnapshot) => Promise<T>,
+  reported: readonly string[] = []
+): Promise<T> {
+  const directory = path.join(stage.historyRoot, `${SNAPSHOT_PREFIX}${stage.runId}-${randomUUID()}`);
+  const stagingDirectory = path.join(directory, 'stage');
+  const unchanged: string[] = [];
+  try {
+    await fs.mkdir(stagingDirectory, { recursive: true });
+    // Only what publishing reads: extension folders, each within its own copy limits.
+    for (const entry of await exists(stage.stagingDirectory) ? await fs.readdir(stage.stagingDirectory, { withFileTypes: true }) : []) {
+      if (!entry.isDirectory() || !EXTENSION_ID.test(entry.name)) continue;
+      const source = path.join(stage.stagingDirectory, entry.name);
+      const baseline = stage.baselineHashes[entry.name];
+      if (baseline !== undefined && !reported.includes(entry.name) && await directoryHash(source) === baseline) {
+        unchanged.push(entry.name);
+        continue;
+      }
+      await copyRegularTree(source, path.join(stagingDirectory, entry.name));
+    }
+    return await use({ ...stage, stagingDirectory, compiledDirectory: path.join(directory, 'compiled'), unchanged });
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+}
+
+export async function publishExtensionChanges(
+  stage: ExtensionStage & { unchanged?: readonly string[] },
   declaredChanges: readonly AgentExtensionChange[]
 ): Promise<ExtensionChangeSetRecord | null> {
   const currentHashes = await extensionHashes(stage.liveDirectory);
@@ -61,14 +100,22 @@ export async function publishExtensionChanges(
   }
 
   const stagedHashes = await extensionHashes(stage.stagingDirectory);
+  for (const id of stage.unchanged ?? []) stagedHashes[id] = stage.baselineHashes[id]!;
   const actualIds = changedIds(stage.baselineHashes, stagedHashes);
   const declared = new Map(declaredChanges.map((change) => [change.id, change]));
   const declaredIds = [...declared.keys()].sort();
+  const expectedChanges = actualIds.map(id => ({
+    id,
+    action: stage.baselineHashes[id] === undefined ? 'created' : stagedHashes[id] === undefined ? 'removed' : 'updated'
+  }));
+  const reportError = (message: string): never => {
+    throw new AgentResultValidationError(`${message} Nothing was applied. Actual staged extension changes: ${JSON.stringify(expectedChanges)}. Inspect these changes and return each once in extensions with the indicated action, or revert unintended staged edits before completing.`);
+  };
   if (new Set(declaredIds).size !== declaredChanges.length) {
-    throw new Error('The agent reported the same extension change more than once. Nothing was applied.');
+    reportError('The agent reported the same extension change more than once.');
   }
   if (actualIds.join('\0') !== declaredIds.join('\0')) {
-    throw new Error('The agent change report did not match its staged files. Nothing was applied.');
+    reportError('The agent change report did not match its staged files.');
   }
   if (actualIds.length === 0) return null;
 
@@ -77,7 +124,7 @@ export async function publishExtensionChanges(
     const after = stagedHashes[id];
     const expected = before === undefined ? 'created' : after === undefined ? 'removed' : 'updated';
     if (declared.get(id)?.action !== expected) {
-      throw new Error(`The agent reported ${id} as ${declared.get(id)?.action ?? 'missing'}, but it was ${expected}. Nothing was applied.`);
+      reportError(`The agent reported ${id} as ${declared.get(id)?.action ?? 'missing'}, but it was ${expected}.`);
     }
     if (after !== undefined) await validateExtensionDirectory(stage.stagingDirectory, id);
   }
@@ -120,8 +167,11 @@ export async function publishExtensionChanges(
     await fs.rename(pending, final);
     return record;
   } catch (error) {
-    await rollbackPendingChangeSet(pending, stage.liveDirectory, record).catch(() => undefined);
-    await fs.rm(pending, { recursive: true, force: true }).catch(() => undefined);
+    // Retain the journal and backups if rollback itself fails so boot can retry.
+    try {
+      await rollbackPendingChangeSet(pending, stage.liveDirectory, record);
+      await fs.rm(pending, { recursive: true, force: true });
+    } catch { /* Recovery will retry the pending transaction. */ }
     throw error;
   }
 }
@@ -143,18 +193,20 @@ export async function restoreExtensionChangeSet(options: {
   const redo = path.join(directory, 'redo');
   await fs.rm(redo, { recursive: true, force: true });
   await fs.mkdir(redo, { recursive: true });
+  const touched: string[] = [];
   try {
     for (const change of record.changes) {
       const live = path.join(options.liveDirectory, change.id);
       if (await exists(live)) await fs.rename(live, path.join(redo, change.id));
+      touched.push(change.id);
       const snapshot = path.join(before, change.id);
       if (await exists(snapshot)) await copyRegularTree(snapshot, live);
     }
   } catch (error) {
-    for (const change of record.changes) {
-      const live = path.join(options.liveDirectory, change.id);
+    for (const id of touched.reverse()) {
+      const live = path.join(options.liveDirectory, id);
       await fs.rm(live, { recursive: true, force: true }).catch(() => undefined);
-      const previous = path.join(redo, change.id);
+      const previous = path.join(redo, id);
       if (await exists(previous)) await fs.rename(previous, live).catch(() => undefined);
     }
     throw error;
@@ -182,7 +234,13 @@ export async function recoverAllInterruptedExtensionTransactions(userData: strin
   const root = path.join(userData, 'Agent Change History');
   if (!await exists(root)) return;
   for (const entry of await fs.readdir(root, { withFileTypes: true })) {
-    if (entry.isDirectory()) await recoverInterruptedExtensionTransactions(path.join(root, entry.name), liveDirectory);
+    if (!entry.isDirectory()) continue;
+    const historyRoot = path.join(root, entry.name);
+    await recoverInterruptedExtensionTransactions(historyRoot, liveDirectory);
+    // Only at boot: a run on this project may be using its snapshot now.
+    for (const leftover of await fs.readdir(historyRoot)) {
+      if (leftover.startsWith(SNAPSHOT_PREFIX)) await fs.rm(path.join(historyRoot, leftover), { recursive: true, force: true });
+    }
   }
 }
 
@@ -194,9 +252,21 @@ async function rollbackPendingChangeSet(
   await fs.mkdir(liveDirectory, { recursive: true });
   for (const change of record.changes) {
     const live = path.join(liveDirectory, change.id);
-    await fs.rm(live, { recursive: true, force: true });
+    if (!EXTENSION_ID.test(change.id)) throw new Error('Invalid pending extension id.');
     const previous = path.join(pending, 'before', change.id);
-    if (await exists(previous)) await fs.rename(previous, live);
+    if (await exists(previous)) {
+      // Keep the backup until the entire journal is removed. A crash during
+      // recovery must never turn a partially restored tree into the only copy.
+      const restored = path.join(pending, 'restore', change.id);
+      await fs.rm(restored, { recursive: true, force: true });
+      await copyRegularTree(previous, restored);
+      await fs.rm(live, { recursive: true, force: true });
+      await fs.rename(restored, live);
+    } else if (change.action === 'created' && !await exists(path.join(pending, 'next', change.id))) {
+      // Only a creation whose prepared replacement was moved can be ours.
+      await fs.rm(live, { recursive: true, force: true });
+    }
+    // Updated/removed entries without a backup have not been touched.
   }
 }
 
@@ -246,10 +316,29 @@ async function directoryHash(root: string): Promise<string> {
         continue;
       }
       if (!entry.isFile()) throw new Error(`Extension contains an unsupported file: ${nextRelative}`);
-      const data = await fs.readFile(full);
-      files += 1;
-      bytes += data.byteLength;
-      if (files > MAX_FILES || bytes > MAX_BYTES) throw new Error('Extension staging exceeds the safe copy limits.');
+      // The stage is agent-writable: a file swapped since the listing for a
+      // link, FIFO or device is refused, never followed or waited on.
+      const handle = await fs.open(full, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK).catch((error: NodeJS.ErrnoException) => {
+        throw error.code === 'ELOOP' ? new Error(`Extension contains an unsupported symbolic link: ${nextRelative}`) : error;
+      });
+      let data: Buffer;
+      try {
+        const opened = await handle.stat();
+        if (!opened.isFile()) throw new Error(`Extension contains an unsupported file: ${nextRelative}`);
+        files += 1;
+        bytes += opened.size;
+        if (files > MAX_FILES || bytes > MAX_BYTES) throw new Error('Extension staging exceeds the safe copy limits.');
+        // Read what fstat promised and one byte more, so a file growing meanwhile is caught, not buffered.
+        data = Buffer.alloc(opened.size + 1);
+        let length = 0;
+        for (;;) {
+          const { bytesRead } = await handle.read(data, length, data.byteLength - length, length);
+          if (!bytesRead) break;
+          length += bytesRead;
+          if (length > opened.size) throw new Error(`Extension staging changed while it was being read: ${nextRelative}`);
+        }
+        data = data.subarray(0, length);
+      } finally { await handle.close(); }
       hash.update(`f\0${nextRelative}\0`);
       hash.update(data);
     }
@@ -258,12 +347,27 @@ async function directoryHash(root: string): Promise<string> {
   return hash.digest('hex');
 }
 
+const sameFile = (a: { dev: number; ino: number }, b: { dev: number; ino: number }) => a.dev === b.dev && a.ino === b.ino;
+
+/**
+ * Copy folders and regular files only. Agent processes may still swap a
+ * folder for a link while it is read, so each folder must be the same one
+ * after its listing and still resolve beneath the source, and each file read
+ * must be the file now at its place there; otherwise the copy aborts.
+ */
 async function copyRegularTree(source: string, destination: string): Promise<void> {
+  if (!(await fs.lstat(source)).isDirectory()) throw new Error('Extension staging is not a folder.');
+  const root = await fs.realpath(source);
+  const changed = () => new Error('Extension staging changed while it was being copied. Nothing was copied from it.');
   await fs.mkdir(destination, { recursive: true });
   let files = 0;
   let bytes = 0;
   async function walk(from: string, to: string): Promise<void> {
+    const expected = path.join(root, path.relative(source, from));
+    const before = await fs.lstat(from);
     const entries = await fs.readdir(from, { withFileTypes: true });
+    const after = await fs.lstat(from);
+    if (!before.isDirectory() || !after.isDirectory() || !sameFile(before, after) || await fs.realpath(from) !== expected) throw changed();
     for (const entry of entries) {
       const input = path.join(from, entry.name);
       const output = path.join(to, entry.name);
@@ -274,7 +378,14 @@ async function copyRegularTree(source: string, destination: string): Promise<voi
         continue;
       }
       if (!entry.isFile()) throw new Error(`Extension staging does not allow special files: ${entry.name}`);
-      const data = await fs.readFile(input);
+      // A file swapped for a link since the listing is refused, not followed.
+      const handle = await fs.open(input, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      let data: Buffer;
+      try {
+        const opened = await handle.stat();
+        if (!opened.isFile() || !sameFile(opened, await fs.lstat(input)) || await fs.realpath(from) !== expected) throw changed();
+        data = await handle.readFile();
+      } finally { await handle.close(); }
       files += 1;
       bytes += data.byteLength;
       if (files > MAX_FILES || bytes > MAX_BYTES) throw new Error('Extension staging exceeds the safe copy limits.');

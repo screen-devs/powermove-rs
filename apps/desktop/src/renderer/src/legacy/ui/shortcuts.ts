@@ -2,6 +2,7 @@ import { installLayerMenu } from './layer-menu';
 import { installParentPickwhip } from './parent-pickwhip';
 import { evaluatedValue } from '../core/content-properties';
 import { materializeSvgPaths } from '../core/svg-import';
+import { temporalKeys } from '../core/temporal-bridge';
 import { inspectorService, timelineService, toolService, viewerService } from '../core/services';
 /* Ported from js/ui/shortcuts.js — behavior-preserving.
  *
@@ -13,9 +14,12 @@ import { inspectorService, timelineService, toolService, viewerService } from '.
  *     and dispatched by the one key listener the kernel installs.
  */
 import type { CommandDefinition } from '../../kernel/api';
+import { IMPORT_DEFAULTS_SERVICE } from '../../kernel/import-defaults';
 import { hasTextSelection, isFieldTarget, selectableTextRoot, selectTextContents } from '../../kernel/keychord';
 import { ensureKernel, registryView } from '../kernel-view';
 import type { PMRegistry } from '../registry';
+import { bridge as hostBridge } from '../../kernel/bridge';
+import { compositionSettingsDialog, deleteCompositionPrompt, precomposeDialog } from './compositions';
 
 export const LEGACY_OWNER = 'legacy';
 
@@ -65,7 +69,7 @@ const activeTextField = (): boolean => {
 const readingText = () => typeof document !== 'undefined' ? selectableTextRoot(document.activeElement) : null;
 
 const nativeEdit = (action: string): unknown => {
-  const bridge: any = typeof window === 'undefined' ? null : (window as any).powermove;
+  const bridge: any = typeof window === 'undefined' ? null : (hostBridge() as any);
   if (typeof bridge?.nativeEdit === 'function') {
     bridge.nativeEdit(action);
     return true;
@@ -161,7 +165,7 @@ def('centerAnchor', 'Center anchor point in layer content', '⌘⌥Home', () => 
   if (!commands.length) return false;
   return PM.Edit.apply(commands, { label: 'Center anchor point', origin: 'command' });
 }, 'Tool');
-PM.commandForAsset = (id?: any, at: any = PM.time) => {
+const nativeCommandForAsset = (id?: any, at: any = PM.time) => {
   const meta: any = PM.proj.assets[id]; if (!meta) return;
   const a: any = PM.assets?.get?.(id) || meta;
   if (a.kind === 'model') {
@@ -207,6 +211,25 @@ PM.commandForAsset = (id?: any, at: any = PM.time) => {
     select: true,
   };
 };
+PM.commandForAsset = (id?: any, at: any = PM.time) => {
+  const command = nativeCommandForAsset(id, at);
+  const defaults = kernel.services.get<import('../../kernel/api').ImportDefaults>(IMPORT_DEFAULTS_SERVICE);
+  if (!command || !defaults || !['image', 'video', 'shape'].includes(command.layerType)) return command;
+  // Measure a detached layer before insertion. No existing channel, keyframe,
+  // selection, revision, or history entry is modified by the default itself.
+  const layer = PM.mkLayer(command.layerType, { d: command.content });
+  const bounds = PM.GL?.bounds?.(layer, command.from);
+  if (!bounds) throw new Error('Import defaults could not measure the new layer bounds.');
+  const x = bounds.x0 + (bounds.x1 - bounds.x0) * defaults.anchor.x;
+  const y = bounds.y0 + (bounds.y1 - bounds.y0) * defaults.anchor.y;
+  if (![x, y].every(Number.isFinite)) throw new Error('Import defaults received invalid layer bounds.');
+  return { ...command, properties: {
+    'anchor.x': x, 'anchor.y': y,
+    // Compensate the new anchor so the imported content stays in place.
+    'position.x': layer.p['position.x'].v + x - layer.p['anchor.x'].v,
+    'position.y': layer.p['position.y'].v + y - layer.p['anchor.y'].v,
+  } };
+};
 def('addFromAsset', 'Add layer from asset', null, (id?: any) => {
   const command: any = PM.commandForAsset(id);
   if (!command) return;
@@ -228,28 +251,51 @@ def('selectAll', 'Select all layers', '⌘A', () => PM.selectLayers(PM.proj.laye
 def('deselect', 'Deselect', '⎋', () => { PM.selectLayers([]); PM.sel.keys = []; }, 'Edit');
 def('groupLayers', 'Group layers', '⌘G', () => PM.Edit.apply({ type: 'group_layers', targets: PM.sel.layers }, { label: 'Group layers', origin: 'timeline' }), 'Edit');
 def('ungroupLayers', 'Ungroup layers', '⌘⇧G', () => PM.Edit.apply({ type: 'ungroup_layers', targets: PM.sel.layers }, { label: 'Ungroup layers', origin: 'timeline' }), 'Edit');
-def('precompose', 'Group layers', null, () => PM.cmd('groupLayers'), 'Edit', hidden);
 
 /* ── layer clipboard ───────────────────────────────────── */
 let layerClip: any = null;
+/* Selected keyframes take precedence over their layers, as Delete does.
+   Only the most recent copy (effects, keyframes, or layers) stays pasteable. */
+let keyClip: KeyframeClipboard | null = null;
+const copySelectedKeyframes = (): boolean => {
+  const copied = copyKeyframes(PM);
+  if (!copied) return false;
+  keyClip = copied;
+  layerClip = null;
+  inspectorService(PM)?.clearEffectClipboard();
+  const count = copied.tracks.reduce((sum, track) => sum + track.keys.length, 0);
+  PM.toast?.(`Copied ${count} ${count === 1 ? 'keyframe' : 'keyframes'}`);
+  return true;
+};
 def('copyLayers', 'Copy layers', '⌘C', () => {
   const inspector = inspectorService(PM);
-  if (inspector?.copySelectedEffects()) return;
+  if (inspector?.copySelectedEffects()) { keyClip = null; return; }
+  if (copySelectedKeyframes()) return;
   const sels: any = selectedStackLayers(PM); if (!sels.length) return;
   /* An explicit layer copy becomes the active app-local clipboard payload.
      Effect rows stop propagation before this command, so copying an effect
      keeps the effect payload active while the user selects its destination. */
   inspector?.clearEffectClipboard();
+  keyClip = null;
   layerClip = sels.map((L: any) => JSON.parse(JSON.stringify(L)));
   PM.toast(`Copied ${layerClip.length} ${layerClip.length === 1 ? 'layer' : 'layers'}`);
 }, 'Edit');
-def('cutLayers', 'Cut layers', '⌘X', () => cutLayers(PM, (value: any[]) => { layerClip = value; }), 'Edit');
+def('cutLayers', 'Cut layers', '⌘X', () => {
+  if (copySelectedKeyframes()) return deleteSelection(PM);
+  return cutLayers(PM, (value: any[]) => { layerClip = value; keyClip = null; });
+}, 'Edit');
 def('pasteLayers', 'Paste layers', '⌘V', () => {
   /* Effect paste deliberately routes through the ordinary global shortcut:
      select effect → ⌘C → select destination layer → ⌘V. */
   if (inspectorService(PM)?.pasteCopiedEffects()) return;
+  if (keyClip) return pasteKeyframes(PM, keyClip);
   return pasteLayers(PM, () => layerClip);
 }, 'Edit');
+def('copyKeyframes', 'Copy keyframes', null, () => copySelectedKeyframes(), 'Keyframes');
+def('pasteKeyframes', 'Paste keyframes', null, (target?: KeyframePasteTarget) => {
+  if (!keyClip) { PM.toast?.('Copy keyframes first'); return false; }
+  return pasteKeyframes(PM, keyClip, target);
+}, 'Keyframes');
 def('contextUndo', 'Undo', null, () => activeTextField() ? nativeEdit('undo') : readingText() ? false : PM.cmd('undo'), 'Edit', hidden);
 def('contextRedo', 'Redo', null, () => activeTextField() ? nativeEdit('redo') : readingText() ? false : PM.cmd('redo'), 'Edit', hidden);
 def('contextCut', 'Cut', null, () => activeTextField() ? nativeEdit('cut') : readingText() ? false : PM.cmd('cutLayers'), 'Edit', hidden);
@@ -355,14 +401,29 @@ def('zoomOut', 'Zoom out', ',', () => zoomViewer(PM, .8), 'View', preserveFalse)
 def('actualSize', 'Actual size', '/', () => setViewerZoom(PM, 1), 'View', preserveFalse);
 def('palette', 'Command palette', '⌘K', () => PM.palette(), 'View');
 def('agent', 'Ask Powermove agent', '⌘⇧K', () => PM.SpatialAssistant?.open?.(), 'View');
-def('settings', 'Settings…', '⌘,', () => PM.SettingsUI?.open?.(), 'View');
+def('settings', 'Settings…', '⌘,', () => PM.SettingsUI?.isOpen ? PM.SettingsUI.close?.() : PM.SettingsUI?.open?.(), 'View');
 def('projectSettings', 'Project settings…', '⌘⇧,', () => PM.SettingsUI?.open?.('project'), 'File');
 def('save', 'Save project', '⌘S', () => PM.saveProject(), 'File');
 def('saveAs', 'Save project as…', '⌘⇧S', () => PM.saveProject({ saveAs: true }), 'File');
 def('open', 'Open project…', '⌘O', () => PM.openProject(), 'File');
 def('export', 'Export…', '⌘E', () => PM.Export.dialog(), 'File');
 def('projects', 'Projects screen', '⌘P', () => PM.ProjectsScreen && PM.ProjectsScreen.toggle(), 'File');
-def('newProject', 'New project', '⌘N', () => PM.newProject(), 'File');
+def('newProject', 'New project', '⌥⌘N', () => PM.newProject(), 'File');
+
+/* ── compositions (After Effects) ──────────────────────── */
+def('newComposition', 'New composition…', '⌘N', () => compositionSettingsDialog(PM), 'Composition');
+def('compositionSettings', 'Composition settings…', '⌥⌘K', (id?: any) => compositionSettingsDialog(PM, typeof id === 'string' ? id : PM.Comps.active()), 'Composition');
+def('precompose', 'Pre-compose…', '⇧⌘C', () => precomposeDialog(PM), 'Layer');
+def('openComposition', 'Open composition', null, (id?: any) => PM.Comps.open(id), 'Composition', hidden);
+def('closeComposition', 'Close composition', null, (id?: any) => PM.Comps.close(id ?? PM.Comps.active()), 'Composition', hidden);
+def('addCompositionToTimeline', 'Add composition to timeline', null, (id?: any, options?: any) => PM.Comps.addToTimeline(id, options), 'Composition', hidden);
+def('duplicateComposition', 'Duplicate composition', null, (id?: any) => PM.Comps.duplicate(id ?? PM.Comps.active()), 'Composition', hidden);
+def('deleteComposition', 'Delete composition', null, (id?: any) => deleteCompositionPrompt(PM, id ?? PM.Comps.active()), 'Composition', hidden);
+def('newCompFromMedia', 'New composition from media', null, (assetId?: any) => PM.Comps.fromAsset(assetId), 'Composition', hidden);
+def('closeTab', 'Close tab', '⌘W', () => PM.Tabs?.closeCurrent(), 'File');
+def('nextTab', 'Show next tab', '⌃Tab', () => PM.Tabs?.step(1), 'View');
+def('previousTab', 'Show previous tab', '⌃⇧Tab', () => PM.Tabs?.step(-1), 'View');
+def('moveTabToNewWindow', 'Move tab to new window', '', () => PM.Tabs?.moveToNewWindow(PM.proj?.id), 'View');
 def('takeSave', 'Save take', '', () => { PM.takes.save(); PM.toast('Take saved'); }, 'File');
 
 /* ── AE layer timing ───────────────────────────────────── */
@@ -523,7 +584,10 @@ export function splitLayers(PM: PMRegistry): unknown {
     const hierarchy = layers.filter((layer: any) => ids.has(layer.id));
     return { root, hierarchy };
   }).filter(({ root, hierarchy }: any) => crossesPlayhead(splitSpan(PM, root), T)
-    && hierarchy.length > 1
+    // A group with one child is still a real editable layer strip.  Do not
+    // reject it here: ⌘⇧D must split singleton groups just like larger
+    // hierarchies.
+    && hierarchy.length > 0
     && !hierarchy.some((layer: any) => layer.lock
       || (PM.groupAncestors?.(layer) || []).some((group: any) => group.lock && !hierarchy.includes(group))));
   if (!ordinaryTargets.length && !groupPlans.length) return false;
@@ -745,7 +809,7 @@ export function setLayerLocks(PM: PMRegistry, locked: boolean, all = false): unk
 
 /** Cmd/Ctrl+Up/Down follows the visible layer stack; Shift extends the range. */
 export function selectAdjacentLayer(PM: PMRegistry, direction: -1 | 1, extend = false): unknown {
-  const layers = currentLayers(PM).filter((layer: any) => !layer.shy);
+  const layers = currentLayers(PM);
   if (!layers.length) return false;
   const selected = new Set((PM.sel?.layers || []).filter(Boolean));
   const selectedIndexes = layers
@@ -876,6 +940,8 @@ interface SelectedKeyframeEntry {
   comp: any;
   layer: any;
   prop: any;
+  /** Property path as `PM.findProp` resolves it. */
+  path: string;
   key: any;
 }
 
@@ -891,7 +957,7 @@ function selectedKeyframeEntries(PM: PMRegistry): SelectedKeyframeEntry[] {
     seen.add(comp);
     for (const layer of comp.layers || []) for (const item of PM.allProps?.(layer) || []) {
       for (const key of item?.prop?.kf || []) if (selected.has(key?.i)) {
-        entries.push({ comp, layer, prop: item.prop, key });
+        entries.push({ comp, layer, prop: item.prop, path: item.key, key });
       }
     }
     comps.push(...Object.values(comp.comps || {}));
@@ -929,11 +995,166 @@ export function nudgeKeyframes(PM: PMRegistry, frames?: any): unknown {
       prop.kf = prop.kf.filter((key: any) => selectedKeys.has(key)
         || !destinations.has(Math.round(Number(key.t) * fps)));
     }
+    for (const prop of destinationFrames.keys()) temporalKeys(prop.kf);
     for (const entry of selected) entry.key.t = Math.round((Number(entry.key.t) + delta) * fps) / fps;
     for (const prop of destinationFrames.keys()) prop.kf.sort((a: any, b: any) => Number(a.t) - Number(b.t));
     PM.touch?.();
     PM.bus?.emit?.('sel');
     PM.invalidate?.();
+  });
+}
+
+export interface KeyframeClipboard {
+  /** Composition time of the earliest copied key; paste puts it at the target time. */
+  start: number;
+  /** Channel selected at copy time. Selecting another channel before pasting
+   * retargets a single-property clipboard, as in After Effects. */
+  chan: string | null;
+  tracks: { layer: string; path: string; fx?: { id: string; type: string; param: string }; keys: { at: number; key: any }[] }[];
+}
+
+export interface KeyframePasteTarget {
+  layer?: string;
+  path?: string;
+  time?: number;
+}
+
+/** Snapshot the selected keyframes with their composition times. */
+export function copyKeyframes(PM: PMRegistry): KeyframeClipboard | null {
+  const selected = selectedKeyframeEntries(PM);
+  if (!selected.length) return null;
+  const tracks = new Map<string, KeyframeClipboard['tracks'][number]>();
+  for (const { layer, path, key } of selected) {
+    const id = `${layer.id}\n${path}`;
+    let track = tracks.get(id);
+    if (!track) {
+      const [fxId, param] = path.split('.');
+      const effect = (layer.fx || []).find((item: any) => item.id === fxId);
+      tracks.set(id, track = {
+        layer: layer.id, path,
+        ...(effect && param ? { fx: { id: effect.id, type: effect.type, param } } : {}),
+        keys: [],
+      });
+    }
+    track.keys.push({ at: Number(layer.from) + Number(key.t), key: JSON.parse(JSON.stringify(key)) });
+  }
+  for (const track of tracks.values()) track.keys.sort((a, b) => a.at - b.at);
+  return {
+    start: Math.min(...selected.map(({ layer, key }) => Number(layer.from) + Number(key.t))),
+    chan: typeof PM.sel?.chan === 'string' ? PM.sel.chan : null,
+    tracks: [...tracks.values()],
+  };
+}
+
+function keyframeValueKind(value: any): string {
+  if (Array.isArray(value)) return `array:${value.length}`;
+  return value === null ? 'null' : typeof value;
+}
+
+function editableLayer(PM: PMRegistry, layer: any): boolean {
+  return !layer.lock && !(PM.groupAncestors?.(layer) || []).some((group: any) => group.lock);
+}
+
+/** Paste copied keyframes so the earliest lands at the playhead (or `target.time`),
+ * keeping relative timing. A one-layer clipboard goes to the selected layers;
+ * a multi-layer clipboard returns to its source layers. Pasted keys replace
+ * keys on the same frame and become the new keyframe selection. */
+export function pasteKeyframes(PM: PMRegistry, clipboard: KeyframeClipboard | null, target: KeyframePasteTarget = {}): unknown {
+  if (!clipboard?.tracks.length) return false;
+  const comp: any = typeof PM.curComp === 'function' ? PM.curComp() : PM.proj;
+  const fps = Math.max(1, Number(PM.proj?.fps) || 30);
+  const duration = Math.max(0, Number(comp?.dur) || 0);
+  const layers = currentLayers(PM);
+  const byId = new Map(layers.map((layer: any) => [layer.id, layer]));
+  const time = Number.isFinite(Number(target.time)) ? Number(target.time) : Number(PM.time) || 0;
+  const offset = time - clipboard.start;
+
+  const sourceLayers = new Set(clipboard.tracks.map(track => track.layer));
+  const selectedLayers = selectedStackLayers(PM).filter((layer: any) => layer.type !== 'group');
+  const destinationLayers = (source: string): any[] => {
+    if (target.layer) return byId.has(target.layer) ? [byId.get(target.layer)] : [];
+    if (sourceLayers.size === 1 && selectedLayers.length) return selectedLayers;
+    return byId.has(source) ? [byId.get(source)] : [];
+  };
+  const chan = typeof PM.sel?.chan === 'string' ? PM.sel.chan : null;
+  const retarget = clipboard.tracks.length === 1
+    ? target.path ?? (chan && chan !== clipboard.chan ? chan : null)
+    : null;
+
+  const writes: { layer: any; prop: any; keys: any[] }[] = [];
+  /* Effects a paste has to create, and which destination effect each source
+   * effect maps to, so several params of one effect land on the same instance. */
+  const addedEffects = new Map<any, any[]>();
+  const effectFor = new Map<string, any>();
+  const claimed = new Set<any>();
+  const resolveEffect = (layer: any, fx: NonNullable<KeyframeClipboard['tracks'][number]['fx']>) => {
+    const cacheKey = `${layer.id}\n${fx.id}`;
+    const cached = effectFor.get(cacheKey);
+    if (cached) return cached;
+    if (PM.TYPE_META?.[layer.type]?.effects === false) return null;
+    const existing = [...(layer.fx || []), ...(addedEffects.get(layer) || [])];
+    let effect = existing.find((item: any) => item.id === fx.id && item.type === fx.type)
+      || existing.find((item: any) => item.type === fx.type && !claimed.has(item));
+    if (!effect) {
+      effect = PM.mkEffect?.(fx.type);
+      if (!effect) return null;
+      addedEffects.set(layer, [...(addedEffects.get(layer) || []), effect]);
+    }
+    claimed.add(effect);
+    effectFor.set(cacheKey, effect);
+    return effect;
+  };
+  let skipped = 0;
+  for (const track of clipboard.tracks) {
+    const kind = keyframeValueKind(track.keys[0]?.key.v);
+    for (const layer of destinationLayers(track.layer)) {
+      if (!editableLayer(PM, layer)) { skipped++; continue; }
+      const retargeted = retarget ? PM.findProp?.(layer, retarget) : null;
+      /* An explicit destination row is strict; a stale channel selection is not. */
+      let prop = retargeted || (retarget && target.path ? null : PM.findProp?.(layer, track.path));
+      if (track.fx && !retarget && !target.path) {
+        const effect = resolveEffect(layer, track.fx);
+        prop = effect ? (track.fx.param === '$enabled' ? effect.on : effect.p?.[track.fx.param]) ?? null : null;
+      }
+      const current = prop?.kf?.length ? prop.kf[0].v : prop?.v;
+      if (!prop || keyframeValueKind(current) !== kind) { skipped++; continue; }
+      const keys = track.keys.map(({ at, key }) => ({ at: Math.round((at + offset) * fps) / fps, key }))
+        .filter(({ at }) => at >= -1e-9 && at <= duration + 1e-9)
+        .map(({ at, key }) => ({
+          ...JSON.parse(JSON.stringify(key)),
+          i: PM.uid('k'),
+          t: Math.round((at - Number(layer.from)) * fps) / fps,
+        }));
+      if (keys.length) writes.push({ layer, prop, keys });
+    }
+  }
+  if (!writes.length) {
+    PM.toast?.(skipped ? 'No matching property to paste keyframes into' : 'Select a layer to paste keyframes');
+    return false;
+  }
+
+  const pasted = writes.flatMap(write => write.keys);
+  return PM.hist.do(pasted.length === 1 ? 'Paste keyframe' : 'Paste keyframes', () => {
+    /* Only effects that actually receive keys are added. */
+    for (const [layer, effects] of addedEffects) {
+      const used = effects.filter(effect => writes.some(write => write.layer === layer
+        && (Object.values(effect.p || {}).includes(write.prop) || write.prop === effect.on)));
+      if (used.length) layer.fx = [...(layer.fx || []), ...used];
+    }
+    for (const { prop, keys } of writes) {
+      const frames = new Set(keys.map(key => Math.round(Number(key.t) * fps)));
+      prop.kf = [...(prop.kf || []).filter((key: any) => !frames.has(Math.round(Number(key.t) * fps))), ...keys]
+        .sort((a: any, b: any) => Number(a.t) - Number(b.t));
+      temporalKeys(prop.kf);
+    }
+    PM.sel.keys = pasted.map(key => key.i);
+    const timeline = timelineService(PM);
+    if (timeline) timeline.keySelectionActive = true;
+    PM.touch?.();
+    PM.bus?.emit?.('sel');
+    PM.invalidate?.();
+    PM.toast?.(`Pasted ${pasted.length} ${pasted.length === 1 ? 'keyframe' : 'keyframes'}`);
+    return pasted;
   });
 }
 
@@ -1123,6 +1344,7 @@ export function deleteSelection(PM: PMRegistry): unknown {
         const remaining = prop.kf.filter((key: any) => !ids.has(key.i));
         if (prop.kf.length && !remaining.length) prop.v = PM.evP(layer, prop, PM.time, path);
         prop.kf = remaining;
+        temporalKeys(prop.kf);
       }));
       PM.sel.keys = [];
       PM.touch(); PM.bus.emit('sel'); PM.invalidate();

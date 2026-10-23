@@ -29,6 +29,27 @@ describe('agent thread archive', () => {
     expect(restored.select('missing')).toBe(false);
     expect(restored.activeId).toBe(first);
   });
+  it('reuses a blank thread instead of stacking empties on "new thread"', () => {
+    const { make } = setup(); const threads = make(); threads.load('project-a');
+    const first = threads.activeId;
+    expect(AgentThreads.isBlank(threads.active)).toBe(true);
+    // "+" on a thread that has nothing in it stays put.
+    expect(threads.create().id).toBe(first);
+    expect(threads.threads).toHaveLength(1);
+    threads.active.conversation.push({ role: 'user', text: 'Now it exists' });
+    const second = threads.create().id;
+    expect(second).not.toBe(first);
+    expect(threads.threads).toHaveLength(2);
+    // Switching back to the old thread and pressing "+" returns to the blank one rather than making a third.
+    threads.select(first);
+    expect(threads.create().id).toBe(second);
+    expect(threads.threads).toHaveLength(2);
+    // A draft or an attachment makes a thread real enough to keep.
+    threads.active.composerDraft = 'half-typed';
+    expect(AgentThreads.isBlank(threads.active)).toBe(false);
+    expect(threads.create().id).not.toBe(second);
+    expect(threads.threads).toHaveLength(3);
+  });
   it('isolates projects and saves a snapshot, not mutable references', () => {
     const { make } = setup(); const threads = make(); threads.load('a');
     threads.active.composerDraft = 'Saved'; threads.save();
@@ -72,4 +93,31 @@ it('restores structured mod results with their status and action', () => {
   threads.save();
   const restored = make(); restored.load('mods');
   expect(restored.active.conversation[0]?.modResult).toEqual(modResult);
+});
+
+it('restores completed work timing and thinking alongside the final reply', () => {
+  const { make } = setup(); const threads = make(); threads.load('work-history');
+  threads.active.conversation.push({ role: 'trace', durationMs: 543000, steps: [
+    { kind: 'thought', id: 'thought', label: 'Check the timing.', live: false },
+    { kind: 'text', id: 'answer', text: 'Both stems are ready.' }
+  ] });
+  threads.save();
+  const restored = make(); restored.load('work-history');
+  expect(restored.active.conversation[0]).toMatchObject(threads.active.conversation[0]!);
+});
+
+it('stores attachment bytes once while draft text and inline positions change', () => {
+  const { make, store, saved } = setup(); const threads = make(); threads.load('large');
+  const dataBase64 = 'abcd'.repeat(250_000);
+  threads.active.attachments = [{ id: 'binary', name: 'scene.aep', dataBase64, promptOffset: 0 }];
+  expect(threads.save()).toBe(true);
+  store.set.mockClear();
+  threads.active.composerDraft = 'Use this file'; threads.active.attachments[0]!.promptOffset = 4;
+  expect(threads.save()).toBe(true);
+  expect(store.set).toHaveBeenCalledOnce();
+  expect(JSON.stringify(saved.get('agentThreads.large')).length).toBeLessThan(1000);
+  const restored = make(); restored.load('large');
+  expect(restored.active.attachments[0]).toMatchObject({ dataBase64, promptOffset: 4 });
+  restored.save();
+  expect(store.set.mock.calls.filter(([key]) => key.startsWith('agentAttachment.'))).toHaveLength(0);
 });

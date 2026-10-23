@@ -62,7 +62,12 @@ function domHelper(tag: string, attrs: Record<string, any> | string | null, ...c
 
 function setup(
   fixtureAssets: AssetFixture[] = [IMAGE, AUDIO],
-  options: { references?: Record<string, number>; removals?: Record<string, { removedLayers: number; removedLayerIds: string[] }> } = {}
+  options: {
+    references?: Record<string, number>;
+    removals?: Record<string, { removedLayers: number; removedLayerIds: string[] }>;
+    offline?: string[];
+    posters?: Record<string, string>;
+  } = {}
 ) {
   const project = {
     id: 'project-1',
@@ -76,9 +81,12 @@ function setup(
   });
   const liveAssets: any = new Map([
     ['image-1', { url: 'blob:backdrop' }],
-    ['video-1', { el: { currentSrc: 'blob:product-video' } }]
+    ['video-1', { el: { currentSrc: 'blob:product-video' } }],
+    ['audio-1', { peaks: undefined }]
   ]);
   liveAssets.replace = vi.fn(async () => ({ persisted: true }));
+  options.offline?.forEach((id) => liveAssets.delete(id));
+  liveAssets.poster = vi.fn((id: string) => options.posters?.[id] ?? '');
   const PM: Record<string, any> = {
     proj: project,
     ICONS: {
@@ -94,7 +102,7 @@ function setup(
       missing: '<path data-test-icon="missing"></path>'
     },
     assets: liveAssets,
-    Viewer: { preview: { clear: vi.fn(), toggle: vi.fn(), playing: false } },
+    Kernel: { services: new Map([['viewer', { preview: { clear: vi.fn(), toggle: vi.fn(), show: vi.fn(() => true), playing: false } }]]) },
     pickFiles: vi.fn(),
     cmd: vi.fn(),
     hist: { do: vi.fn((_label: string, operation: () => unknown) => operation()) },
@@ -112,6 +120,7 @@ function setup(
     toast: vi.fn(),
     menu: vi.fn(),
     modal: vi.fn(),
+    confirm: vi.fn(async () => true),
     h: domHelper
   };
 
@@ -175,6 +184,75 @@ describe('AssetsPanel', () => {
     expect(target.textContent).toContain('Product.mp4');
   });
 
+  it('prefers the cached poster over decoding the live video again', () => {
+    setup([VIDEO], { posters: { 'video-1': 'blob:poster-video' } });
+
+    expect(target.querySelector<HTMLImageElement>('.asset-preview.video img.asset-poster')?.src).toBe('blob:poster-video');
+    expect(target.querySelector('.asset-preview.video video')).toBeNull();
+  });
+
+  it('marks media whose bytes could not be restored as offline', () => {
+    const { PM } = setup([{ ...VIDEO, sourcePath: '/Volumes/Footage/Product.mp4' }], {
+      offline: ['video-1'],
+      posters: { 'video-1': 'blob:poster-video' }
+    });
+
+    const card = rows()[0]!;
+    expect(card.classList.contains('is-offline')).toBe(true);
+    expect(card.getAttribute('draggable')).toBe('false');
+    expect(card.querySelector('.asset-offline')?.textContent).toContain('Media offline');
+    expect(card.querySelector('.asset-poster')).not.toBeNull();
+    expect(card.querySelector('.asset-missing')?.textContent).toBe('Missing · /Volumes/Footage/Product.mp4');
+    expect(card.querySelector('button[aria-label="Add Product.mp4 to timeline"]')).toBeNull();
+    expect(card.querySelector('button[aria-label="Locate Product.mp4"]')).not.toBeNull();
+
+    card.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+    expect(PM.cmd).not.toHaveBeenCalledWith('addFromAsset', 'video-1');
+    expect(PM.pickFiles).toHaveBeenCalledExactlyOnceWith(false, { replaceAssetId: 'video-1' });
+    expect(PM.Kernel.services.get('viewer').preview.show).not.toHaveBeenCalled();
+  });
+
+  it('enables the same media card when its bytes and poster arrive after render', () => {
+    const { PM } = setup([VIDEO], { offline: ['video-1'] });
+    const card = rows()[0]!;
+    expect(card.classList.contains('is-offline')).toBe(true);
+    expect(card.getAttribute('draggable')).toBe('false');
+
+    PM.assets.set('video-1', { el: { currentSrc: 'blob:restored-video' } });
+    PM.assets.poster.mockReturnValue('blob:restored-poster');
+    PM.bus.emit('assets');
+    flushSync();
+
+    expect(rows()[0]).toBe(card);
+    expect(card.classList.contains('is-offline')).toBe(false);
+    expect(card.getAttribute('draggable')).toBe('true');
+    expect(card.querySelector('.asset-offline')).toBeNull();
+    expect(card.querySelector<HTMLImageElement>('.asset-poster')?.src).toBe('blob:restored-poster');
+    card.querySelector<HTMLButtonElement>('button[aria-label="Add Product.mp4 to timeline"]')?.click();
+    expect(PM.cmd).toHaveBeenCalledWith('addFromAsset', 'video-1');
+  });
+
+  it('shows the load failure without claiming an existing file is missing', () => {
+    const { PM } = setup([VIDEO], { offline: ['video-1'] });
+    PM.assets.errors = new Map([['video-1', 'The source file has changed. Use Locate File to choose a replacement.']]);
+    PM.bus.emit('assets');
+    flushSync();
+    const card = rows()[0]!;
+    expect(card.querySelector('.asset-offline')?.textContent).toContain('Media unavailable');
+    expect(card.querySelector('.asset-missing')?.textContent).toContain('Could not load · The source file has changed');
+    expect(card.textContent).not.toContain('Missing ·');
+  });
+
+  it('offers Locate instead of Add in the context menu for offline media', () => {
+    const { PM } = setup([VIDEO], { offline: ['video-1'] });
+
+    rows()[0]!.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 10, clientY: 10 }));
+    const items = (PM.menu.mock.calls[0]![1] as any[]).filter((item) => item && typeof item === 'object' && item.label);
+    const labels = items.map((item) => item.label);
+    expect(labels).toContain('Locate File…');
+    expect(labels).not.toContain('Add to timeline');
+  });
+
   it('selects video cards with the same state used by audio cards', () => {
     setup([AUDIO, VIDEO]);
     const options = rows();
@@ -201,7 +279,7 @@ describe('AssetsPanel', () => {
     flushSync();
 
     expect(rows().map((row) => row.getAttribute('aria-selected'))).toEqual(['false', 'false']);
-    expect(PM.Viewer.preview.clear).toHaveBeenCalledOnce();
+    expect(PM.Kernel.services.get('viewer').preview.clear).toHaveBeenCalledOnce();
     timeline.remove();
   });
 
@@ -216,17 +294,29 @@ describe('AssetsPanel', () => {
     flushSync();
 
     expect(target.querySelectorAll('[aria-selected="true"]')).toHaveLength(0);
-    expect(PM.Viewer.preview.clear).toHaveBeenCalledOnce();
+    expect(PM.Kernel.services.get('viewer').preview.clear).toHaveBeenCalledOnce();
   });
 
-  it('adds media from its button and double-click', () => {
+  it('adds media from its button', () => {
     const { PM } = setup();
 
     target.querySelector<HTMLButtonElement>('button[aria-label="Add Backdrop.png to timeline"]')?.click();
-    rows()[1]!.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, detail: 2 }));
+    expect(PM.cmd).toHaveBeenCalledExactlyOnceWith('addFromAsset', 'image-1');
+  });
 
-    expect(PM.cmd).toHaveBeenNthCalledWith(1, 'addFromAsset', 'image-1');
-    expect(PM.cmd).toHaveBeenNthCalledWith(2, 'addFromAsset', 'audio-1');
+  it.each([IMAGE, AUDIO, VIDEO])('opens $kind source preview on double-click without adding a layer', (asset) => {
+    const { PM } = setup([asset]);
+    const row = rows()[0]!;
+    row.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, detail: 2 }));
+    flushSync();
+    expect(PM.Kernel.services.get('viewer').preview.show).toHaveBeenCalledExactlyOnceWith(asset.id);
+    expect(PM.cmd).not.toHaveBeenCalled();
+    expect(row.getAttribute('aria-selected')).toBe('true');
+    expect(row.title).toContain('double-click to preview');
+    expect(target.textContent).toContain(`Previewing ${asset.name}`);
+    PM.Kernel.services.get('viewer').preview.show.mockClear();
+    row.querySelector('button')!.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, detail: 2 }));
+    expect(PM.Kernel.services.get('viewer').preview.show).not.toHaveBeenCalled();
   });
 
   it('reveals the original media file in Finder without adding it to the timeline', async () => {
@@ -239,7 +329,7 @@ describe('AssetsPanel', () => {
     expect(PM.cmd).not.toHaveBeenCalled();
   });
 
-  it('opens media actions on right-click and replaces through a compatible single-file picker', async () => {
+  it('opens media actions on right-click and replaces through the shared import picker', () => {
     const { PM } = setup([IMAGE]);
     const row = rows()[0]!;
     row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 37, clientY: 49 }));
@@ -251,33 +341,12 @@ describe('AssetsPanel', () => {
     expect(anchor).toBe(row);
     expect(position).toEqual({ x: 37, y: 49 });
     expect(items.filter((item: any) => item?.label).map((item: any) => item.label)).toEqual([
-      'Add to timeline', 'Replace File…', 'Reveal in Finder', 'Delete media…'
+      'Add to timeline', 'New Comp from Selection', 'Replace File…', 'Reveal in Finder', 'Delete media…'
     ]);
 
     items.find((item: any) => item?.label === 'Replace File…').run();
-    const input = document.querySelector<HTMLInputElement>('input[type="file"][aria-label="Replace Backdrop.png"]')!;
-    expect(input).not.toBeNull();
-    expect(input.accept).toBe('image/*,.svg');
-    expect(input.multiple).toBe(false);
-
-    const replacement = new File(['new pixels'], 'New Backdrop.png', { type: 'image/png' });
-    Object.defineProperty(input, 'files', { configurable: true, value: [replacement] });
-    input.dispatchEvent(new Event('change'));
-    await vi.waitFor(() => expect(PM.assets.replace).toHaveBeenCalledWith('image-1', replacement));
-    await vi.waitFor(() => expect(PM.toast).toHaveBeenCalledWith('Replaced Backdrop.png with New Backdrop.png'));
-    expect(document.body.contains(input)).toBe(false);
-  });
-
-  it('does not mutate media when the replacement picker is cancelled', () => {
-    const { PM } = setup([AUDIO]);
-    rows()[0]!.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true }));
-    PM.menu.mock.calls[0][1].find((item: any) => item?.label === 'Replace File…').run();
-    const input = document.querySelector<HTMLInputElement>('input[type="file"][aria-label="Replace Theme.wav"]')!;
-
-    input.dispatchEvent(new Event('cancel'));
-
+    expect(PM.pickFiles).toHaveBeenCalledExactlyOnceWith(false, { replaceAssetId: 'image-1' });
     expect(PM.assets.replace).not.toHaveBeenCalled();
-    expect(document.body.contains(input)).toBe(false);
   });
 
   it('uses roving tabindex and supports arrows, Home, End, Space, and Enter', () => {
@@ -314,6 +383,35 @@ describe('AssetsPanel', () => {
     expect(document.activeElement).toBe(rows()[0]);
   });
 
+  it.each(['Enter', ' ', 'ArrowRight', 'Delete'])('leaves %s on a media action button to the button', (key) => {
+    const { PM } = setup();
+    const button = target.querySelector<HTMLButtonElement>('.asset-delete')!;
+    const shortcut = vi.fn();
+    document.addEventListener('keydown', shortcut);
+    button.focus();
+    const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true });
+    button.dispatchEvent(event);
+    document.removeEventListener('keydown', shortcut);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(shortcut).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(button);
+    expect(PM.cmd).not.toHaveBeenCalled();
+    expect(PM.Kernel.services.get('viewer').preview.toggle).not.toHaveBeenCalled();
+    expect(PM.hist.do).not.toHaveBeenCalled();
+  });
+
+  it('still lets application shortcuts reach the window from media buttons', () => {
+    setup();
+    const shortcut = vi.fn();
+    document.addEventListener('keydown', shortcut);
+    target.querySelector<HTMLButtonElement>('.asset-add')!.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 's', metaKey: true, bubbles: true, cancelable: true })
+    );
+    document.removeEventListener('keydown', shortcut);
+    expect(shortcut).toHaveBeenCalledOnce();
+  });
+
   it('deletes unreferenced media through history and preserves the legacy cleanup events', () => {
     const { PM, events, removeAsset } = setup();
 
@@ -329,7 +427,7 @@ describe('AssetsPanel', () => {
     expect(target.querySelector('[data-asset-id="image-1"]')).toBeNull();
   });
 
-  it('confirms referenced deletion and removes affected layer selections after approval', () => {
+  it('confirms referenced deletion and removes affected layer selections after approval', async () => {
     const { PM, events } = setup([IMAGE], {
       references: { 'image-1': 1 },
       removals: { 'image-1': { removedLayers: 1, removedLayerIds: ['image-layer'] } }
@@ -337,12 +435,14 @@ describe('AssetsPanel', () => {
 
     rows()[0]!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }));
     expect(PM.hist.do).not.toHaveBeenCalled();
-    expect(PM.modal).toHaveBeenCalledOnce();
-    const modal = PM.modal.mock.calls[0][0];
-    expect(modal).toMatchObject({ title: 'Delete “Backdrop.png”?', width: 420 });
-    expect(modal.body.textContent).toContain('This also removes 1 layer that uses this media. You can undo this.');
+    expect(PM.confirm).toHaveBeenCalledOnce();
+    expect(PM.confirm.mock.calls[0][0]).toEqual({
+      message: 'Delete “Backdrop.png”?',
+      detail: 'This also removes 1 layer that uses this media. You can undo this.',
+      confirmLabel: 'Delete'
+    });
 
-    modal.actions[1].run();
+    await PM.confirm.mock.results[0].value;
     flushSync();
     expect(PM.sel.layers).toEqual(['keep-layer']);
     expect(events).toEqual(['assets', 'layers', 'sel', 'project']);
@@ -368,4 +468,79 @@ describe('AssetsPanel', () => {
     expect(rows()).toHaveLength(1);
     expect(rows()[0]!.tabIndex).toBe(0);
   });
+
+  it('does not apply a pending deletion confirmation to a different project', async () => {
+    const { PM, project, removeAsset, events } = setup([IMAGE], { references: { 'image-1': 1 } });
+    let confirm!: (approved: boolean) => void;
+    const approval = new Promise<boolean>(resolve => { confirm = resolve; });
+    PM.confirm.mockReturnValueOnce(approval);
+    target.querySelector<HTMLButtonElement>('.asset-delete')!.click();
+    const nextProject = { id: 'project-2', assets: { [IMAGE.id]: { ...IMAGE } }, layers: [] };
+    PM.proj = nextProject;
+    doc.replace(nextProject as any);
+    flushSync();
+    confirm(true);
+    await approval;
+    flushSync();
+
+    expect(removeAsset).not.toHaveBeenCalled();
+    expect(PM.hist.do).not.toHaveBeenCalled();
+    expect(project.assets[IMAGE.id]).toBeDefined();
+    expect(nextProject.assets[IMAGE.id]).toBeDefined();
+    expect(events).toEqual([]);
+    expect(PM.toast).toHaveBeenCalledWith('Deletion stopped because you switched projects');
+  });
+});
+
+it('shows restoring media as loading instead of missing and prevents relink actions', () => {
+  const { PM } = setup([VIDEO], { offline: [VIDEO.id] });
+  PM.assets.loading = new Set([VIDEO.id]);
+  doc.tick.assets++;
+  flushSync();
+  const card = target.querySelector<HTMLElement>('.asset-card')!;
+  expect(card.textContent).toContain('Loading media…');
+  expect(card.querySelector('.asset-offline')).toBeNull();
+  expect(card.getAttribute('aria-busy')).toBe('true');
+  expect(card.querySelector<HTMLButtonElement>('.asset-add')!.disabled).toBe(true);
+  card.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+  expect(PM.pickFiles).not.toHaveBeenCalled();
+  PM.assets.loading.clear(); doc.tick.assets++; flushSync();
+  expect(card.querySelector('.asset-offline')).not.toBeNull();
+});
+
+it('shows restoring media as loading instead of missing and prevents relink actions', () => {
+  const { PM } = setup([VIDEO], { offline: [VIDEO.id] });
+  PM.assets.loading = new Set([VIDEO.id]);
+  doc.tick.assets++;
+  flushSync();
+  const card = target.querySelector<HTMLElement>('.asset-card')!;
+  expect(card.textContent).toContain('Loading media…');
+  expect(card.querySelector('.asset-offline')).toBeNull();
+  expect(card.getAttribute('aria-busy')).toBe('true');
+  expect(card.querySelector<HTMLButtonElement>('.asset-add')!.disabled).toBe(true);
+  card.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+  expect(PM.pickFiles).not.toHaveBeenCalled();
+  PM.assets.loading.clear(); doc.tick.assets++; flushSync();
+  expect(card.querySelector('.asset-offline')).not.toBeNull();
+});
+
+it('offers a visible cloud download action and prevents duplicate clicks while downloading', () => {
+  const { PM } = setup([VIDEO], { offline: ['video-1'] });
+  let state = { provider: 'iCloud', state: 'offloaded' };
+  PM.assets.cloud = { get: vi.fn(() => state), download: vi.fn() };
+  PM.bus.emit('assets'); flushSync();
+  const card = rows()[0]!;
+  expect(card.classList.contains('is-cloud')).toBe(true);
+  expect(card.querySelector('.asset-offline')?.textContent).toContain('In cloud');
+  expect(card.querySelector('.asset-missing')?.textContent).toContain('Stored in iCloud');
+  const button = card.querySelector<HTMLButtonElement>('.asset-download')!;
+  button.click();
+  expect(PM.assets.cloud.download).toHaveBeenCalledExactlyOnceWith('video-1');
+  expect(PM.pickFiles).not.toHaveBeenCalled();
+  state = { provider: 'iCloud', state: 'downloading' };
+  PM.bus.emit('assets'); flushSync();
+  expect(button.disabled).toBe(true);
+  expect(card.getAttribute('aria-busy')).toBe('true');
+  expect(card.querySelector('.asset-offline')?.textContent).toContain('Downloading');
+  expect(card.querySelector('.asset-missing')?.textContent).toBe('Downloading from iCloud…');
 });

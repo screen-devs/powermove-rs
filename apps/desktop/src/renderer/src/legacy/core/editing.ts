@@ -1,4 +1,5 @@
 import { captureFontAnchor } from './font-anchor';
+import { captureSizeAnchor, sizeAnchorOffset, sizeBounds } from './size-anchor';
 import { temporalKeys } from './temporal-bridge';
 import { validMatteSource } from './matte';
 import { canAnimateContent, evaluatedValue, isProperty } from './content-properties';
@@ -307,7 +308,7 @@ function setContent(command: any) {
 
 function extensionParamValue(definition: any, value: any) {
   if (definition.type === 'color') {
-    if (typeof value !== 'string' || !/^#[0-9a-f]{6}$/i.test(value)) throw new Error(`${definition.label} must be a hex color`);
+    if (typeof value !== 'string' || !/^#[0-9a-f]{6}(?:[0-9a-f]{2})?$/i.test(value)) throw new Error(`${definition.label} must be a hex color`);
     return value.toUpperCase();
   }
   if (definition.type === 'toggle') {
@@ -608,13 +609,22 @@ function setEffect(command: any) {
   const effect: any = layer.fx.find((item: any) => item.id === command.effect || item.type === command.effect);
   if (!effect) throw new Error(`Effect not found: ${command.effect}`);
   const patch: any = safePatch(command.patch, 'effect patch');
-  const allowed: any = new Set(['enabled', 'open']);
+  const allowed: any = new Set(['enabled', 'open', 'index']);
   for (const key of Object.keys(patch)) if (!allowed.has(key)) throw new Error(`Effect field “${key}” is not editable`);
   if (patch.enabled != null) {
     if (isProperty(effect.on)) setProperty({ target: layer.id, path: `${effect.id}.$enabled`, value: !!patch.enabled, preserveHandEdits: false });
     else effect.on = !!patch.enabled;
   }
   if (patch.open != null) effect.open = !!patch.open;
+  if (patch.index != null) {
+    const to: any = PM.clamp(Math.round(finite(patch.index, 'effect index')), 0, layer.fx.length - 1);
+    const from: any = layer.fx.indexOf(effect);
+    if (from !== to) {
+      const next: any = layer.fx.filter((item: any) => item !== effect);
+      next.splice(to, 0, effect);
+      layer.fx = next;
+    }
+  }
   PM.touch();
   return { id: layer.id, effectId: effect.id };
 }
@@ -809,9 +819,18 @@ function runOne(sourceCommand: any, meta: any = {}) {
   const command: any = policy.command;
   const fontLayer = findLayer(command.target || command.layer || command.targetId);
   captureFontAnchor(PM, fontLayer, command);
+  captureSizeAnchor(PM, fontLayer, command);
   const anchorEdit = fontLayer?.d?.fontAnchorBounds && command.type === 'set_property'
     && ['anchor.x', 'anchor.y'].includes(command.path || command.channel);
   const anchorRaster = anchorEdit ? PM.raster(fontLayer, 1, command.time ?? PM.time) : null;
+  const sizeAnchorEdit = fontLayer?.d?.sizeAnchorBounds && command.type === 'set_property'
+    && ['anchor.x', 'anchor.y'].includes(command.path || command.channel);
+  const nativeSizeBounds = sizeAnchorEdit ? sizeBounds(PM, fontLayer, command.time ?? PM.time) : null;
+  const sizeOffset = nativeSizeBounds ? sizeAnchorOffset(PM, fontLayer, command.time ?? PM.time) : null;
+  const sizeAnchorBounds = nativeSizeBounds && sizeOffset ? {
+    x0: nativeSizeBounds.x0 + sizeOffset.x, x1: nativeSizeBounds.x1 + sizeOffset.x,
+    y0: nativeSizeBounds.y0 + sizeOffset.y, y1: nativeSizeBounds.y1 + sizeOffset.y,
+  } : null;
   let data: any;
   switch (command.type) {
     case 'set_property': data = setProperty(command); break;
@@ -849,6 +868,19 @@ function runOne(sourceCommand: any, meta: any = {}) {
       ref[end] = ref[start] + referenceSpan;
     }
   }
+  if (sizeAnchorBounds) {
+    // Moving the pivot must preserve the current artwork before the next resize.
+    const ref = fontLayer.d.sizeAnchorBounds;
+    for (const axis of ['x', 'y'] as const) {
+      const start = `${axis}0` as const, end = `${axis}1` as const;
+      const span = sizeAnchorBounds[end] - sizeAnchorBounds[start], referenceSpan = ref[end] - ref[start];
+      if (span <= 0) continue;
+      const anchor = PM.ev(fontLayer, 'anchor.' + axis, command.time ?? PM.time);
+      ref[start] = anchor - (anchor - sizeAnchorBounds[start]) / span * referenceSpan;
+      ref[end] = ref[start] + referenceSpan;
+    }
+    PM.touch();
+  }
   if (['add_layer', 'delete_layers', 'reorder_layer', 'group_layers', 'ungroup_layers', 'move_to_group'].includes(command.type)
       || command.type === 'set_layer' && Object.keys(command.patch || {}).some((key: any) => ['name', 'from', 'duration', 'visible', 'parent'].includes(key))) {
     PM.ProjectIndex?.invalidate();
@@ -878,7 +910,7 @@ function changed(notify: any = true) {
   if (notify) inspectorService(PM)?.refresh();
 }
 
-const colorValue: any = (value: any) => typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value);
+const colorValue: any = (value: any) => typeof value === 'string' && /^#[0-9a-f]{6}(?:[0-9a-f]{2})?$/i.test(value);
 const primitiveControl: any = (value: any) => typeof value === 'boolean' ? 'toggle'
   : typeof value === 'number' ? 'slider'
     : colorValue(value) ? 'color'
@@ -925,7 +957,6 @@ function sourceCatalog() {
       { path: 'layer.duration', label: 'Duration', control: 'slider', value: layer.dur, min: 1 / Math.max(1, p.fps), max: Math.max(p.dur, layer.dur), step: 1 / Math.max(1, p.fps), unit: 's' },
       { path: 'layer.visible', label: 'Visible', control: 'toggle', value: evaluatedValue(PM, layer, layer.on, PM.time, 'l.on') },
       { path: 'layer.locked', label: 'Locked', control: 'toggle', value: layer.lock },
-      { path: 'layer.shy', label: 'Shy', control: 'toggle', value: layer.shy },
       { path: 'layer.collapsed', label: 'Collapsed', control: 'toggle', value: layer.collapsed },
       { path: 'layer.color', label: 'Label color', control: 'color', value: layer.color },
     ];

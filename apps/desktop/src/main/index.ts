@@ -1,41 +1,79 @@
+import { registerFontsIpc } from './fonts';
 import { registerAgentNotifications } from './agent-notifications';
 import { installUpdates } from './updates';
+import { installWhatsNew, whatsNewOptions } from './whats-new';
 import { installTextContextMenu } from './text-context-menu';
 import { installPermissionHandlers } from './permissions';
 import { registerRenderEncoder } from './render-encoder';
 import {
   app,
   BrowserWindow,
+  dialog,
   ipcMain,
   protocol,
+  safeStorage,
   screen,
   session,
   shell,
+  webContents as allWebContents,
   type WebContents
 } from 'electron';
 import { mkdir, readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 
-import { IPC } from '../shared/ipc';
+import {
+  IPC,
+  PROJECT_ID,
+  type WindowClaimResult,
+  type WindowPlaceTabResult,
+  type WindowInitialProject,
+  type WindowOpenResult
+} from '../shared/ipc';
 import { registerCaptureIpc } from './capture';
 import { registerCodexIpc } from './codex';
+import { configureRuntimeUpdates } from './runtime-updates';
 import { recoverAllInterruptedExtensionTransactions } from './codex/change-history';
-import { extensionAssetCorsHeaders, registerExtensionsIpc, serveExtensionAsset } from './extensions';
-import { createExtensionRegistry } from './extensions/registry';
+import { extensionAssetCorsHeaders, registerExtensionsIpc, removeUserExtension, serveExtensionAsset, sandboxManifestFor } from './extensions';
+import { createExtensionRegistry, type ExtensionRegistry } from './extensions/registry';
+import { createProvenanceStore } from './cloud/provenance';
+import { trustDialog, trustLevelFor, hasStoreMarker } from './cloud/trust';
+import { DEEP_LINK_SCHEME } from './cloud/auth';
+import { createDeepLinkQueue, deepLinksIn, startCloudService, type CloudService } from './cloud/service';
+import { createStoreClient } from './cloud/store-client';
+import { createPublishApi, createPublisher } from './cloud/publish';
+import { createStoreInstaller } from './cloud/install';
+import { registerStoreIpc as registerExtensionStoreIpc } from './cloud/store-ipc';
+import { createStoreAgentGateway, type StoreAgentGateway } from './cloud/store-agent';
+import { ApiError, type MeDto } from '@powermove/registry/wire';
+import { CLOUD_IPC, CLOUD_UNREACHABLE } from '../shared/cloud-ipc';
+import { STORE_IPC } from '../shared/store-ipc';
+import { createEnvStore } from './env/store';
+import { createVarsService } from './env/service';
+import { createRemoveValuesPrompt, registerVarsIpc } from './env/ipc';
 import { startExtensionWatcher } from './extensions/watcher';
 import { registerLogIpc } from './log';
+import { MIME_TYPES } from './mime';
 import { registerHapticsIpc } from './haptics';
 import { registerContextMenuIpc } from './context-menu';
-import { MediaProxyService, playbackConverter, imageSequenceConverter, registerMediaProxyIpc } from './media-proxy';
+import { registerCloudMediaIpc } from './cloud-media';
+import { registerConfirmIpc } from './native-confirm';
+import { registerClipboardIpc } from './clipboard';
+import { userInput } from './user-input';
+import { MediaProxyService, playbackConverter, previewConverter, imageSequenceConverter, stillImageConverter, registerMediaProxyIpc } from './media-proxy';
 import { registerNativeEditIpc } from './native-edit';
 import { installMenu, installRendererMenuShortcutRouting } from './menu';
-import { registerSaveIpc } from './save';
+import { openProjectForWindow, registerProjectOpenPathIpc, registerSaveIpc } from './save';
 import { ProjectFiles } from './project-files';
 import { registerShellIpc } from './shell';
-import { CONTENT_SECURITY_POLICY, SANDBOX_CONTENT_SECURITY_POLICY } from './security-policy';
-import { createStore, installQuitFlush, registerStoreIpc } from './storage';
+import { registerRemoteMediaIpc } from './remote-media';
+import { CONTENT_SECURITY_POLICY, SANDBOX_CONTENT_SECURITY_POLICY, extensionSandboxCsp, sandboxFrameNavigationAllowed, sandboxHostOwner, sandboxProcessesToKill, type ContentsFrames } from './security-policy';
+import { SANDBOX_DOCUMENT, isSandboxHost, sandboxDocumentId, sandboxHost } from '../shared/sandbox-origin';
+import { EXTENSION_ID } from '../shared/extensions';
+import { createStore, installQuitFlush, registerStoreIpc, type Store } from './storage';
 import { registerThemeIpc } from './theme';
 import { backgroundTesting, backgroundWindowOptions } from './background-testing';
+import { EditorWindows, restorableSessions, windowUnderTabDrop } from './windows';
+import { isPanelPopoutRequest } from './panel-popout';
 import { OnboardingFlow, onboardingCompleted, onboardingEnabled, persistOnboardingCompleted } from './onboarding';
 
 const APP_ORIGIN = 'app://powermove';
@@ -44,39 +82,6 @@ const APP_ORIGIN = 'app://powermove';
 // Set it before the first getPath('userData') call so development launches use
 // the same Powermove profile as packaged builds (including generated effects).
 app.setName('Powermove');
-
-// Served with X-Content-Type-Options: nosniff, so anything not listed here is
-// rejected by <video>/<audio>/WebAssembly rather than sniffed.
-const MIME_TYPES: Readonly<Record<string, string>> = {
-  '.aac': 'audio/aac',
-  '.avif': 'image/avif',
-  '.css': 'text/css; charset=utf-8',
-  '.flac': 'audio/flac',
-  '.gif': 'image/gif',
-  '.html': 'text/html; charset=utf-8',
-  '.ico': 'image/x-icon',
-  '.jpeg': 'image/jpeg',
-  '.jpg': 'image/jpeg',
-  '.js': 'text/javascript; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.m4a': 'audio/mp4',
-  '.m4v': 'video/mp4',
-  '.map': 'application/json; charset=utf-8',
-  '.mjs': 'text/javascript; charset=utf-8',
-  '.mov': 'video/quicktime',
-  '.mp3': 'audio/mpeg',
-  '.mp4': 'video/mp4',
-  '.ogg': 'audio/ogg',
-  '.png': 'image/png',
-  '.svg': 'image/svg+xml',
-  '.ttf': 'font/ttf',
-  '.wasm': 'application/wasm',
-  '.wav': 'audio/wav',
-  '.webm': 'video/webm',
-  '.webp': 'image/webp',
-  '.woff': 'font/woff',
-  '.woff2': 'font/woff2'
-};
 
 // Media imported by the user stays on blob: URLs (IndexedDB-backed), so the
 // app:// handler never needs Range/206 support for the bundle it serves.
@@ -104,10 +109,64 @@ if (userDataOverride && path.isAbsolute(userDataOverride)) {
 }
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
-let mainWindow: BrowserWindow | null = null;
+/* Any number of windows, each with its own project tabs. `editors` is the whole
+   of the app's window state; nothing below may assume a single "main" window. */
+const editors = new EditorWindows<BrowserWindow>({ quiet: isBackgroundTest });
+/** The window a menu command or a Dock activation belongs to. */
+const currentEditor = (): BrowserWindow | null => {
+  const focused = BrowserWindow.getFocusedWindow();
+  return focused && editors.has(focused) ? focused : editors.mostRecent();
+};
+/* Set once the store exists; before that a window cannot have a project yet. */
+let persistOpenWindows: () => void = () => {};
 let onboardingFlow: OnboardingFlow | null = null;
 let startupInitialized = false;
+let projects: ProjectFiles | null = null;
+const pendingOpenFiles: string[] = [];
+/* Editors whose current page has subscribed to projectOpenExternal. A message
+   sent before that (on a cold start, `did-finish-load` comes first) is lost. */
+const openReadyEditors = new WeakSet<WebContents>();
+const recentOpenFiles = new Map<string, number>();
 let quitPrepared = () => false;
+/* `powermove://auth?state&token` finishes a browser sign-in (store plan §2.3).
+   On a cold start `open-url` fires before `ready`, so links wait here until
+   the account is initialised. */
+const deepLinks = createDeepLinkQueue();
+
+function queueOrOpen(filePath: string): void {
+  const mainWindow = currentEditor();
+  const normalized = path.resolve(filePath);
+  const now = Date.now();
+  const lastOpen = recentOpenFiles.get(normalized);
+  if (lastOpen !== undefined && now - lastOpen < 1_000) return;
+  recentOpenFiles.set(normalized, now);
+  for (const [candidate, timestamp] of recentOpenFiles) {
+    if (now - timestamp >= 1_000) recentOpenFiles.delete(candidate);
+  }
+  if (!startupInitialized || !mainWindow || mainWindow.isDestroyed()
+    || mainWindow.webContents.isDestroyed() || !openReadyEditors.has(mainWindow.webContents) || mainWindow.webContents.isLoading() || !projects) {
+    if (!pendingOpenFiles.includes(normalized)) pendingOpenFiles.push(normalized);
+    return;
+  }
+  const target = mainWindow.webContents;
+  void openProjectForWindow({ projects }, target, normalized).then(result => {
+    if (!target.isDestroyed()) target.send(IPC.projectOpenExternal, result);
+  });
+}
+
+function drainPendingOpenFiles(): void {
+  const mainWindow = currentEditor();
+  if (!startupInitialized || !mainWindow || mainWindow.isDestroyed()
+    || mainWindow.webContents.isDestroyed() || !openReadyEditors.has(mainWindow.webContents) || mainWindow.webContents.isLoading() || !projects) return;
+  const queued = pendingOpenFiles.splice(0);
+  for (const filePath of queued) {
+    // The queue has already passed through the duplicate guard.
+    const target = mainWindow.webContents;
+    void openProjectForWindow({ projects }, target, filePath).then(result => {
+      if (!target.isDestroyed()) target.send(IPC.projectOpenExternal, result);
+    });
+  }
+}
 async function prepareEditorClose(window: BrowserWindow): Promise<void> {
   if (window.isDestroyed() || window.webContents.isDestroyed()
     || !isAllowedNavigation(window.webContents.getURL(), devRendererUrl)) return;
@@ -149,12 +208,86 @@ function errorResponse(status: number, message: string): Response {
 const SANDBOX_PATH = 'host/sandbox.html';
 const SANDBOX_CSP = SANDBOX_CONTENT_SECURITY_POLICY;
 
+/* Static files the sandbox document itself loads: its entry and chunks, the
+   stylesheets and fonts they reference. Nothing else of the app is served on
+   a sandbox host. */
+const SANDBOX_STATIC = /^(?:host\/[^/]+\.js|assets\/[^/]+\.css|assets\/fonts\/[^/]+\.(?:woff2?|ttf|otf))$/i;
+
+function rendererFile(rendererRoot: string, requestedPath: string): string | null {
+  const filePath = path.resolve(rendererRoot, requestedPath);
+  const relativePath = path.relative(rendererRoot, filePath);
+  return relativePath === '..' || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath) ? null : filePath;
+}
+
+/* Every installed extension id, once the registry exists: a sandbox host is
+   served and terminated only for the one id on it (sandboxHostOwner). */
+let installedExtensionIds: () => string[] = () => [];
+
+/**
+ * One Store extension's host, `app://<sandboxHost(id)>` (docs/sandbox-data-plane.md
+ * §1): its sandbox document, the static files that document loads, and its
+ * own bundle. A host no installed extension owns (or, fail closed, several
+ * would) serves nothing. Node's URL.origin is "null" for custom schemes, so
+ * the origin is spelled out.
+ */
+async function serveSandboxHost(requestUrl: URL, rendererRoot: string): Promise<Response> {
+  const host = requestUrl.host;
+  const owner = sandboxHostOwner(host, installedExtensionIds());
+  if (owner === null) return errorResponse(404, 'Not found');
+  const origin = `app://${host}`;
+  const requestedPath = decodeURIComponent(requestUrl.pathname).replace(/^\/+/, '');
+  if (requestedPath === SANDBOX_DOCUMENT) {
+    const id = sandboxDocumentId(requestUrl.href);
+    const manifest = id === owner ? sandboxManifestFor(id) : null;
+    if (!id || !manifest || requestUrl.searchParams.get('perms') !== (manifest.permissions ?? []).join(',')) return errorResponse(404, 'Not found');
+    const headers = responseHeaders('text/html; charset=utf-8');
+    headers['Cross-Origin-Resource-Policy'] = 'same-origin';
+    /* Development: the renderer runs from Vite, which has no built
+       out/renderer/host. Serve the document from Vite's own entry through
+       app:// so the frame keeps the same origin rules and CSP as a packaged
+       build (Vite answers /host/ext-sandbox.html with the app shell, which is
+       why the frame must not load it directly). */
+    if (devRendererUrl) {
+      const vite = new URL(devRendererUrl).origin;
+      const upstream = await fetch(`${vite}/sandbox/ext-sandbox.html`);
+      if (!upstream.ok) return errorResponse(502, 'Sandbox document unavailable from the dev server');
+      const html = (await upstream.text())
+        .replace('src="./ext-sandbox.ts"', `src="${vite}/sandbox/ext-sandbox.ts"`)
+        .replace('src="/@vite/client"', `src="${vite}/@vite/client"`);
+      headers['Content-Security-Policy'] = extensionSandboxCsp(id, manifest.permissions ?? [], origin, vite);
+      headers['Cache-Control'] = 'no-store';
+      return new Response(html, { headers });
+    }
+    headers['Content-Security-Policy'] = extensionSandboxCsp(id, manifest.permissions ?? [], origin);
+    return new Response(await readFile(path.join(rendererRoot, SANDBOX_DOCUMENT)), { headers });
+  }
+  const ext = /^ext\/([^/]+)\//.exec(requestedPath);
+  if (ext) {
+    // Another extension's bundle never loads from this host.
+    if (ext[1] !== owner) return errorResponse(404, 'Not found');
+    const asset = await serveExtensionAsset(requestedPath);
+    if (asset === null) return errorResponse(404, 'Not found');
+    const headers = responseHeaders('text/javascript; charset=utf-8');
+    headers['Cache-Control'] = 'no-store';
+    // The sandbox document is an opaque origin, so its module fetches carry `Origin: null`.
+    headers['Access-Control-Allow-Origin'] = '*';
+    return new Response(asset.body, { status: asset.status, headers });
+  }
+  const filePath = SANDBOX_STATIC.test(requestedPath) ? rendererFile(rendererRoot, requestedPath) : null;
+  if (!filePath) return errorResponse(404, 'Not found');
+  const headers = responseHeaders(MIME_TYPES[path.extname(filePath).toLowerCase()] ?? 'application/octet-stream');
+  // Vite marks the document's scripts and stylesheets crossorigin.
+  headers['Access-Control-Allow-Origin'] = '*';
+  return new Response(await readFile(filePath), { headers });
+}
+
 function registerAppProtocol(): void {
   const rendererRoot = path.resolve(__dirname, '../renderer');
 
   protocol.handle('app', async (request) => {
     try {
       const requestUrl = new URL(request.url);
+      if (isSandboxHost(requestUrl.host)) return await serveSandboxHost(requestUrl, rendererRoot);
       if (requestUrl.host !== 'powermove') {
         return errorResponse(404, 'Not found');
       }
@@ -167,23 +300,21 @@ function registerAppProtocol(): void {
         const headers = responseHeaders('text/javascript; charset=utf-8');
         headers['Cache-Control'] = 'no-store';
         Object.assign(headers, extensionAssetCorsHeaders(devRendererUrl));
+        headers['Access-Control-Allow-Origin'] = '*';
         return new Response(asset.body, { status: asset.status, headers });
       }
-      const filePath = path.resolve(rendererRoot, requestedPath);
+      // Store extension documents load only from their own host (above).
+      if (requestedPath === SANDBOX_DOCUMENT) return errorResponse(404, 'Not found');
+      const filePath = rendererFile(rendererRoot, requestedPath);
+      if (!filePath) return errorResponse(403, 'Forbidden');
       const relativePath = path.relative(rendererRoot, filePath);
-
-      if (
-        relativePath === '..' ||
-        relativePath.startsWith(`..${path.sep}`) ||
-        path.isAbsolute(relativePath)
-      ) {
-        return errorResponse(403, 'Forbidden');
-      }
 
       const contents = await readFile(filePath);
       const contentType = MIME_TYPES[path.extname(filePath).toLowerCase()] ?? 'application/octet-stream';
       const headers = responseHeaders(contentType);
       if (relativePath === SANDBOX_PATH) headers['Content-Security-Policy'] = SANDBOX_CSP;
+      if (relativePath.startsWith('host/') && relativePath.endsWith('.js')) headers['Access-Control-Allow-Origin'] = '*';
+      if (/\.(?:woff2?|ttf|otf)$/i.test(relativePath)) headers['Access-Control-Allow-Origin'] = '*';
       return new Response(contents, { headers });
     } catch {
       return errorResponse(404, 'Not found');
@@ -212,11 +343,34 @@ function secureWebContents(webContents: WebContents, devRendererUrl: string | un
   };
   webContents.on('will-navigate', guard);
   // Subframe navigations (frame-src allows about:/blob:) never fire
-  // will-navigate on the host, so they need their own hook.
-  webContents.on('will-frame-navigate', (event) => guard(event, event.url));
+  // will-navigate on the host, so they need their own hook. A Store
+  // extension's frame may load its sandbox document on its own host only.
+  webContents.on('will-frame-navigate', (event) => {
+    if (!event.isMainFrame && sandboxFrameNavigationAllowed(event.url, [frameUrl(event.frame), frameUrl(event.initiator)])) return;
+    guard(event, event.url);
+  });
   webContents.on('will-redirect', guard);
 
-  webContents.setWindowOpenHandler(({ url }) => {
+  webContents.setWindowOpenHandler(({ url, frameName }) => {
+    const opener = BrowserWindow.fromWebContents(webContents);
+    if (isPanelPopoutRequest(url, frameName,
+      !!opener && editors.has(opener) && isAllowedNavigation(webContents.getURL(), devRendererUrl)
+    )) {
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          ...backgroundWindowOptions(isBackgroundTest),
+          minWidth: 280,
+          minHeight: 240,
+          webPreferences: {
+            ...backgroundWindowOptions(isBackgroundTest).webPreferences,
+            contextIsolation: true,
+            sandbox: true,
+            nodeIntegration: false
+          }
+        }
+      };
+    }
     try {
       const target = new URL(url);
       if (target.protocol === 'https:' || target.protocol === 'http:') {
@@ -228,6 +382,11 @@ function secureWebContents(webContents: WebContents, devRendererUrl: string | un
 
     return { action: 'deny' };
   });
+}
+
+/** A frame's URL, or '' once it is gone (WebFrameMain throws after disposal). */
+function frameUrl(frame: Electron.WebFrameMain | null | undefined): string {
+  try { return frame && !frame.isDestroyed() ? frame.url : ''; } catch { return ''; }
 }
 
 function isAppMainFrame(webContents: WebContents | null, requestingUrl: string | undefined): boolean {
@@ -257,11 +416,54 @@ function isTrustedSenderContents(sender: WebContents): boolean {
   return !!win && !win.isDestroyed() && isAllowedNavigation(sender.getURL(), devRendererUrl);
 }
 
-function createWindow(entrance = false, onEntranceReady?: () => void): BrowserWindow {
+interface EditorWindowOptions {
+  /** Plays the first-run entrance animation and defers showing the window. */
+  entrance?: boolean;
+  onEntranceReady?: () => void;
+  /** The project this window opens. Null lets the renderer pick, the way a
+   *  single-window launch did. */
+  projectId?: string | null;
+  /** Tabs a restored window comes back with, in strip order. */
+  tabs?: string[];
+  /** Screen point for the window's top-left corner: a tab torn off into a
+   *  window of its own opens where it was dropped. */
+  at?: { x: number; y: number };
+}
+
+/* A torn-off tab's window opens under the pointer but never off the display
+   it was dropped on, so its titlebar is always reachable. */
+function boundsAt(point: { x: number; y: number }, width: number, height: number): { x: number; y: number } {
+  const area = screen.getDisplayNearestPoint(point).workArea;
+  return {
+    x: Math.round(Math.min(Math.max(point.x, area.x), area.x + Math.max(0, area.width - width))),
+    y: Math.round(Math.min(Math.max(point.y, area.y), area.y + Math.max(0, area.height - height)))
+  };
+}
+
+/* Windows after the first are offset so a new one never lands exactly on the
+   window it was opened from. */
+function cascadeBounds(): { x: number; y: number } | null {
+  const from = currentEditor();
+  if (!from || from.isDestroyed()) return null;
+  const { x, y } = from.getBounds();
+  const area = screen.getDisplayMatching(from.getBounds()).workArea;
+  const next = { x: x + 26, y: y + 26 };
+  // Walking off the display resets to its top-left instead of opening a window
+  // whose titlebar the user cannot reach.
+  if (next.x + 480 > area.x + area.width || next.y + 320 > area.y + area.height) {
+    return { x: area.x + 40, y: area.y + 40 };
+  }
+  return next;
+}
+
+function createWindow(options: EditorWindowOptions = {}): BrowserWindow {
+  const { entrance = false, onEntranceReady, projectId = null, tabs = [], at } = options;
   const testOptions = backgroundWindowOptions(isBackgroundTest);
+  const cascade = at ? boundsAt(at, 1440, 900) : editors.size > 0 ? cascadeBounds() : null;
   const window = new BrowserWindow({
     ...testOptions,
     ...(entrance ? { show: false } : {}),
+    ...(cascade ?? {}),
     width: 1440,
     height: 900,
     minWidth: 980,
@@ -284,8 +486,35 @@ function createWindow(entrance = false, onEntranceReady?: () => void): BrowserWi
     }
   });
 
-  mainWindow = window;
+  editors.add(window, projectId, tabs);
+  persistOpenWindows();
+  window.on('focus', () => editors.touch(window));
+  // Drained once the page has both loaded and subscribed, in either order.
+  window.webContents.on('did-finish-load', drainPendingOpenFiles);
+  // A reload or navigation replaces the page that was listening.
+  window.webContents.on('did-start-navigation', details => {
+    if (details.isMainFrame && !details.isSameDocument) openReadyEditors.delete(window.webContents);
+  });
   installRendererMenuShortcutRouting(window.webContents);
+  userInput.track(window.webContents, forget => window.on('blur', forget));
+  let sandboxFocus = { focused: false, field: false, extensionId: '' };
+  const onSandboxFocus = (event: Electron.IpcMainEvent, value: unknown): void => {
+    if (event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame || !value || typeof value !== 'object') return;
+    const report = value as { focused?: unknown; field?: unknown; extensionId?: unknown };
+    if (typeof report.focused !== 'boolean' || typeof report.field !== 'boolean' || typeof report.extensionId !== 'string') return;
+    sandboxFocus = { focused: report.focused, field: report.focused && report.field, extensionId: report.extensionId };
+  };
+  ipcMain.on(IPC.storeSandboxFocus, onSandboxFocus);
+  window.on('blur', () => { sandboxFocus = { focused: false, field: false, extensionId: '' }; });
+  window.on('closed', () => ipcMain.off(IPC.storeSandboxFocus, onSandboxFocus));
+  window.webContents.on('before-input-event', (_event, input) => {
+    if (!sandboxFocus.focused || input.type !== 'keyDown' || window.webContents.isDestroyed()) return;
+    window.webContents.send(IPC.inputKey, {
+      type: input.type, key: input.key, code: input.code,
+      modifiers: [input.meta && 'meta', input.control && 'control', input.alt && 'alt', input.shift && 'shift'].filter(Boolean),
+      isAutoRepeat: input.isAutoRepeat, field: sandboxFocus.field, extensionId: sandboxFocus.extensionId
+    });
+  });
   installTextContextMenu(window.webContents);
 
   let closing = false, closePrepared = false;
@@ -305,9 +534,8 @@ function createWindow(entrance = false, onEntranceReady?: () => void): BrowserWi
   });
 
   window.on('closed', () => {
-    if (mainWindow === window) {
-      mainWindow = null;
-    }
+    editors.remove(window);
+    persistOpenWindows();
   });
 
   if (entrance) {
@@ -356,33 +584,272 @@ function createWindow(entrance = false, onEntranceReady?: () => void): BrowserWi
   return window;
 }
 
+/** The project id in a window request, or null for "no project". */
+function readProjectId(payload: unknown, channel: string): string | null {
+  if (payload === null || payload === undefined) return null;
+  if (typeof payload !== 'object') throw new Error(`${channel}: expected { projectId }`);
+  const value = (payload as { projectId?: unknown }).projectId;
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value !== 'string' || !PROJECT_ID.test(value)) {
+    throw new Error(`${channel}: invalid projectId`);
+  }
+  return value;
+}
+
+function registerWindowIpc(): void {
+  const senderWindow = (event: { sender: WebContents }): BrowserWindow | null => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    return window && editors.has(window) ? window : null;
+  };
+
+  // Read during the renderer's synchronous boot, before it decides which
+  // project to load, so it must answer without a round trip of its own.
+  ipcMain.on(IPC.projectOpenReady, (event) => {
+    if (!isTrustedSender(event)) return;
+    openReadyEditors.add(event.sender);
+    drainPendingOpenFiles();
+  });
+
+  ipcMain.on(IPC.windowInitialProject, (event) => {
+    const window = isTrustedSender(event) ? senderWindow(event) : null;
+    if (!window) {
+      // Nothing about the open documents is told to a sender we do not trust.
+      event.returnValue = { projectId: null, tabs: [], taken: [] } satisfies WindowInitialProject;
+      return;
+    }
+    const projectId = editors.projectOf(window);
+    const tabs = editors.tabsOf(window);
+    event.returnValue = {
+      projectId,
+      tabs,
+      taken: editors.openProjectIds().filter((id) => !tabs.includes(id))
+    } satisfies WindowInitialProject;
+  });
+
+  // A window showing a document, as a new tab or one it already has. Refused
+  // when another window has it, because two editors autosaving one slot would
+  // lose edits.
+  ipcMain.handle(IPC.windowClaimProject, (event, payload: unknown): WindowClaimResult => {
+    if (!isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
+    const window = senderWindow(event);
+    if (!window) return { claimed: false, focused: false };
+    const projectId = readProjectId(payload, IPC.windowClaimProject);
+    const holder = projectId ? editors.windowForProject(projectId) : null;
+    if (holder && holder !== window) {
+      editors.reveal(holder);
+      return { claimed: false, focused: true };
+    }
+    editors.claim(window, projectId);
+    persistOpenWindows();
+    return { claimed: true, focused: false };
+  });
+
+  // Closing a tab frees its project for any window.
+  ipcMain.handle(IPC.windowReleaseProject, (event, payload: unknown): boolean => {
+    if (!isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
+    const window = senderWindow(event);
+    const projectId = readProjectId(payload, IPC.windowReleaseProject);
+    if (!window || !projectId) return false;
+    const released = editors.release(window, projectId);
+    if (released) persistOpenWindows();
+    return released;
+  });
+
+  ipcMain.handle(IPC.windowReorderTabs, (event, payload: unknown): boolean => {
+    if (!isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
+    const window = senderWindow(event);
+    const order = payload && typeof payload === 'object' ? (payload as { order?: unknown }).order : null;
+    if (!window || !Array.isArray(order) || order.length > 500) return false;
+    const ids = order.filter((id): id is string => typeof id === 'string' && PROJECT_ID.test(id));
+    const reordered = editors.reorder(window, ids);
+    if (reordered) persistOpenWindows();
+    return reordered;
+  });
+
+  /* A tab dragged out of its window. The renderer first asks whether it is over
+     another window's strip — a lone tab only moves if so, since tearing off a
+     window's last tab would just leave an empty window behind — then lets the
+     tab go and asks for it to be placed. */
+  const readPoint = (payload: unknown): { x: number; y: number } | null => {
+    const { x, y } = (payload && typeof payload === 'object' ? payload : {}) as { x?: unknown; y?: unknown };
+    return typeof x === 'number' && typeof y === 'number' && Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+  };
+  const dropTarget = (from: BrowserWindow, point: { x: number; y: number }): BrowserWindow | null =>
+    windowUnderTabDrop(editors.byRecency(), from, point, (window) =>
+      window.isDestroyed() || window.isMinimized() ? null : window.getContentBounds());
+
+  ipcMain.handle(IPC.windowTabDropTarget, (event, payload: unknown): boolean => {
+    if (!isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
+    const window = senderWindow(event);
+    const point = readPoint(payload);
+    return !!window && !!point && !!dropTarget(window, point);
+  });
+
+  ipcMain.handle(IPC.windowPlaceTab, (event, payload: unknown): WindowPlaceTabResult => {
+    if (!isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
+    const window = senderWindow(event);
+    const point = readPoint(payload);
+    const projectId = readProjectId(payload, IPC.windowPlaceTab);
+    if (!window || !point || !projectId) return { placed: null };
+    // The sender lets go before asking; anything still holding it keeps it.
+    editors.release(window, projectId);
+    const holder = editors.windowForProject(projectId);
+    if (holder) {
+      editors.reveal(holder);
+      return { placed: 'window' };
+    }
+    const target = dropTarget(window, point);
+    if (target) {
+      const bounds = target.getContentBounds();
+      target.webContents.send(IPC.windowAdoptTab, { projectId, x: point.x - bounds.x });
+      editors.reveal(target);
+      persistOpenWindows();
+      return { placed: 'window' };
+    }
+    // The new window's first tab sits where the pointer let go of it.
+    createWindow({ projectId, at: { x: point.x - 150, y: point.y - 22 } });
+    return { placed: 'new' };
+  });
+
+  ipcMain.handle(IPC.windowOpenProject, (event, payload: unknown): WindowOpenResult => {
+    if (!isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
+    const projectId = readProjectId(payload, IPC.windowOpenProject);
+    if (!projectId) return { opened: false, focused: false, error: 'A project is required' };
+    const holder = editors.windowForProject(projectId);
+    if (holder) {
+      editors.reveal(holder);
+      return { opened: false, focused: true };
+    }
+    createWindow({ projectId });
+    return { opened: true, focused: false };
+  });
+
+  ipcMain.handle(IPC.windowNew, (event) => {
+    if (!isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
+    createWindow();
+  });
+
+  // Routed through the window's own close, so the unsaved-changes guard runs.
+  ipcMain.on(IPC.windowClose, (event) => {
+    if (!isTrustedSender(event)) return;
+    senderWindow(event)?.close();
+  });
+}
+
+/** Reopens last session's windows and their tabs, or opens one window when the
+ *  preference is off, nothing was open, or those projects are gone. */
+function restoreWindows(store: Store): void {
+  const snapshot = store.get
+    ? Object.fromEntries(['restoreWindows', 'projects', 'windowTabs', 'openWindows', 'openTabs'].map(key => [key, store.get!(key)]))
+    : store.snapshot();
+  if (snapshot['restoreWindows'] === false) {
+    createWindow();
+    return;
+  }
+  const metas = Array.isArray(snapshot['projects']) ? snapshot['projects'] : [];
+  const known = new Set(
+    metas.map((meta) => (meta as { id?: unknown } | null)?.id).filter((id): id is string => typeof id === 'string')
+  );
+  const sessions = restorableSessions(snapshot['windowTabs'], snapshot['openWindows'], snapshot['openTabs'], (id) => known.has(id));
+  if (!sessions.length) {
+    createWindow();
+    return;
+  }
+  for (const { tabs, active } of sessions) createWindow({ projectId: active, tabs });
+}
+
 if (!hasSingleInstanceLock) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
+  // macOS delivers `powermove://` links as `open-url`, which can fire before
+  // `ready`; the listener must exist by `will-finish-launching`.
+  app.on('will-finish-launching', () => {
+    app.on('open-url', (event, url) => {
+      event.preventDefault();
+      deepLinks.push(url);
+    });
+  });
+  /* Who opens `powermove://`:
+     - Packaged: electron-builder.yml `protocols` writes the scheme into
+       Info.plist, so Launch Services knows the app; claiming it here as well
+       makes the running copy the default when several are installed.
+     - Dev: nothing by default, so a dev build never takes the scheme from the
+       installed app. `POWERMOVE_DEV_PROTOCOL=1` registers this Electron binary
+       with the dev entry script. The registry always opens `powermove://`,
+       never a dev scheme. */
+  if (app.isPackaged) {
+    app.setAsDefaultProtocolClient(DEEP_LINK_SCHEME);
+  } else if (process.env['POWERMOVE_DEV_PROTOCOL'] === '1' && process.argv[1]) {
+    app.setAsDefaultProtocolClient(DEEP_LINK_SCHEME, process.execPath, [path.resolve(process.argv[1])]);
+  }
+
+  app.on('open-file', (event, filePath) => {
+    event.preventDefault();
+    queueOrOpen(filePath);
+  });
+
+  app.on('second-instance', (_event, argv) => {
+    // Windows and Linux hand a `powermove://` link to the running app this way.
+    const links = deepLinksIn(argv);
+    for (const url of links) deepLinks.push(url);
     if (isBackgroundTest) return;
+    const projectFiles = argv.filter(candidate => path.isAbsolute(candidate) && candidate.toLowerCase().endsWith('.pmv'));
+    // macOS may start a duplicate process in the background. An empty launch
+    // has no document or link to handle and must not pull the editor forward.
+    if (process.platform === 'darwin' && links.length === 0 && projectFiles.length === 0) return;
     // The listener is installed before async startup finishes. Do not let an
     // early second launch create the editor before the first-run gate decides
     // whether onboarding owns startup.
-    if (!startupInitialized) return;
+    if (!startupInitialized) {
+      for (const filePath of projectFiles) queueOrOpen(filePath);
+      return;
+    }
     if (onboardingFlow?.hasActiveWindow() || onboardingFlow?.isFirstRunPending()) {
       onboardingFlow.focus();
+      for (const filePath of projectFiles) queueOrOpen(filePath);
       return;
     }
-    if (mainWindow === null) {
-      createWindow();
-      return;
-    }
-    if (mainWindow.isMinimized()) {
-      mainWindow.restore();
-    }
-    mainWindow.show();
-    mainWindow.focus();
+    // A second launch raises the window the user was last in rather than
+    // adding one; New Window is how they ask for another.
+    if (!editors.reveal(currentEditor())) createWindow();
+    for (const filePath of projectFiles) queueOrOpen(filePath);
   });
 
   // Every WebContents (not just the main window's) gets the navigation guards.
   app.on('web-contents-created', (_event, contents) => {
     secureWebContents(contents, devRendererUrl);
+  });
+
+  /* The kernel's watchdog found a Store extension unresponsive (spinning or
+     crashed). Removing its iframe would not stop a spinning process, so kill
+     the processes that run nothing but that extension's host. */
+  ipcMain.handle(IPC.sandboxTerminate, (event, extensionId: unknown): number => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (!isTrustedSender(event) || !window || !editors.has(window)) throw new Error('Unauthorized IPC sender');
+    if (typeof extensionId !== 'string' || !EXTENSION_ID.test(extensionId)) throw new Error(`${IPC.sandboxTerminate}: invalid extension id`);
+    const contents: ContentsFrames[] = [];
+    for (const wc of allWebContents.getAllWebContents()) {
+      if (wc.isDestroyed()) continue;
+      try {
+        const main = wc.mainFrame;
+        contents.push({ mainFramePid: main.osProcessId, frames: main.framesInSubtree.map(frame => ({ url: frame.url, pid: frame.osProcessId })) });
+      } catch (error) {
+        // A process we cannot see into might be shared: kill nothing.
+        console.error('[sandbox] could not inspect frames; not terminating', error);
+        return 0;
+      }
+    }
+    // Another installed id on the same host would die with it: kill nothing.
+    const host = sandboxHost(extensionId);
+    if (sandboxHostOwner(host, [extensionId, ...installedExtensionIds()]) !== extensionId) {
+      console.error('[sandbox] extension host is not its own; not terminating', extensionId);
+      return 0;
+    }
+    let killed = 0;
+    for (const pid of sandboxProcessesToKill(host, contents)) {
+      try { process.kill(pid, 'SIGKILL'); killed++; } catch { /* already gone */ }
+    }
+    return killed;
   });
 
   ipcMain.handle(IPC.ping, (event) => {
@@ -396,15 +863,38 @@ if (!hasSingleInstanceLock) {
     const proxyEncoder = app.isPackaged
       ? path.join(process.resourcesPath, 'encoder', 'ffmpeg')
       : path.join(app.getAppPath(), 'node_modules', 'ffmpeg-static', 'ffmpeg');
-    const mediaProxies = new MediaProxyService(app.getPath('temp'), playbackConverter(proxyEncoder), imageSequenceConverter(proxyEncoder));
+    const mediaProxies = new MediaProxyService(app.getPath('temp'), playbackConverter(proxyEncoder), imageSequenceConverter(proxyEncoder), previewConverter(proxyEncoder), stillImageConverter(proxyEncoder));
     registerAppProtocol();
     installPermissionHandlers(session.defaultSession, isAppMainFrame);
 
     // Boot barrier: the legacy renderer reads PM.store synchronously while its
     // scripts load, so the store must be in memory before the window exists.
+    configureRuntimeUpdates({ root: path.join(app.getPath('userData'), 'runtimes'), appVersion: app.getVersion() });
     const store = createStore(path.join(app.getPath('userData'), 'store'));
     await store.load();
-    registerStoreIpc(ipcMain, store, { isTrustedSender });
+    registerStoreIpc(ipcMain, store, {
+      isTrustedSender,
+      // One window's write is another window's stale cache. Tell the others
+      // which keys moved so their next read goes back to the store.
+      broadcastChange: (keys, sender) => {
+        for (const window of editors.all()) {
+          if (window.webContents === sender || window.webContents.isDestroyed()) continue;
+          window.webContents.send(IPC.storeChanged, { keys });
+        }
+      }
+    });
+    // Quitting closes every window in turn; the restore list must survive that,
+    // so it stops tracking as soon as the quit begins.
+    let quitting = false;
+    app.on('before-quit', () => { quitting = true; });
+    persistOpenWindows = () => {
+      if (quitting) return;
+      // The flat list is what renderers read to know what is open anywhere;
+      // the per-window tabs are only for putting the windows back at launch.
+      store.set('openWindows', editors.openProjectIds());
+      store.set('windowTabs', editors.openSessions());
+    };
+    registerWindowIpc();
     const quitBarrier = installQuitFlush(app, store, async () => {
       for (const window of BrowserWindow.getAllWindows()) await prepareEditorClose(window);
     });
@@ -416,6 +906,38 @@ if (!hasSingleInstanceLock) {
       ? path.join(process.resourcesPath, 'builtin-extensions')
       : path.resolve(app.getAppPath(), 'src/extensions');
     let refreshRestoredExtensions: ((ids: string[]) => Promise<void>) | undefined;
+    /* One provenance store for values and the Store: its writes are ordered. */
+    const provenance = createProvenanceStore(app.getPath('userData'));
+    /* The signed-in account decides whose a store install is (trust.ts). The
+       registry boots before the account does; this reads through once it has. */
+    let currentMe: () => MeDto | null = () => null;
+    /* The Store as the in-app agent uses it, built alongside the human's Store
+       IPC below and handed to the agent tool bridge. Null until then. */
+    let storeAgentGateway: StoreAgentGateway | null = null;
+    let storeDeps: {
+      registry: ExtensionRegistry;
+      builtinIds: string[];
+      beforeRemove: ReturnType<typeof createRemoveValuesPrompt>;
+      hasValues(id: string): Promise<boolean>;
+    } | null = null;
+    /* Signing in or out can make a store install mine, or someone else's
+       again: re-derive trust for user folders when the publisher changes. */
+    let trustPublisher: string | null | undefined;
+    let trustRefresh: Promise<void> = Promise.resolve();
+    const refreshTrust = (): Promise<void> => {
+      const registry = storeDeps?.registry;
+      const publisher = currentMe()?.publisher?.id ?? null;
+      if (!registry || publisher === trustPublisher) return trustRefresh;
+      trustPublisher = publisher;
+      trustRefresh = trustRefresh.then(async () => {
+        const before = new Map(registry.list().filter((record) => record.scope === 'user').map((record) => [record.id, record.trust]));
+        if (!before.size) return;
+        await registry.refresh([...before.keys()]);
+        const changed = registry.list().filter((record) => before.has(record.id) && before.get(record.id) !== record.trust).map((record) => record.id);
+        if (changed.length) registry.emitChanged({ ids: changed, reason: 'reload' });
+      }).catch((error: unknown) => console.error('[extensions] trust refresh failed', error));
+      return trustRefresh;
+    };
     // Extension boot must never prevent the window from appearing: a bad
     // directory or a slow compile degrades to "no user extensions" instead.
     try {
@@ -430,18 +952,30 @@ if (!hasSingleInstanceLock) {
       } catch {
         // No built-in directory (tests / partial checkouts): kernel still boots.
       }
+      // Extension values live in the profile, never in an extension folder.
+      const vars = createVarsService({
+        env: createEnvStore({ dir: path.join(app.getPath('userData'), 'env'), safeStorage: () => safeStorage }),
+        provenance
+      });
       const extensionRegistry = createExtensionRegistry({
         store,
         userDir,
         buildDir,
         builtinIds,
-        resourcesDir: builtinResourcesDir
+        resourcesDir: builtinResourcesDir,
+        resolveVars: (id, decls) => vars.resolve(id, decls),
+        trustFor: async (id, scope) => trustLevelFor({ scope }, scope === 'user' ? await provenance.get(id) : null, currentMe(), scope === 'user' && await hasStoreMarker(userDir, id))
       });
+      const beforeRemove = createRemoveValuesPrompt({ registry: extensionRegistry, vars });
       registerExtensionsIpc(ipcMain, {
         registry: extensionRegistry,
         resourcesDir: builtinResourcesDir,
-        isTrusted: isTrustedSender
+        isTrusted: isTrustedSender,
+        beforeRemove
       });
+      installedExtensionIds = () => extensionRegistry.list().map((record) => record.id);
+      storeDeps = { registry: extensionRegistry, builtinIds, beforeRemove, hasValues: (id) => vars.hasValues(id) };
+      registerVarsIpc(ipcMain, { registry: extensionRegistry, vars, isTrusted: isTrustedSender });
       refreshRestoredExtensions = async (ids) => {
         await extensionRegistry.refresh(ids);
         extensionRegistry.emitChanged({ ids, reason: 'reload' });
@@ -449,24 +983,155 @@ if (!hasSingleInstanceLock) {
       // Compile in the background; the renderer receives ext:changed when done.
       void extensionRegistry
         .refresh()
-        .then(() => startExtensionWatcher({ userDir, buildDir, registry: extensionRegistry }))
+        .then(() => {
+          extensionRegistry.emitChanged({ ids: [], reason: 'reload' });
+          return startExtensionWatcher({ userDir, buildDir, registry: extensionRegistry });
+        })
         .catch((error) => console.error('[extensions] initial refresh failed', error));
     } catch (error) {
       console.error('[extensions] boot skipped', error);
     }
 
     const ctx = { isTrustedSender, isTrustedSenderContents };
-    registerSaveIpc(ipcMain, { ...ctx, projects: new ProjectFiles(path.join(app.getPath('userData'), 'project-files.json')) });
+    projects = new ProjectFiles(path.join(app.getPath('userData'), 'project-files.json'), path.join(app.getPath('userData'), 'backups'));
+    registerSaveIpc(ipcMain, { ...ctx, projects });
+    registerProjectOpenPathIpc(ipcMain, { ...ctx, projects });
     registerCaptureIpc(ipcMain, ctx);
     registerShellIpc(ipcMain, { ...ctx, attachmentCacheDirectory: path.join(app.getPath('userData'), 'Attachment Cache') });
     registerThemeIpc(ipcMain, ctx);
     registerHapticsIpc(ipcMain, ctx);
+    registerFontsIpc(ipcMain, ctx);
     registerContextMenuIpc(ipcMain, ctx);
+    registerConfirmIpc(ipcMain, ctx);
+    registerClipboardIpc(ipcMain, ctx);
+    registerCloudMediaIpc(ipcMain, ctx);
+    const remoteMedia = registerRemoteMediaIpc(ipcMain, ctx);
+    // e2e swaps DNS and the socket for fakes; only an isolated background test profile exposes it.
+    if (isBackgroundTest) (globalThis as { __powermoveRemoteMedia?: unknown }).__powermoveRemoteMedia = remoteMedia;
     registerAgentNotifications(ipcMain, ctx);
     registerNativeEditIpc(ipcMain, ctx);
     registerLogIpc(ipcMain, ctx);
     registerMediaProxyIpc(ipcMain, mediaProxies, ctx);
     registerRenderEncoder(ipcMain,ctx);
+    // Powermove Cloud account. Boot must never block the window: a broken
+    // profile file degrades to "signed out".
+    let cloud: CloudService | null = null;
+    try {
+      cloud = await startCloudService({
+        userData: app.getPath('userData'),
+        appVersion: app.getVersion(),
+        safeStorage: () => safeStorage,
+        ipcMain,
+        isTrusted: isTrustedSender,
+        broadcast: (channel, payload) => {
+          if (channel === CLOUD_IPC.accountChanged) void refreshTrust();
+          for (const window of editors.all()) {
+            if (!window.webContents.isDestroyed()) window.webContents.send(channel, payload);
+          }
+        },
+        openExternal: (url) => shell.openExternal(url),
+        showMessageBox: (options) => {
+          const window = currentEditor();
+          return window && !window.isDestroyed() ? dialog.showMessageBox(window, options) : dialog.showMessageBox(options);
+        }
+      });
+      const service = cloud;
+      deepLinks.ready((url) => {
+        // Coming back from the browser: bring Powermove forward.
+        editors.reveal(currentEditor());
+        void service.auth.handleDeepLink(url);
+      });
+    } catch (error) {
+      console.error('[cloud] account boot skipped', error instanceof Error ? error.message : 'unknown error');
+    }
+    // The Store: browse, install, update, uninstall. Needs the extension
+    // registry; without the account service it reads as offline.
+    if (storeDeps) {
+      const deps = storeDeps;
+      const cloudSession = cloud?.session ?? null;
+      currentMe = () => cloudSession?.me() ?? null;
+      void refreshTrust();
+      const cloudClient = () => {
+        if (!cloudSession) throw new ApiError({ error: 'internal', detail: CLOUD_UNREACHABLE });
+        return cloudSession.client();
+      };
+      const storeClient = createStoreClient(cloudClient);
+      const toEditors = (channel: string, payload?: unknown): void => {
+        for (const window of editors.all()) {
+          if (!window.webContents.isDestroyed()) window.webContents.send(channel, payload);
+        }
+      };
+      // Publishing: the confirmation is a native sheet owned by main.
+      const publisher = createPublisher({
+        registry: deps.registry,
+        provenance,
+        api: createPublishApi(cloudClient),
+        me: () => cloudSession?.me() ?? null,
+        signedIn: () => cloudSession?.currentToken() != null,
+        confirm: async (options) => {
+          const window = currentEditor();
+          const result = window && !window.isDestroyed() ? await dialog.showMessageBox(window, options) : await dialog.showMessageBox(options);
+          return result.response === 0;
+        },
+        notifyProgress: (progress) => toEditors(STORE_IPC.publishProgress, progress),
+        notifyLibrary: () => toEditors(STORE_IPC.libraryChanged)
+      });
+      const installer = createStoreInstaller({
+        registry: deps.registry,
+        provenance,
+        store: storeClient,
+        builtinIds: () => deps.builtinIds,
+        me: () => cloudSession?.me() ?? null,
+        signedIn: () => cloudSession?.currentToken() != null,
+        hasValues: deps.hasValues,
+        notifyUpdates: (updates) => {
+          for (const window of editors.all()) {
+            if (!window.webContents.isDestroyed()) window.webContents.send(STORE_IPC.updatesChanged, updates);
+          }
+        }
+      });
+      registerExtensionStoreIpc(ipcMain, {
+        store: storeClient,
+        installer,
+        publisher,
+        provenance,
+        registry: deps.registry,
+        me: () => cloudSession?.me() ?? null,
+        isTrusted: isTrustedSender,
+        confirmTrust: async (name) => {
+          const window = currentEditor();
+          const options = trustDialog(name);
+          const result = window && !window.isDestroyed() ? await dialog.showMessageBox(window, options) : await dialog.showMessageBox(options);
+          return result.response === 0;
+        },
+        removeExtension: async (event, id) => {
+          await removeUserExtension({ registry: deps.registry, beforeRemove: deps.beforeRemove }, event, id);
+          return true;
+        }
+      });
+      /* The same services, shaped for the in-app agent. It reuses these
+         instances, so agent installs/publishes fire the same library/update
+         notifications the Store screen listens for. The agent path has no IPC
+         event, so uninstall removes the record directly (keeping values) and
+         reconciles the renderer via refreshRestoredExtensions. Publishing
+         still goes through the publisher's native confirmation. */
+      storeAgentGateway = createStoreAgentGateway({
+        store: storeClient,
+        installer,
+        publisher,
+        provenance,
+        registry: deps.registry,
+        me: () => cloudSession?.me() ?? null,
+        signedIn: () => cloudSession?.currentToken() != null,
+        removeExtension: async (id) => {
+          await deps.registry.remove({ id });
+          return true;
+        },
+        ...(refreshRestoredExtensions ? { refreshExtensions: refreshRestoredExtensions } : {})
+      });
+      const stopUpdateChecks = installer.startUpdateChecks();
+      app.once('will-quit', stopUpdateChecks);
+    }
     app.once('will-quit', () => { void mediaProxies.dispose(); });
     // API pack handed to the agent every autonomous run: the extension guide
     // plus the frozen kernel/shared/type contracts.
@@ -477,7 +1142,7 @@ if (!hasSingleInstanceLock) {
       ['EXTENSIONS.md', 'docs/EXTENSIONS.md'],
       ['BACKGROUND_TESTING.md', 'docs/background-testing.md'],
       ['api.ts', 'src/renderer/src/kernel/api.ts'],
-      ['extensions.ts', 'src/shared/extensions.ts'],
+      ['extensions.ts', '../../packages/registry/src/manifest.ts'],
       ['project.ts', 'src/renderer/src/core/types/project.ts'],
       ['commands.ts', 'src/renderer/src/core/types/commands.ts'],
       ['samples/gradient-tint/manifest.json', 'docs/samples/gradient-tint/manifest.json'],
@@ -504,7 +1169,12 @@ if (!hasSingleInstanceLock) {
     };
 
     registerCodexIpc(ipcMain, {
-      getWindow: () => mainWindow,
+      getWindow: () => currentEditor(),
+      broadcast: (send) => {
+        for (const window of editors.all()) {
+          if (!window.webContents.isDestroyed()) send(window.webContents);
+        }
+      },
       userData: app.getPath('userData'),
       extensionsDir: userDir,
       apiPackFiles,
@@ -515,30 +1185,34 @@ if (!hasSingleInstanceLock) {
         ? path.join(process.resourcesPath, 'agent-tools', 'mcp-server.mjs')
         : path.join(app.getAppPath(), 'src/main/agent-tools/mcp-server.mjs'),
       agentToolCommand: process.execPath,
+      agentToolCommandArgs: [...(app.isPackaged ? [] : [app.getAppPath()]), '--powermove-agent-tools'],
       refreshExtensions: refreshRestoredExtensions,
+      storeAgent: () => storeAgentGateway,
       openExternal: async (url) => { await shell.openExternal(url); }
     });
     onboardingFlow = new OnboardingFlow(ipcMain, {
       appOrigin: (devRendererUrl ?? APP_ORIGIN).replace(/\/$/, ''),
       displayBounds: () => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          return screen.getDisplayMatching(mainWindow.getBounds()).bounds;
+        const editor = currentEditor();
+        if (editor && !editor.isDestroyed()) {
+          return screen.getDisplayMatching(editor.getBounds()).bounds;
         }
         return screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).bounds;
       },
       backgroundTest: isBackgroundTest,
       userData: app.getPath('userData'),
       createEditor: () => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          if (mainWindow.isMinimized()) mainWindow.restore();
+        const existing = currentEditor();
+        if (existing && !existing.isDestroyed()) {
+          if (existing.isMinimized()) existing.restore();
           if (!isBackgroundTest) {
-            mainWindow.show();
-            mainWindow.focus();
+            existing.show();
+            existing.focus();
           }
-          return mainWindow;
+          return existing;
         }
         return new Promise<BrowserWindow>((resolve, reject) => {
-          const editor = createWindow(true, () => resolve(editor));
+          const editor = createWindow({ entrance: true, onEntranceReady: () => resolve(editor) });
           editor.webContents.once('did-fail-load', (_event, _code, description) => {
             editor.destroy();
             reject(new Error(description));
@@ -547,8 +1221,12 @@ if (!hasSingleInstanceLock) {
       },
       secure: (window) => secureWebContents(window.webContents, devRendererUrl)
     });
-    const menu = installMenu(() => mainWindow);
+    const menu = installMenu(() => currentEditor(), {
+      newWindow: () => createWindow(),
+      closeWindow: () => currentEditor()?.close()
+    });
     if (!isBackgroundTest) installUpdates(menu);
+    if (!isBackgroundTest || process.env['POWERMOVE_WHATS_NEW_SINCE']) installWhatsNew(ipcMain, whatsNewOptions(process.env));
 
     if (isBackgroundTest) app.dock?.hide();
     const completedOnboarding = await onboardingCompleted(app.getPath('userData'));
@@ -559,9 +1237,10 @@ if (!hasSingleInstanceLock) {
       });
       onboardingFlow.start();
     } else {
-      createWindow();
+      restoreWindows(store);
     }
     startupInitialized = true;
+    drainPendingOpenFiles();
 
     app.on('activate', () => {
       if (isBackgroundTest) return;
@@ -569,9 +1248,7 @@ if (!hasSingleInstanceLock) {
         onboardingFlow.focus();
         return;
       }
-      if (BrowserWindow.getAllWindows().length === 0) {
-        createWindow();
-      }
+      if (editors.size === 0) createWindow();
     });
   });
 }

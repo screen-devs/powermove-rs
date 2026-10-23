@@ -7,8 +7,11 @@ import {
   type AgentUpdateOptions
 } from './agent/agent-state.svelte';
 import { registerSveltePanel } from './registerSveltePanel';
+import { installAgentShell } from './agent-shell';
 
 export interface AgentLegacyBridge {
+  openGlobal?(): void;
+  repairExtension?(request: { id: string; name?: string; diagnostics?: string[] }): Promise<boolean>;
   newThread?(): void;
   switchThread?(id: string): void;
   deleteThread?(id: string): void;
@@ -17,6 +20,7 @@ export interface AgentLegacyBridge {
   submit(value: string): void;
   stop(): void;
   setDraft(value: string): void;
+  setInlineDraft?(value: string, attachments: any[]): void;
   retry?(messageIndex?: number): void;
   continueWithProject?(messageIndex: number): void;
   setStepsExpanded(expanded: boolean): void;
@@ -30,6 +34,7 @@ export interface AgentLegacyBridge {
   applyPlan(): void;
   addAttachments(files: File[]): Promise<void>;
   removeAttachment(id: string): void;
+  answerQuestion?(id: string, answers: Record<string, string[]>): void;
   importArtifact(artifact: Record<string, any>): Promise<void>;
   revealArtifact(artifact: Record<string, any>): void;
   undoPanelRun(): void;
@@ -52,6 +57,8 @@ export function registerAgentPanel(PM: LegacyPM, bridge: AgentLegacyBridge): voi
   };
 
   PM.AgentUI = {
+    openGlobal: bridge.openGlobal,
+    repairExtension: bridge.repairExtension,
     newThread: bridge.newThread,
     switchThread: bridge.switchThread,
     deleteThread: bridge.deleteThread,
@@ -88,6 +95,12 @@ export function registerAgentPanel(PM: LegacyPM, bridge: AgentLegacyBridge): voi
       setAgentComposerDraft(value);
       if (focus) setAgentSnapshot(bridge.snapshot(), { focusComposer: true });
     },
+    setInlineDraft(value: string, attachments: any[]) {
+      if (bridge.setInlineDraft) bridge.setInlineDraft(value, attachments);
+      else bridge.setDraft(value);
+      setAgentComposerDraft(value);
+      agentState.attachments = attachments;
+    },
     setStepsExpanded: bridge.setStepsExpanded,
     setModel: bridge.setModel,
     setProvider: bridge.setProvider,
@@ -99,6 +112,7 @@ export function registerAgentPanel(PM: LegacyPM, bridge: AgentLegacyBridge): voi
     applyPlan: bridge.applyPlan,
     addAttachments: bridge.addAttachments,
     removeAttachment: bridge.removeAttachment,
+    answerQuestion: bridge.answerQuestion,
     importArtifact: bridge.importArtifact,
     revealArtifact: bridge.revealArtifact,
     undoPanelRun: bridge.undoPanelRun,
@@ -114,5 +128,6 @@ export function registerAgentPanel(PM: LegacyPM, bridge: AgentLegacyBridge): voi
     noscroll: true,
     component: AgentPanel
   });
+  if (typeof document !== 'undefined' && document.body) installAgentShell(PM);
   PM.AgentUI.update();
 }

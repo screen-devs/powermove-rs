@@ -1,0 +1,90 @@
+import { Hono } from 'hono';
+import { and, desc, eq, isNull, sql } from 'drizzle-orm';
+import { ApiError, Publish, Store } from '@powermove/registry/wire';
+import { storeIcon } from '../objects/icon';
+import type { Env } from '../env';
+import { extensions, moderationLog, publishers, releases, repos, reports } from '../db/schema';
+import { lineageFor, toListing, toRelease } from '../dto';
+import { requirePublisher, rateAuth } from './session';
+import { canViewDetail } from '../lifecycle';
+import { clientIp, enforce } from '../abuse';
+
+async function owned(c: import('hono').Context<Env>, handle: string, slug: string) {
+  const owner=await requirePublisher(c);
+  if (handle !== owner.handle) throw new ApiError({error:'not_owner'});
+  const [repo]=await c.var.data.db.select().from(repos).where(and(eq(repos.ownerId,owner.id),eq(repos.slug,slug))).limit(1);
+  if (!repo) throw new ApiError({error:'not_found'});
+  if (repo.tombstonedAt) throw new ApiError({error:'gone',reason:'tombstoned'});
+  return {owner,repo};
+}
+export async function listing(c: import('hono').Context<Env>, repo: typeof repos.$inferSelect, owner: typeof publishers.$inferSelect) {
+  const [extension]=await c.var.data.db.select().from(extensions).where(eq(extensions.repoId,repo.id)).limit(1);
+  if (!extension) throw new ApiError({error:'internal'});
+  const [latest]=extension.latestReleaseId ? await c.var.data.db.select().from(releases).where(eq(releases.id,extension.latestReleaseId)).limit(1) : [];
+  return toListing(repo,extension,owner,latest ?? null,await lineageFor(c.var.data.db,repo));
+}
+export const repoManagement = new Hono<Env>()
+ .post('/:handle/:slug/releases/:version/yank',async c=>{
+   const {handle,slug,version}=Publish.Yank.Req.shape.params.parse(c.req.param());
+   const {owner,repo}=await owned(c,handle,slug);
+   const result=await c.var.data.tx(async tx=>{
+     await tx.execute(sql`select id from repos where id = ${repo.id}::uuid for update`);
+     const [release]=await tx.select().from(releases).where(and(eq(releases.repoId,repo.id),eq(releases.version,version))).limit(1);
+     if (!release) throw new ApiError({error:'not_found'});
+     const [yanked]=await tx.update(releases).set({yankedAt:release.yankedAt ?? new Date()}).where(eq(releases.id,release.id)).returning();
+     const [latest]=await tx.select().from(releases).where(and(eq(releases.repoId,repo.id),isNull(releases.yankedAt))).orderBy(desc(releases.publishedAt),desc(releases.id)).limit(1);
+     await tx.update(extensions).set({latestReleaseId:latest?.id ?? null,permissions:latest?.permissions ?? []}).where(eq(extensions.repoId,repo.id));
+     await tx.insert(moderationLog).values({repoId:repo.id,releaseId:release.id,action:'yank',reason:'',actor:owner.id});
+     return yanked!;
+   });
+   return c.json({repo:await listing(c,repo,owner),release:toRelease(result)});
+ })
+ .patch('/:handle/:slug',async c=>{
+   const {handle,slug}=Publish.PatchRepo.Req.shape.params.parse(c.req.param());
+   const body=Publish.PatchRepo.Req.shape.body.parse(await c.req.json().catch(()=>null));
+   const {owner,repo}=await owned(c,handle,slug);
+   const iconKey=await storeIcon(c.env.ICONS,body.iconPng);
+   const [updated]=await c.var.data.db.update(repos).set({...(body.visibility?{visibility:body.visibility}:{}),updatedAt:new Date()}).where(eq(repos.id,repo.id)).returning();
+   if (body.listing || iconKey) await c.var.data.db.update(extensions).set({...body.listing,...(iconKey?{iconKey}:{})}).where(eq(extensions.repoId,repo.id));
+   return c.json(await listing(c,updated!,owner));
+ })
+ .delete('/:handle/:slug',async c=>{
+   const {handle,slug}=Publish.DeleteRepo.Req.shape.params.parse(c.req.param());
+   const {owner,repo}=await owned(c,handle,slug);
+   await c.var.data.tx(async tx=>{
+     await tx.update(repos).set({tombstonedAt:new Date(),updatedAt:new Date()}).where(eq(repos.id,repo.id));
+     await tx.insert(moderationLog).values({repoId:repo.id,action:'tombstone',reason:'',actor:owner.id});
+   });
+   return c.body(null,204);
+ });
+
+export const storeUtility = new Hono<Env>()
+ .get('/icons/:key',async c=>{
+   const {key}=Store.Icon.Req.shape.params.parse(c.req.param());
+   if (!/^[a-f0-9]{64}\.png$/.test(key)) throw new ApiError({error:'not_found'});
+   const session=c.var.session;
+   const [publisher]=session ? await c.var.data.db.select().from(publishers).where(eq(publishers.userId,session.userId)).limit(1) : [];
+   const rows=await c.var.data.db.select({repo:repos}).from(extensions).innerJoin(repos,eq(repos.id,extensions.repoId)).where(eq(extensions.iconKey,key));
+   const readable=rows.filter(row=>canViewDetail(row.repo,{publisherId:publisher?.id ?? null,admin:false})==='ok');
+   if (!readable.length) throw new ApiError({error:'not_found'});
+   const publiclyReadable=readable.some(row=>canViewDetail(row.repo,{publisherId:null,admin:false})==='ok');
+   const obj=await c.env.ICONS.get(`icons/${key}`);
+   if (!obj) throw new ApiError({error:'not_found'});
+   return new Response(obj.body,{headers:{'Content-Type':'image/png','Cache-Control':publiclyReadable?'public, max-age=300':'private, no-store',...(publiclyReadable?{'ETag':`"${key.slice(0,-4)}"`}:{})}});
+ })
+ .post('/x/:handle/:slug/report',async c=>{
+   await rateAuth(c);
+   const ip = clientIp(c);
+   await enforce(c, 'report_ip', ip);
+   const {handle,slug}=Store.Report.Req.shape.params.parse(c.req.param());
+   const body=Store.Report.Req.shape.body.parse(await c.req.json().catch(()=>null));
+   const [row]=await c.var.data.db.select({repo:repos,owner:publishers}).from(repos).innerJoin(publishers,eq(repos.ownerId,publishers.id)).where(and(eq(publishers.handle,handle),eq(repos.slug,slug))).limit(1);
+   if (!row) throw new ApiError({error:'not_found'});
+   const decision=canViewDetail(row.repo,{publisherId:null,admin:false});
+   if (decision==='not_found') throw new ApiError({error:'not_found'});
+   if (decision==='gone_removed') throw new ApiError({error:'gone',reason:'removed'});
+   if (decision==='gone_tombstoned') throw new ApiError({error:'gone',reason:'tombstoned'});
+   await enforce(c, 'report_repo_ip', `${ip}|${row.repo.id}`);
+   await c.var.data.db.insert(reports).values({repoId:row.repo.id,reporterId:c.var.session?.userId ?? null,reason:body.reason});
+   return c.body(null,204);
+ });

@@ -2,7 +2,7 @@ import { readdir, realpath, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 
 import type { ArtifactFile } from '../../shared/ipc';
-import { LIMITS } from '../../shared/ipc';
+import { AgentResultValidationError } from './result-repair';
 
 const MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
   '.aac': 'audio/aac',
@@ -70,7 +70,7 @@ function rejectUnsafeRelativePath(relativePath: string): void {
 
 /**
  * Resolve an artifact path through the filesystem and prove that its final
- * target is a regular, size-bounded file below the real artifact root.
+ * target is a regular file below the real artifact root.
  */
 export async function validatedArtifactPath(root: string, relativePath: string): Promise<string> {
   rejectUnsafeRelativePath(relativePath);
@@ -84,18 +84,16 @@ export async function validatedArtifactPath(root: string, relativePath: string):
 
   const metadata = await stat(candidate);
   if (!metadata.isFile()) throw new Error('Artifact is not a regular file.');
-  if (metadata.size > LIMITS.artifactBytes) throw new Error('Artifact is larger than 64 MB.');
   return candidate;
 }
 
 export async function readArtifact(root: string, relativePath: string): Promise<ArtifactFile> {
   const filePath = await validatedArtifactPath(root, relativePath);
   const data = await readFile(filePath);
-  if (data.byteLength > LIMITS.artifactBytes) throw new Error('Artifact is larger than 64 MB.');
   return {
     name: path.basename(filePath),
     mime: mimeTypeForPath(filePath),
-    data: new Uint8Array(data)
+    data: new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
   };
 }
 
@@ -152,8 +150,10 @@ function requestedImportPaths(requested: readonly unknown[]): Set<string> {
   for (const entry of requested) {
     if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue;
     const artifact = entry as Record<string, unknown>;
-    if (artifact.importToTimeline === true && typeof artifact.path === 'string') {
-      result.add(artifact.path);
+    if (artifact.importToTimeline === true) {
+      if (typeof artifact.path !== 'string') throw new Error('An import requires an artifact path.');
+      rejectUnsafeRelativePath(artifact.path);
+      result.add(path.posix.normalize(artifact.path));
     }
   }
   return result;
@@ -169,7 +169,6 @@ export async function collectArtifacts(
   const discovered: Array<{ localPath: string; fullPath: string }> = [];
 
   async function walk(directory: string, prefix: string): Promise<void> {
-    if (discovered.length >= 80) return;
     let entries;
     try {
       entries = await readdir(directory, { withFileTypes: true });
@@ -178,7 +177,6 @@ export async function collectArtifacts(
     }
     entries.sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
-      if (discovered.length >= 80) return;
       if (entry.name.startsWith('.')) continue;
       const localPath = prefix ? `${prefix}/${entry.name}` : entry.name;
       const fullPath = path.join(directory, entry.name);
@@ -191,8 +189,21 @@ export async function collectArtifacts(
   }
 
   await walk(runDirectory, '');
+  const importFiles = new Set<string>();
+  for (const requestedPath of imports) {
+    const exact = discovered.filter(item => requestedPath === item.localPath
+      || requestedPath === `${runId}/${item.localPath}`
+      || requestedPath === `artifacts/${runId}/${item.localPath}`);
+    const matches = exact.length ? exact : discovered.filter(item => requestedPath === path.basename(item.localPath));
+    if (matches.length !== 1) {
+      throw new AgentResultValidationError(matches.length
+        ? `Import path is ambiguous: ${requestedPath}. Use the full path under artifacts/${runId}/.`
+        : `Requested import was not found: ${requestedPath}. Put the file under artifacts/${runId}/ and correct its path in the completion report.`);
+    }
+    importFiles.add(matches[0]!.localPath);
+  }
   const artifacts: CollectedArtifact[] = [];
-  for (const item of discovered.sort((left, right) => left.localPath.localeCompare(right.localPath)).slice(0, 80)) {
+  for (const item of discovered.sort((left, right) => left.localPath.localeCompare(right.localPath))) {
     let metadata;
     try {
       metadata = await stat(item.fullPath);
@@ -206,8 +217,7 @@ export async function collectArtifacts(
       name: path.basename(item.localPath),
       size: metadata.size,
       mime: mimeTypeForPath(item.fullPath),
-      importToTimeline:
-        imports.has(artifactPath) || imports.has(item.localPath) || imports.has(path.basename(item.localPath))
+      importToTimeline: importFiles.has(item.localPath)
     });
   }
   return artifacts;

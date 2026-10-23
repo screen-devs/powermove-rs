@@ -46,7 +46,7 @@ extraResources:
     to: api-pack/BACKGROUND_TESTING.md
   - from: src/renderer/src/kernel/api.ts
     to: api-pack/api.ts
-  - from: src/shared/extensions.ts
+  - from: ../../packages/registry/src/manifest.ts
     to: api-pack/extensions.ts
   - from: src/renderer/src/core/types/project.ts
     to: api-pack/project.ts
@@ -66,22 +66,60 @@ extraMetadata:
   main: out/main/index.js
 
 afterPack: ./scripts/after-pack.mjs
+# Releases live in this repository. electron-updater reads the GitHub release
+# feed (latest-mac.yml / beta-mac.yml), so the repo must be public for updates
+# to work on user machines. Drafts first: parallel asset uploads race release
+# creation, and the workflow publishes the draft once every asset is up.
 publish:
   provider: github
-  owner: motionerapp
-  repo: powermove-releases
-  releaseType: prerelease
+  owner: iterative-computer
+  repo: powermove
+  releaseType: draft
 
 artifactName: ${productName}-${version}-mac-${arch}.${ext}
 
+# `powermove://auth?state&token` finishes a browser sign-in to Powermove Cloud
+# (src/main/cloud/auth.ts). Dev builds do not claim it unless
+# POWERMOVE_DEV_PROTOCOL=1 (src/main/index.ts).
+protocols:
+  - name: Powermove
+    schemes:
+      - powermove
+
+fileAssociations:
+  - ext: pmv
+    name: Powermove Project
+    description: Powermove Project
+    role: Editor
+    icon: resources/document.icns
+    mimeType: application/vnd.powermove.project
+    isPackage: false
+
 mac:
+  # Local dist:mac builds stay unsigned. scripts/release-mac.mjs flips
+  # identity, hardenedRuntime and notarize on for CI releases.
   identity: null
   hardenedRuntime: false
-  icon: resources/icon.icns
+  category: public.app-category.graphics-design
+  entitlementsInherit: resources/entitlements.mac.plist
+  # Apple Icon Composer catalog. electron-builder invokes actool so macOS can
+  # select light, dark, tinted, and clear renditions from icon.json.
+  icon: resources/icon/Powermove.icon
+  extendInfo:
+    UTExportedTypeDeclarations:
+      - UTTypeIdentifier: com.zellzoi.powermove.project
+        UTTypeDescription: Powermove Project
+        UTTypeConformsTo:
+          - public.data
+        UTTypeTagSpecification:
+          public.filename-extension:
+            - pmv
+          public.mime-type:
+            - application/vnd.powermove.project
+        UTTypeIconFile: document.icns
+  # The DMG comes from scripts/create-dmg.mjs; electron-builder only builds
+  # the ZIP that electron-updater downloads.
   target:
-    - target: dmg
-      arch:
-        - arm64
     - target: zip
       arch:
         - arm64

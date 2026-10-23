@@ -1,0 +1,579 @@
+/*
+ * The browser's stand-in for the Electron preload. When the app is served by
+ * `powermove serve`, there is no contextBridge; this module speaks the same
+ * IPC contract over one WebSocket and installs itself into the kernel's
+ * bridge capture (kernel/bridge.ts) before the engines boot, so the rest of
+ * the renderer does not know the difference. It never touches `window`.
+ *
+ * What cannot cross the network stays in the browser: confirmations are
+ * window.confirm, saves become downloads, dropped files are uploaded first,
+ * notifications use the Notification API.
+ */
+import { IPC, type AgentToolRequestEvent, type CodexRunResult, type FileSaveResult, type MediaProxyResult, type PowermoveBridge, type ProjectOpenResult, type RemoteRunRecord, type StoreErrorEvent } from '../../../shared/ipc';
+import { EXT_IPC, type ExtensionRecord } from '../../../shared/extensions';
+import { CLOUD_UNREACHABLE } from '../../../shared/cloud-ipc';
+import type { StoreResult } from '../../../shared/store-ipc';
+import { WEB, WEB_UPLOAD_CHUNK_BYTES, type WebHello } from '../../../shared/wire';
+import { Connection } from '../../../shared/link';
+import { attachRemoteMedia } from './remote-media';
+import { ReconnectingLink, isDisconnectError } from '../../../shared/reconnect';
+import { bridge as capturedBridge, provideBridge } from '../kernel/bridge';
+
+const WS_PATH = '/__powermove/ws';
+const VARS_UNAVAILABLE = 'Variables are not available in powermove serve yet';
+const CLOUD_UNAVAILABLE = 'Sign in is not available in powermove serve yet';
+/* The served host installs nothing: the Store shows its offline state. */
+const storeOffline = async <T>(): Promise<StoreResult<T>> => ({ ok: false, error: { error: 'internal', detail: CLOUD_UNREACHABLE } });
+
+/** The live link, for modules that attach after the engines boot (remote-sync). It outlives any one socket. */
+let activeLink: ReconnectingLink | null = null;
+export function remoteLink(): ReconnectingLink | null { return activeLink; }
+const CONNECT_TIMEOUT_MS = 4000;
+const LINK_TOAST = 'host-link';
+
+function openSocket(url: string): Promise<WebSocket> {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(url);
+    const timer = setTimeout(() => { socket.close(); reject(new Error('timeout')); }, CONNECT_TIMEOUT_MS);
+    socket.addEventListener('open', () => { clearTimeout(timer); resolve(socket); }, { once: true });
+    socket.addEventListener('error', () => { clearTimeout(timer); reject(new Error('unreachable')); }, { once: true });
+  });
+}
+
+/** The browser tells us when the network is back or the tab is looked at again: good moments to retry. */
+function wakeOn(retry: () => void): () => void {
+  const visible = () => { if (document.visibilityState === 'visible') retry(); };
+  window.addEventListener('online', retry);
+  document.addEventListener('visibilitychange', visible);
+  return () => { window.removeEventListener('online', retry); document.removeEventListener('visibilitychange', visible); };
+}
+
+/* ── browser-side helpers ─────────────────────────────────── */
+
+function download(pathOnHost: string, name: string): void {
+  const anchor = document.createElement('a');
+  anchor.href = `/__powermove/download?path=${encodeURIComponent(pathOnHost)}`;
+  anchor.download = name;
+  anchor.rel = 'noopener';
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+}
+
+function pickFile(accept: string, multiple = false): Promise<File[]> {
+  return new Promise((resolve) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = accept;
+    input.multiple = multiple;
+    input.style.display = 'none';
+    document.body.appendChild(input);
+    const finish = (files: File[]) => { input.remove(); resolve(files); };
+    input.addEventListener('change', () => finish([...(input.files ?? [])]), { once: true });
+    input.addEventListener('cancel', () => finish([]), { once: true });
+    input.click();
+  });
+}
+
+type Toast = (text: string, ms?: number, options?: { error?: boolean }) => void;
+const toast: Toast = (text, ms, options) => {
+  const pm = (window as unknown as { PM?: { toast?: Toast } }).PM;
+  if (pm?.toast) pm.toast(text, ms, options); else console.info(`[powermove] ${text}`);
+};
+
+const UPLOAD_PARALLEL = 4;
+
+/** A server-side path for a browser File: uploaded in 1 MiB chunks, a few in flight. */
+async function upload(link: ReconnectingLink, file: File, kind: 'media' | 'project'): Promise<string> {
+  const label = file.name || (kind === 'project' ? 'project' : 'media');
+  const megabytes = (file.size / 1048576).toFixed(file.size < 10 * 1048576 ? 1 : 0);
+  toast(`Uploading ${label} (${megabytes} MB) to the host…`, 60_000, { error: false });
+  const id = await link.invoke<string>(WEB.uploadBegin, { name: file.name, size: file.size, kind });
+  try {
+    let sent = 0, lastShown = -1;
+    const offsets: number[] = [];
+    for (let offset = 0; offset < file.size; offset += WEB_UPLOAD_CHUNK_BYTES) offsets.push(offset);
+    let next = 0;
+    const worker = async () => {
+      while (next < offsets.length) {
+        const offset = offsets[next++]!;
+        const data = new Uint8Array(await file.slice(offset, offset + WEB_UPLOAD_CHUNK_BYTES).arrayBuffer());
+        await link.invoke(WEB.uploadChunk, { id, offset, data });
+        sent += data.byteLength;
+        const percent = Math.floor((sent / file.size) * 100);
+        if (percent !== lastShown && (percent - lastShown >= 5 || percent === 100)) {
+          lastShown = percent;
+          toast(`Uploading ${label}… ${percent}%`, 60_000, { error: false });
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(UPLOAD_PARALLEL, offsets.length || 1) }, worker));
+    const hostPath = await link.invoke<string>(WEB.uploadFinish, id);
+    toast(`Uploaded ${label}. Opening on the host…`, 4000, { error: false });
+    return hostPath;
+  } catch (error) {
+    await link.invoke(WEB.uploadAbort, id).catch(() => undefined);
+    toast(`Upload of ${label} failed: ${error instanceof Error ? error.message : String(error)}`, 8000);
+    throw error;
+  }
+}
+
+function withProgress<T>(link: ReconnectingLink, channel: string, requestId: string, onProgress: ((completed: number) => void) | undefined, run: () => Promise<T>): Promise<T> {
+  const off = link.on(channel, (progress) => {
+    const value = progress as { requestId?: string; completed?: number };
+    if (value?.requestId === requestId && typeof value.completed === 'number') onProgress?.(value.completed);
+  });
+  return run().finally(off);
+}
+
+/** Generated extension bundles are served by the host at /ext/…, not app://. */
+function localizeRecords(records: ExtensionRecord[]): ExtensionRecord[] {
+  return records.map((record) => record.bundleUrl?.startsWith('app://powermove/')
+    ? { ...record, bundleUrl: `${location.origin}/${record.bundleUrl.slice('app://powermove/'.length)}` }
+    : record);
+}
+
+const IS_PMV = /\.pmv$/i;
+let nextMediaRequest = 0;
+
+/* ── the bridge ───────────────────────────────────────────── */
+
+function createBridge(link: ReconnectingLink, hello: WebHello, storeSnapshot: Record<string, string>, initialProject: { projectId: string | null; taken: string[] }): PowermoveBridge {
+  // Keys another tab wrote arrive as names; the value is re-read before the
+  // shim is told, so its synchronous refill sees the fresh string.
+  const serialized = new Map(Object.entries(storeSnapshot));
+  const storeChangedListeners = new Set<(keys: string[]) => void>();
+  link.on(IPC.storeChanged, (payload) => {
+    const keys = Array.isArray((payload as { keys?: unknown })?.keys) ? ((payload as { keys: unknown[] }).keys.filter((key): key is string => typeof key === 'string')) : [];
+    if (!keys.length) return;
+    void Promise.all(keys.map(async (key) => {
+      const value = await link.sync<string | null>(IPC.storeGetSync, { key }).catch(() => null);
+      if (value === null) serialized.delete(key); else serialized.set(key, value);
+    })).then(() => { for (const listener of storeChangedListeners) listener(keys); });
+  });
+
+  // After a reconnect the host may hold writes from other tabs made while this
+  // one was away: adopt every key whose bytes differ, the way storeChanged does.
+  link.on('__reconnected', () => {
+    void link.sync<Record<string, string>>(IPC.storeSnapshotSerializedSync).then((fresh) => {
+      const changed: string[] = [];
+      for (const [key, value] of Object.entries(fresh)) if (serialized.get(key) !== value) { serialized.set(key, value); changed.push(key); }
+      for (const key of [...serialized.keys()]) if (!(key in fresh)) { serialized.delete(key); changed.push(key); }
+      if (changed.length) for (const listener of storeChangedListeners) listener(changed);
+    }).catch(() => undefined);
+  });
+
+  /** Events seen per run, so a re-attach after a drop asks only for what was missed. */
+  const runEventCounts = new Map<string, number>();
+  link.on(IPC.codexEvent, (progress) => {
+    const id = (progress as { id?: unknown })?.id;
+    if (typeof id === 'string') runEventCounts.set(id, (runEventCounts.get(id) ?? 0) + 1);
+  });
+  const followRun = (runId: string, onProgress?: (text: string) => void, onTrace?: (step: never) => void): Promise<CodexRunResult> => new Promise<CodexRunResult>((resolve, reject) => {
+    const offEvents = link.on(IPC.codexEvent, (progress) => {
+      const event = progress as { id: string; kind: 'progress' | 'trace'; text?: string; step?: unknown };
+      if (event.id !== runId) return;
+      if (event.kind === 'progress') onProgress?.(event.text ?? ''); else onTrace?.(event.step as never);
+    });
+    const offFinish = link.on(WEB.runFinished, (payload) => {
+      const finished = payload as { id: string; result: CodexRunResult };
+      if (finished.id !== runId) return;
+      offEvents(); offFinish(); runEventCounts.delete(runId);
+      resolve(finished.result);
+    });
+    link.invoke(WEB.runsAttach, { runId, since: runEventCounts.get(runId) ?? 0 }).catch((error) => { offEvents(); offFinish(); reject(error); });
+  });
+  // A new socket is a new window to the host: tell it which project this tab is on.
+  let claimed: string | null = initialProject.projectId;
+  link.on('__reconnected', () => { if (claimed) void link.invoke(IPC.windowClaimProject, { projectId: claimed }).catch(() => undefined); });
+  /** Resolves once the link is up again (or at once if it already is). */
+  const whenReconnected = (): Promise<void> => new Promise<void>((resolve) => {
+    if (link.isConnected) { resolve(); return; }
+    const off = link.on('__reconnected', () => { off(); resolve(); });
+  });
+
+  const subscribe = <T,>(channel: string) => (cb: (value: T) => void) => link.on(channel, (value) => cb(value as T));
+  const notify = (title: string, body: string) => {
+    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+    try { new Notification(title, { body, silent: true }); } catch { /* not permitted */ }
+  };
+
+  const bridge: PowermoveBridge = {
+    compatible: {
+      status: () => link.invoke(IPC.compatibleStatus),
+      configure: (input) => link.invoke(IPC.compatibleConfigure, input)
+    },
+    agentNotification: async (options) => {
+      if (options.preview) return;
+      if (typeof Notification !== 'undefined' && Notification.permission === 'default') await Notification.requestPermission().catch(() => undefined);
+      if (options.question) notify('Your agent has a question', options.question.slice(0, 240));
+      else notify('Powermove', 'Your agent has finished. Your result is ready.');
+    },
+    ping: () => link.invoke<string>(IPC.ping),
+    remote: true,
+    wrapMediaStore: (store, onChange) => attachRemoteMedia(link, store as never, onChange) as never,
+    remoteRuns: {
+      list: (projectId) => link.invoke<RemoteRunRecord[]>(WEB.runsList, projectId),
+      attach: (runId, hooks) => followRun(runId, hooks.onProgress, hooks.onTrace)
+    },
+    versions: { electron: '', chrome: /Chrome\/(\S+)/.exec(navigator.userAgent)?.[1] ?? '', node: hello.node },
+
+    fileUpload: {
+      begin: (size) => link.invoke(IPC.fileSaveUpload, size),
+      chunk: (uploadId, data) => link.invoke(IPC.fileSaveChunk, { uploadId, data }),
+      finish: async (uploadId, metadata) => {
+        const result = await link.invoke<FileSaveResult>(IPC.fileSave, { ...metadata, uploadId });
+        if (result.ok && !IS_PMV.test(result.path)) download(result.path, metadata.name);
+        return result;
+      },
+      abort: (uploadId) => link.invoke(IPC.fileSaveAbort, uploadId)
+    },
+    saveFile: async (req) => {
+      let result: FileSaveResult;
+      if (req.data.byteLength <= 4 * 1024 * 1024) {
+        result = await link.invoke<FileSaveResult>(IPC.fileSave, req);
+      } else {
+        const uploadId = await link.invoke<string>(IPC.fileSaveUpload, req.data.byteLength);
+        try {
+          for (let offset = 0; offset < req.data.byteLength; offset += 1024 * 1024) {
+            await link.invoke(IPC.fileSaveChunk, { uploadId, data: req.data.slice(offset, offset + 1024 * 1024) });
+          }
+          const { data: _data, ...metadata } = req;
+          result = await link.invoke<FileSaveResult>(IPC.fileSave, { ...metadata, uploadId });
+        } finally { await link.invoke(IPC.fileSaveAbort, uploadId).catch(() => undefined); }
+      }
+      // Project files stay on the host; exports also come down to this machine.
+      if (result.ok && !IS_PMV.test(result.path)) download(result.path, req.name);
+      return result;
+    },
+    openProjectFile: async () => {
+      const [file] = await pickFile('.pmv,.json');
+      if (!file) { toast('No project file was chosen.', 2500); return { ok: false, cancelled: true }; }
+      try {
+        const hostPath = await upload(link, file, 'project');
+        return await link.invoke<ProjectOpenResult>(WEB.projectOpenPath, hostPath);
+      } catch (error) {
+        return { ok: false, cancelled: false, error: error instanceof Error ? error.message : 'Could not open project.' };
+      }
+    },
+    openProjectFromFile: async (file) => {
+      try {
+        const hostPath = await upload(link, file, 'project');
+        return await link.invoke<ProjectOpenResult>(WEB.projectOpenPath, hostPath);
+      } catch (error) {
+        return { ok: false, cancelled: false, error: error instanceof Error ? error.message : 'Could not open project.' };
+      }
+    },
+    onProjectOpenExternal: subscribe(IPC.projectOpenExternal),
+    projectRead: {
+      read: (token, offset, length) => link.invoke(IPC.projectRead, { token, offset, length }),
+      close: (token) => link.invoke(IPC.projectReadClose, token)
+    },
+    confirmProjectClose: (name) => link.invoke(IPC.projectConfirmClose, name),
+    confirm: async (request) => {
+      const detail = request.detail ? `\n\n${request.detail}` : '';
+      return window.confirm(`${request.message}${detail}`);
+    },
+    clipboardWriteText: (text) => navigator.clipboard.writeText(text),
+
+    render: {
+      start: (options) => link.invoke(IPC.renderStart, options),
+      write: (token, data, audio) => link.invoke(IPC.renderWrite, { token, data, audio }),
+      finish: async (token) => {
+        const result = await link.invoke<{ path?: string; cancelled?: boolean }>(IPC.renderFinish, { token });
+        if (result.path) download(result.path, result.path.split('/').pop() ?? 'render');
+        return result;
+      },
+      cancel: (token) => link.invoke(IPC.renderCancel, { token })
+    },
+    media: {
+      // Browser projects restore media through the host's media store. Native
+      // source paths and cloud placeholders belong to the desktop that saved them.
+      cloudStatus: async () => ({}),
+      openLocalSource: async () => null,
+      cloudPrompt: async () => ({ download: false, automatic: false }),
+      downloadCloudSource: async () => { throw new Error('Download cloud media in the desktop app, then save the project.'); },
+      readCloudSource: async () => { throw new Error('Native media sources are unavailable in the browser.'); },
+      releaseCloudSource: async () => {},
+      beginPreview: (size) => link.invoke(IPC.mediaPreviewBegin, size),
+      writePreview: (token, offset, data) => link.invoke(IPC.mediaPreviewChunk, { token, offset, data }),
+      finishPreview: (token) => link.invoke(IPC.mediaPreviewFinish, token),
+      sourcePath: () => null,
+      revealSource: () => Promise.resolve(),
+      createPlaybackProxy: async (file) => {
+        try {
+          const sourcePath = await upload(link, file, 'media');
+          return await link.invoke<MediaProxyResult>(IPC.mediaProxyCreate, { sourcePath, name: file.name });
+        } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'Upload failed' }; }
+      },
+      createImageSequence: async (files, fps, onProgress) => {
+        try {
+          const sourcePaths: string[] = [];
+          for (const file of files) sourcePaths.push(await upload(link, file, 'media'));
+          const requestId = `sequence-${Date.now()}-${++nextMediaRequest}`;
+          return await withProgress(link, IPC.mediaSequenceProgress, requestId, onProgress, () =>
+            link.invoke<MediaProxyResult>(IPC.mediaSequenceCreate, { sourcePaths, fps, requestId }));
+        } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'Upload failed' }; }
+      },
+      beginAnimation: (fps, repeats) => link.invoke(IPC.mediaAnimationBegin, { fps, repeats }),
+      writeAnimationFrame: (token, index, offset, data) => link.invoke(IPC.mediaAnimationFrame, { token, index, offset, data }),
+      finishAnimation: (token, onProgress) => {
+        const requestId = `animation-${Date.now()}-${++nextMediaRequest}`;
+        return withProgress(link, IPC.mediaAnimationProgress, requestId, onProgress, () =>
+          link.invoke<MediaProxyResult>(IPC.mediaAnimationFinish, { token, requestId }));
+      },
+      createStillImage: async (file) => {
+        try {
+          const sourcePath = await upload(link, file, 'media');
+          return await link.invoke<MediaProxyResult>(IPC.mediaImageCreate, { sourcePath, name: file.name });
+        } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'Upload failed' }; }
+      },
+      readPlaybackProxy: (token, offset, length) => link.invoke(IPC.mediaProxyRead, { token, offset, length }),
+      releasePlaybackProxy: (token) => link.invoke(IPC.mediaProxyRelease, token)
+    },
+    attachments: {
+      // Nothing to reveal on this machine: hand the bytes to the browser instead.
+      reveal: async (request) => {
+        const url = URL.createObjectURL(new Blob([request.data as BlobPart]));
+        const anchor = document.createElement('a');
+        anchor.href = url; anchor.download = request.name; anchor.rel = 'noopener';
+        document.body.appendChild(anchor); anchor.click(); anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 10_000);
+      }
+    },
+
+    codex: {
+      async run(req, onProgress, onTrace) {
+        const off = link.on(IPC.codexEvent, (progress) => {
+          const event = progress as { id: string; kind: 'progress' | 'trace'; text?: string; step?: unknown };
+          if (event.id !== req.id) return;
+          if (event.kind === 'progress') onProgress?.(event.text ?? ''); else onTrace?.(event.step as never);
+        });
+        try {
+          return await link.invoke<CodexRunResult>(IPC.codexRun, req);
+        } catch (error) {
+          // The run lives on the host, not in this socket: after a drop, pick
+          // it back up where the stream left off rather than reporting failure.
+          if (!isDisconnectError(error)) throw error;
+          onProgress?.('Reconnecting to the run on the host…');
+          await whenReconnected();
+          off();
+          return await followRun(req.id, onProgress, onTrace);
+        } finally { off(); }
+      },
+      steer: (req) => link.invoke(IPC.codexSteer, req),
+      answer: (req) => link.invoke(IPC.codexAnswer, req),
+      cancel: (id, preserveChanges = false) => link.invoke(IPC.codexCancel, { id, preserveChanges }),
+      fixPrompt: (req) => link.invoke(IPC.codexFixPrompt, req),
+      rebasePrompt: (req) => link.invoke(IPC.codexRebasePrompt, req),
+      restoreChangeSet: (req) => link.invoke(IPC.codexRestoreChangeSet, req),
+      requestComputerConsent: (req) => link.invoke(IPC.consentComputer, req)
+    },
+
+    agentTools: {
+      onRequest: (cb) => link.on(IPC.agentToolRequest, (request) => cb(request as AgentToolRequestEvent)),
+      respond: (response) => link.send(IPC.agentToolResponse, response)
+    },
+
+    chatgpt: {
+      status: () => link.invoke(IPC.chatgptStatus),
+      models: () => link.invoke(IPC.chatgptModels),
+      connect: () => link.invoke(IPC.chatgptConnect),
+      disconnect: () => link.invoke(IPC.chatgptDisconnect),
+      onChanged: subscribe(IPC.chatgptChanged)
+    },
+    agentRuntime: {
+      update: (provider) => link.invoke(IPC.agentRuntimeUpdate, provider)
+    },
+    claude: {
+      status: () => link.invoke(IPC.claudeStatus),
+      connect: () => link.invoke(IPC.claudeConnect),
+      disconnect: () => link.invoke(IPC.claudeDisconnect),
+      onChanged: subscribe(IPC.claudeChanged)
+    },
+    artifacts: {
+      read: (ref) => link.invoke(IPC.artifactRead, ref),
+      reveal: (ref) => link.invoke(IPC.artifactReveal, ref)
+    },
+
+    captureWindow: () => Promise.resolve(null),
+
+    store: {
+      snapshotSync: () => Object.fromEntries([...serialized].map(([key, value]) => [key, JSON.parse(value)])),
+      snapshotSerializedSync: () => Object.fromEntries(serialized),
+      snapshot: () => link.invoke(IPC.storeSnapshot),
+      set: (key, value) => { serialized.set(key, JSON.stringify(value)); link.send(IPC.storeSet, { key, value }); },
+      setSerialized: async (key, value) => { serialized.set(key, value); await link.invoke(IPC.storeSetSerialized, { key, serialized: value }); },
+      delete: (key) => { serialized.delete(key); link.send(IPC.storeDelete, { key }); },
+      flush: () => link.invoke(IPC.storeFlush),
+      onError: (cb) => link.on(IPC.storeError, (error) => cb(error as StoreErrorEvent)),
+      getSync: (key) => serialized.get(key) ?? null,
+      onChanged: (cb) => { storeChangedListeners.add(cb); return () => { storeChangedListeners.delete(cb); }; }
+    },
+
+    windows: {
+      initialProject: () => initialProject,
+      claimProject: (projectId) => { claimed = projectId; return link.invoke(IPC.windowClaimProject, { projectId }); },
+      openProject: (projectId) => link.invoke(IPC.windowOpenProject, { projectId }),
+      create: () => link.invoke(IPC.windowNew),
+      close: () => link.send(IPC.windowClose)
+    },
+
+    setTheme: () => {},
+    haptic: { alignment: () => {} },
+    // No `menu`: the overlay Menu falls back to its own listbox.
+    log: (level, text) => link.send(IPC.log, { level, text }),
+    openExternal: async (url) => { window.open(url, '_blank', 'noopener'); },
+    nativeEdit: (action) => { try { document.execCommand(action === 'selectAll' ? 'selectAll' : action); } catch { /* unsupported */ } },
+    onMenuCommand: () => () => {},
+    updates: {
+      status: () => link.invoke(WEB.updateStatus),
+      check: () => link.invoke(WEB.updateCheck),
+      install: async () => {
+        const result = await link.invoke<{ restarting: true } | { restarting: false; command: string }>(WEB.updateInstall);
+        if (result.restarting) { toast('Updating the host… this tab reconnects when it is back.', 8000, { error: false }); return; }
+        // The host cannot replace itself the way it was started: hand over the command.
+        try { await navigator.clipboard.writeText(result.command); } catch { /* clipboard may be blocked */ }
+        toast(`To update, run this on the host (copied): ${result.command}`, 12_000, { error: false });
+      },
+      onChanged: subscribe(WEB.updateChanged)
+    },
+
+    extensions: {
+      list: async () => localizeRecords(await link.invoke<ExtensionRecord[]>(EXT_IPC.list)),
+      setEnabled: async (req) => localizeRecords(await link.invoke<ExtensionRecord[]>(EXT_IPC.setEnabled, req)),
+      remove: async (req) => localizeRecords(await link.invoke<ExtensionRecord[]>(EXT_IPC.remove, req)),
+      reload: async (req) => localizeRecords(await link.invoke<ExtensionRecord[]>(EXT_IPC.reload, req)),
+      create: async (req) => localizeRecords(await link.invoke<ExtensionRecord[]>(EXT_IPC.create, req)),
+      fork: (req) => link.invoke(IPC.extensionFork, req),
+      reveal: (req) => link.invoke(EXT_IPC.reveal, req),
+      readSource: (req) => link.invoke(EXT_IPC.readSource, req),
+      reportHealth: (req) => link.send(EXT_IPC.reportHealth, req),
+      onChanged: subscribe(EXT_IPC.changed)
+    },
+
+    /* Values stay on the Mac that runs Powermove; the served host has no
+       setup flow yet (store plan §2.2b). */
+    vars: {
+      status: () => Promise.reject(new Error(VARS_UNAVAILABLE)),
+      set: () => Promise.reject(new Error(VARS_UNAVAILABLE)),
+      delete: () => Promise.reject(new Error(VARS_UNAVAILABLE)),
+      reveal: () => Promise.reject(new Error(VARS_UNAVAILABLE)),
+      values: () => Promise.reject(new Error(VARS_UNAVAILABLE))
+    },
+
+    /* The session lives in the Mac's keychain-backed store; the served host
+       has no sign-in flow yet. Nobody is signed in here. */
+    cloud: {
+      account: async () => ({ me: null }),
+      signInSocial: () => Promise.reject(new Error(CLOUD_UNAVAILABLE)),
+      emailSend: () => Promise.reject(new Error(CLOUD_UNAVAILABLE)),
+      emailVerify: () => Promise.reject(new Error(CLOUD_UNAVAILABLE)),
+      claimHandle: () => Promise.reject(new Error(CLOUD_UNAVAILABLE)),
+      setRememberInstalls: () => Promise.reject(new Error(CLOUD_UNAVAILABLE)),
+      signOut: () => Promise.reject(new Error(CLOUD_UNAVAILABLE)),
+      deleteAccount: () => Promise.reject(new Error(CLOUD_UNAVAILABLE)),
+      registryUrl: () => Promise.reject(new Error(CLOUD_UNAVAILABLE)),
+      setRegistryUrl: () => Promise.reject(new Error(CLOUD_UNAVAILABLE)),
+      onAccountChanged: () => () => {},
+      onSignInFailed: () => () => {}
+    },
+
+    extensionStore: {
+      browse: storeOffline,
+      extensions: storeOffline,
+      detail: storeOffline,
+      release: storeOffline,
+      tree: storeOffline,
+      file: storeOffline,
+      compare: storeOffline,
+      install: storeOffline,
+      update: storeOffline,
+      uninstall: storeOffline,
+      library: async () => [],
+      checkUpdates: storeOffline,
+      publishPrepare: storeOffline,
+      publish: storeOffline,
+      yank: storeOffline,
+      trust: storeOffline,
+      untrust: storeOffline,
+      onUpdatesChanged: () => () => {},
+      onPublishProgress: () => () => {},
+      onLibraryChanged: () => () => {}
+    }
+  };
+
+  /* server-initiated */
+  link.answer(WEB.askMessageBox, (box) => {
+    const { message, detail, buttons, cancelId } = box as { message: string; detail: string | null; buttons: string[]; cancelId: number };
+    // Two-button boxes map onto confirm(); with three, OK means the primary and
+    // Cancel means cancel — the middle option is not reachable from a browser.
+    const primary = buttons.findIndex((_label, index) => index !== cancelId);
+    const accepted = window.confirm(`${message}${detail ? `\n\n${detail}` : ''}\n\nOK = ${buttons[primary] ?? 'OK'}`);
+    return accepted ? Math.max(primary, 0) : cancelId;
+  });
+  link.on(WEB.openExternal, (url) => { if (typeof url === 'string') window.open(url, '_blank', 'noopener'); });
+  link.on(WEB.openWindow, (projectId) => {
+    const target = new URL(location.href);
+    target.search = typeof projectId === 'string' && projectId ? `?project=${encodeURIComponent(projectId)}` : '';
+    window.open(target.toString(), '_blank');
+  });
+  link.on(WEB.focusWindow, () => window.focus());
+  link.on(WEB.closeWindow, () => window.close());
+  type LinkToast = { toast?: (text: string, ms?: number, options?: Record<string, unknown>) => void; dismissToast?: (key: string) => void };
+  const pm = () => (window as unknown as { PM?: LinkToast }).PM;
+  link.on('__closed', () => {
+    document.documentElement.classList.add('host-disconnected');
+    pm()?.toast?.('Connection to the Powermove host lost. Reconnecting…', 60_000, { key: LINK_TOAST, sticky: true, dismissible: false, error: false });
+  });
+  link.on('__reconnected', () => {
+    document.documentElement.classList.remove('host-disconnected');
+    pm()?.dismissToast?.(LINK_TOAST);
+    pm()?.toast?.('Reconnected to the Powermove host.', 2500, { error: false });
+  });
+
+  return bridge;
+}
+
+/**
+ * Install the host bridge when the page is served by `powermove serve`.
+ * Runs after `captureBridge`. Resolves immediately in Electron (the preload's
+ * bridge was captured) and after a short failed probe in a plain browser
+ * without a host.
+ */
+export async function installWebBridge(): Promise<boolean> {
+  if (capturedBridge()) return false;
+  if (location.protocol !== 'http:' && location.protocol !== 'https:') return false;
+  const params = new URLSearchParams(location.search);
+  const project = params.get('project');
+  const url = new URL(WS_PATH, location.href);
+  url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  if (project) url.searchParams.set('project', project);
+  let first: Connection;
+  try { first = new Connection(await openSocket(url.toString())); } catch { return false; }
+  const [hello, snapshot, initialProject] = await Promise.all([
+    first.invoke<WebHello>(WEB.hello),
+    first.sync<Record<string, string>>(IPC.storeSnapshotSerializedSync),
+    first.sync<{ projectId: string | null; taken: string[] }>(IPC.windowInitialProject)
+  ]);
+  // Later sockets reconnect to the project this tab is on, not the URL's.
+  const reconnectUrl = new URL(url);
+  reconnectUrl.searchParams.delete('project');
+  const link = new ReconnectingLink({
+    open: () => openSocket(reconnectUrl.toString()),
+    handshake: async (connection) => {
+      const next = await connection.invoke<WebHello>(WEB.hello);
+      // A different host version means a different renderer: reload rather than
+      // run old code against a new host.
+      if (next.version !== hello.version) { location.reload(); await new Promise(() => undefined); }
+    },
+    wake: wakeOn,
+    log: (line) => console.info(line)
+  });
+  link.adopt(first);
+  activeLink = link;
+  provideBridge(createBridge(link, hello, snapshot, initialProject));
+  document.documentElement.classList.add('remote-app');
+  if (project) history.replaceState(null, '', location.pathname);
+  return true;
+}

@@ -2,6 +2,7 @@ import { flushSync, mount, unmount } from 'svelte';
 
 import type { PMRegistry } from '../legacy/registry';
 import { MenuController } from './Menu';
+import { confirm as nativeConfirm, type ConfirmOptions } from './confirm';
 import { ModalController } from './modal';
 import { PaletteController } from './palette';
 import Toasts from './Toasts.svelte';
@@ -72,7 +73,7 @@ export function installSvelteOverlays(PM: PMRegistry): void {
     toast: (message: unknown, milliseconds = 2200, options: ToastOptions = {}): void => {
       flushSync(() => toasts.push(message, milliseconds, options));
     },
-    menu: (anchor: HTMLElement, items: MenuItem[], options: MenuOptions = {}): HTMLElement =>
+    menu: (anchor: HTMLElement, items: MenuItem[] | PromiseLike<MenuItem[]>, options: MenuOptions = {}): HTMLElement =>
       menu.open(anchor, items, options),
     closeMenus: (): void => menu.close(false),
     modal: (options: ModalOptions) => modal.open(options),
@@ -86,6 +87,7 @@ export function installSvelteOverlays(PM: PMRegistry): void {
   PM.menu = members.menu;
   PM.closeMenus = members.closeMenus;
   PM.modal = members.modal;
+  PM.confirm = (options: ConfirmOptions): Promise<boolean> => nativeConfirm(PM, options);
   PM.palette = members.palette;
   if (PM.commands?.palette) PM.commands.palette.run = members.paletteCommand;
   flushSync();

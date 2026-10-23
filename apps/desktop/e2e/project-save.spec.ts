@@ -1,7 +1,17 @@
-import { readFile, writeFile } from 'node:fs/promises';
+import { readdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { expect, test, type LaunchedApp } from './helpers/app';
 import { decodeProjectContainer } from '../src/shared/project-container';
+import { fixturePath } from './helpers/media';
+
+async function newestBackup(userData: string): Promise<string> {
+  const root = path.join(userData, 'backups');
+  const files: string[] = [];
+  for (const id of await readdir(root)) for (const name of await readdir(path.join(root, id))) files.push(path.join(root, id, name));
+  files.sort((a, b) => path.basename(b).localeCompare(path.basename(a)));
+  if (!files[0]) throw new Error('No project backup was written');
+  return files[0];
+}
 
 async function saveTo(session: LaunchedApp, destination: string | null) {
   await session.app.evaluate(({ dialog }, filePath) => {
@@ -39,7 +49,7 @@ test('Command+S writes real files, reuses the destination, saves from a field, a
   });
   await session.page.keyboard.press('Meta+S');
   await expect.poll(() => savedName(a)).toBe('Second version');
-  expect(await savedName(a + '1')).toBe('Velocity Study');
+  expect(await savedName(await newestBackup(session.userData))).toBe('Velocity Study');
   expect(await session.app.evaluate(() => (globalThis as any).__saveDialogs)).toBe(1);
   await saveTo(session, b);
   await session.page.keyboard.press('Meta+Shift+S');
@@ -119,9 +129,7 @@ test('Projects screen exposes file state and saves active, duplicated, and opene
     }, action);
   };
 
-  await page.getByRole('button', { name: 'New project', exact: true }).click();
-  await page.getByRole('dialog', { name: 'New composition', exact: true })
-    .getByRole('button', { name: 'Create', exact: true }).click();
+  await session.openEditor();
   await rename(session, 'Velocity Study');
   await page.evaluate(() => (window as any).PM.ProjectsScreen.show('projects'));
   await expect(card('Velocity Study')).not.toContainText('.pmv');
@@ -147,13 +155,26 @@ test('Projects screen exposes file state and saves active, duplicated, and opene
   await page.screenshot({ path: '/tmp/powermove-projects-functional.png' });
 
   const beforeOpen = await page.evaluate(() => (window as any).PM.proj.id);
-  await session.app.evaluate(({ dialog }, filePath) => {
-    dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [filePath] });
-  }, saveAs);
-  await page.getByRole('button', { name: 'Open Project…', exact: true }).click();
+  const chooser = page.waitForEvent('filechooser');
+  await page.getByRole('button', { name: 'Open…', exact: true }).click();
+  await (await chooser).setFiles(saveAs);
   await expect(page.locator('#projects-screen')).not.toHaveClass(/\bon\b/);
   await expect.poll(() => page.evaluate(() => (window as any).PM.proj.id)).not.toBe(beforeOpen);
   await expect.poll(() => page.evaluate(() => (window as any).PM.app.dirty)).toBe(false);
+});
+
+test('Open on Home starts a blank project from media', async ({ session }) => {
+  await session.openEditor();
+  const page = session.page;
+  const beforeOpen = await page.evaluate(() => (window as any).PM.proj.id);
+  await page.evaluate(() => (window as any).PM.ProjectsScreen.show('projects'));
+  const chooser = page.waitForEvent('filechooser');
+  await page.getByRole('button', { name: 'Open…', exact: true }).click();
+  await (await chooser).setFiles(fixturePath('h264-aac.mp4'));
+  await expect(page.locator('#projects-screen')).not.toHaveClass(/\bon\b/);
+  await expect.poll(() => page.evaluate(() => (window as any).PM.proj.layers.length), { timeout: 20_000 }).toBe(1);
+  expect(await page.evaluate(() => (window as any).PM.proj.name)).toBe('h264-aac');
+  expect(await page.evaluate(() => (window as any).PM.proj.id)).not.toBe(beforeOpen);
 });
 
 test('cancel, disk-write failures, and external modifications never clear unsaved changes', async ({ session }) => {
@@ -175,7 +196,7 @@ test('cancel, disk-write failures, and external modifications never clear unsave
   expect(await session.page.evaluate(() => (window as any).PM.app.dirty)).toBe(true);
 });
 
-test('closing a tab and the native window honors Cancel and cancelled Save', async ({ session }) => {
+test('renderer and native window close honor Cancel and cancelled Save', async ({ session }) => {
   await session.openEditor();
   await rename(session, 'Keep this open');
   await session.app.evaluate(({ dialog }) => {
@@ -184,7 +205,7 @@ test('closing a tab and the native window honors Cancel and cancelled Save', asy
       return { response: 1, checkboxChecked: false };
     };
   });
-  await session.page.getByRole('button', { name: 'Close Keep this open', exact: true }).click();
+  await session.page.evaluate(() => (window as any).PM.windows.close());
   await expect.poll(() => session.app.evaluate(() => (globalThis as any).__closePrompts)).toBe(1);
   expect(await session.page.evaluate(() => (window as any).PM.proj.name)).toBe('Keep this open');
   await session.app.evaluate(({ BrowserWindow }) => { BrowserWindow.getAllWindows()[0]!.close(); });
@@ -226,4 +247,23 @@ test('native Quit honors Cancel without closing the editing session', async ({ s
   expect(await session.page.evaluate(() => (window as any).PM.proj.name)).toBe('Cancel quitting');
   expect(await session.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length)).toBe(1);
   await session.app.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 2, checkboxChecked: false }); });
+});
+
+test('a project opened from Finder while the editor is still loading is not dropped', async ({ session }) => {
+  await session.openEditor();
+  const destination = path.join(session.userData, 'Cold start.pmv');
+  await saveTo(session, destination);
+  expect(await session.page.evaluate(() => (window as any).PM.saveProject())).toBe(true);
+  const before = await session.page.evaluate(() => (window as any).PM.proj.id);
+  // A cold start: macOS delivers `open-file` before the renderer subscribes.
+  await session.app.evaluate(({ app, BrowserWindow }, [filePath, url]) => {
+    const window = BrowserWindow.getAllWindows().find(item => !item.isDestroyed() && item.webContents.getURL() === url)!;
+    window.webContents.reload();
+    app.emit('open-file', { preventDefault() {} }, filePath);
+  }, [destination, session.page.url()] as const);
+  // File opens get a fresh id; the reloaded session alone would keep `before`.
+  await expect.poll(() => session.page.evaluate(previous => {
+    const PM = (window as any).PM;
+    return PM?.proj && PM.proj.id !== previous ? PM.Projects.getState(PM.proj.id)?.file?.path ?? null : null;
+  }, before).catch(() => null), { timeout: 20_000 }).toBe(destination);
 });

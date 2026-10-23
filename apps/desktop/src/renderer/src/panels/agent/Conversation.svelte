@@ -1,13 +1,19 @@
 <script lang="ts">
+  import type { Snippet } from 'svelte';
   import { agentState } from './agent-state.svelte';
   import Timeline from './Timeline.svelte';
   import WorkingTimer from './WorkingTimer.svelte';
   import Turn from './Turn.svelte';
   import ResultActions from './ResultActions.svelte';
 
-  let { PM }: { PM: Record<string, any> } = $props();
+  /* `welcome` replaces the default empty state, for hosts that already know what is being changed. */
+  let { PM, welcome }: { PM: Record<string, any>; welcome?: Snippet } = $props();
 
-  const suggestions = $derived(agentState.accessMode === 'editor' ? [
+  const suggestions = $derived(agentState.context === 'app' ? [
+    ['Create an extension', 'Help me design and build a new Powermove extension'],
+    ['Improve an extension', 'Help me improve one of my existing Powermove extensions'],
+    ['Check compatibility', 'Help me check an extension for Store sandbox compatibility']
+  ] : agentState.accessMode === 'editor' ? [
     ['Animate a title', 'Animate the selected title with a confident entrance using editable keyframes'],
     ['Shape the scene', 'Refine the composition with editable shapes, thoughtful spacing, and a clear visual hierarchy'],
     ['Arrange my workspace', 'Organize my panels into a focused animation workspace']
@@ -25,10 +31,14 @@
     : -1);
 </script>
 
-{#if !agentState.conversation.length && !agentState.activity}
+{#if !agentState.conversation.length && !agentState.activity && welcome}
+  {@render welcome()}
+{:else if !agentState.conversation.length && !agentState.activity}
   <div class="agent-welcome">
     <div class="agent-welcome-heading">
-      <div><b>Make your next move</b><span>{agentState.accessMode === 'editor'
+      <div><b>Make your next move</b><span>{agentState.context === 'app'
+        ? 'Build and improve your extensions.'
+        : agentState.accessMode === 'editor'
         ? 'Your ideas. Editable motion.'
         : 'Create, research, and build with your project.'}</span></div>
     </div>

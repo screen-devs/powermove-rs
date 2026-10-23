@@ -22,12 +22,15 @@ import {
   REQUEST_ID,
   type ArtifactRef,
   type ChatGPTAccountStatus,
+  type ClaudeModelOption,
+  type CodexModelOption,
   type ClaudeAccountStatus,
   type CodexCancelRequest,
   type AgentChangeSetRestoreRequest,
   type CodexFixPromptRequest,
   type CodexRebasePromptRequest,
   type CodexRunRequest,
+  type CodexAnswerRequest,
   type CodexSteerRequest,
   type ConsentRequest
 } from '../../shared/ipc';
@@ -37,12 +40,16 @@ import { readArtifact, revealArtifact } from './artifacts';
 import { requestComputerConsent } from './consent';
 import { CodexRunner, isCodexRunRequest } from './runner';
 import { ChatGPTAccountClient } from './app-server-account';
+import { discoverCodexBinary, forgetCodexDescription } from './env';
+import { installLatestRuntime, installRuntimeIfNewer, type RuntimeProvider } from '../runtime-updates';
 import { CodexAppServerRunner } from './app-server-runner';
 import { ClaudeAccountClient, ClaudeRunner } from '../claude';
+import { discoverClaudeBinary } from '../claude/env';
 import { buildFixPrompt, buildRebasePrompt } from './instructions';
 import { restoreExtensionChangeSet } from './change-history';
 import { agentWorkspaceRoot, safeAgentComponent, sessionPathFor, type AgentApiPackFile } from './workspace';
 import { PowermoveAgentToolBridge, type PowermoveAgentToolSession } from '../agent-tools/bridge';
+import type { StoreAgentGateway } from '../cloud/store-agent';
 import { readForkRebaseInfo, stageForkRebase } from '../extensions/rebase';
 
 const FIX_PROMPT_ERROR_CHARS = 4_000;
@@ -50,7 +57,11 @@ const FIX_PROMPT_FILES = 40;
 const FIX_PROMPT_FILE_BYTES = 64 * 1024;
 
 export interface CodexIpcContext {
+  /** The window a request belongs to — the focused editor, or the last one
+   *  focused when the request came from somewhere else. */
   getWindow(): BrowserWindow | null;
+  /** Account state is app-wide, so it reaches every open window, not just one. */
+  broadcast?(send: (webContents: BrowserWindow['webContents']) => void): void;
   userData: string;
   extensionsDir: string;
   apiPackFiles(): Promise<AgentApiPackFile[]>;
@@ -59,16 +70,20 @@ export interface CodexIpcContext {
   claudeBinaryPref?(): string | null;
   openExternal(url: string): Promise<void>;
   refreshExtensions?(ids: string[]): Promise<void>;
+  /** The Store as the agent uses it; null/absent when cloud is unconfigured. */
+  storeAgent?(): StoreAgentGateway | null;
   /** Standalone MCP shim copied beside the packaged app resources. */
   agentToolServerPath?: string;
   /** Defaults to process.execPath (Electron with ELECTRON_RUN_AS_NODE=1). */
   agentToolCommand?: string;
+  agentToolCommandArgs?: string[];
   /** Test seam; production resolves the same built-in resource root as main boot. */
   builtinExtensionsDir?: string;
 }
 
 export interface ChatGPTAccountController {
   status(): Promise<ChatGPTAccountStatus>;
+  models?(): Promise<CodexModelOption[]>;
   connect(): Promise<ChatGPTAccountStatus>;
   disconnect(): Promise<ChatGPTAccountStatus>;
   shutdown(): Promise<void>;
@@ -77,6 +92,7 @@ export interface ChatGPTAccountController {
 
 export interface ClaudeAccountController {
   status(): Promise<ClaudeAccountStatus>;
+  models?(): Promise<ClaudeModelOption[]>;
   connect(): Promise<ClaudeAccountStatus>;
   disconnect(): Promise<ClaudeAccountStatus>;
   shutdown(): Promise<void>;
@@ -93,10 +109,11 @@ function requireRunRequest(value: unknown): CodexRunRequest {
 }
 
 function requireCancelRequest(value: unknown): CodexCancelRequest {
-  if (!isRecord(value) || !isString(value.id) || !REQUEST_ID.test(value.id)) {
+  if (!isRecord(value) || !isString(value.id) || !REQUEST_ID.test(value.id) ||
+      (value.preserveChanges !== undefined && typeof value.preserveChanges !== 'boolean')) {
     throw new IpcValidationError(IPC.codexCancel, 'invalid request id');
   }
-  return { id: value.id };
+  return { id: value.id, preserveChanges: value.preserveChanges === true };
 }
 
 function requireSteerRequest(value: unknown): CodexSteerRequest {
@@ -108,6 +125,19 @@ function requireSteerRequest(value: unknown): CodexSteerRequest {
     value.images.some((image) => !(image instanceof Uint8Array) || image.byteLength > 4 * 1024 * 1024)
   ) throw new IpcValidationError(IPC.codexSteer, 'invalid steering request');
   return { id: value.id, prompt: value.prompt, images: value.images as Uint8Array[] };
+}
+
+function requireAnswerRequest(value: unknown): CodexAnswerRequest {
+  const answers = isRecord(value) && isRecord(value.answers) ? Object.entries(value.answers) : null;
+  if (
+    !isRecord(value) ||
+    !isString(value.id) || !REQUEST_ID.test(value.id) ||
+    !isString(value.itemId, 240) || value.itemId.length === 0 ||
+    answers === null || answers.length > 12 ||
+    answers.some(([id, list]) => id.length > 200 || !Array.isArray(list) || list.length > 12 ||
+      list.some((answer) => !isString(answer, 8_000)))
+  ) throw new IpcValidationError(IPC.codexAnswer, 'invalid answer');
+  return { id: value.id, itemId: value.itemId, answers: Object.fromEntries(answers) as Record<string, string[]> };
 }
 
 function requireRestoreRequest(value: unknown): AgentChangeSetRestoreRequest {
@@ -300,6 +330,8 @@ export function registerCodexIpc(
     ? new PowermoveAgentToolBridge(ipcMain, {
         mcpServerPath: ctx.agentToolServerPath,
         ...(ctx.agentToolCommand ? { command: ctx.agentToolCommand } : {}),
+        ...(ctx.agentToolCommandArgs ? { commandArgs: ctx.agentToolCommandArgs } : {}),
+        storeAgent: ctx.storeAgent?.() ?? null,
         stageForkRebase: ({ forkId, stagingDirectory }) => stageForkRebase({
           forkId,
           stagingDirectory,
@@ -309,23 +341,29 @@ export function registerCodexIpc(
       })
     : null;
 
-  account.onChanged((status) => {
+  const announce = (channel: string, status: unknown): void => {
+    if (ctx.broadcast) {
+      ctx.broadcast((webContents) => webContents.send(channel, status));
+      return;
+    }
     const window = ctx.getWindow();
     if (window !== null && !window.isDestroyed() && !window.webContents.isDestroyed()) {
-      window.webContents.send(IPC.chatgptChanged, status);
+      window.webContents.send(channel, status);
     }
-  });
+  };
 
-  claudeAccount.onChanged((status) => {
-    const window = ctx.getWindow();
-    if (window !== null && !window.isDestroyed() && !window.webContents.isDestroyed()) {
-      window.webContents.send(IPC.claudeChanged, status);
-    }
-  });
+  account.onChanged((status) => announce(IPC.chatgptChanged, status));
+  claudeAccount.onChanged((status) => announce(IPC.claudeChanged, status));
 
   ipcMain.handle(IPC.chatgptStatus, async (event) => {
     requireTrusted(event, ctx);
     return account.status();
+  });
+
+  ipcMain.handle(IPC.chatgptModels, async (event) => {
+    requireTrusted(event, ctx);
+    void refreshRuntime('codex');
+    return account.models?.() ?? [];
   });
 
   ipcMain.handle(IPC.chatgptConnect, async (event) => {
@@ -343,6 +381,39 @@ export function registerCodexIpc(
     return claudeAccount.status();
   });
 
+  // New models only appear once the runtime knows them, so each launch checks
+  // for a newer runtime and re-announces so the pickers refresh.
+  const runtimeChecked = new Set<RuntimeProvider>();
+  const refreshRuntime = async (provider: RuntimeProvider): Promise<void> => {
+    if (runtimeChecked.has(provider)) return;
+    runtimeChecked.add(provider);
+    // Let the app finish booting before any network or disk work starts.
+    await new Promise<void>(resolve => { setTimeout(resolve, 20_000).unref(); });
+    try {
+      if (provider === 'claude') {
+        if (process.env.CLAUDE_BINARY || ctx.claudeBinaryPref?.() || (await claudeAccount.status()).state !== 'connected') return;
+        if (await installRuntimeIfNewer('claude', await discoverClaudeBinary(null))) void claudeAccount.status();
+        return;
+      }
+      if (process.env.CODEX_BINARY || ctx.codexBinaryPref() || (await account.status()).state !== 'connected') return;
+      if (!await installRuntimeIfNewer('codex', await discoverCodexBinary(null))) return;
+      forgetCodexDescription();
+      // Restarting would kill a run in flight; those runs keep the old process.
+      if (owners.size === 0) {
+        await Promise.all([account.shutdown(), appServerRunner.shutdown()]);
+        void account.status();
+      }
+    } catch {
+      // The bundled runtime and model list keep working when the check fails.
+    }
+  };
+
+  ipcMain.handle(IPC.claudeModels, async (event) => {
+    requireTrusted(event, ctx);
+    void refreshRuntime('claude');
+    return claudeAccount.models?.() ?? [];
+  });
+
   ipcMain.handle(IPC.claudeConnect, async (event) => {
     requireTrusted(event, ctx);
     return claudeAccount.connect();
@@ -351,6 +422,21 @@ export function registerCodexIpc(
   ipcMain.handle(IPC.claudeDisconnect, async (event) => {
     requireTrusted(event, ctx);
     return claudeAccount.disconnect();
+  });
+
+  ipcMain.handle(IPC.agentRuntimeUpdate, async (event, provider: unknown) => {
+    requireTrusted(event, ctx);
+    if (provider !== 'claude' && provider !== 'codex') throw new Error('Unknown agent runtime.');
+    const result = await installLatestRuntime(provider);
+    // Long-lived processes still run the old binary; restart them on the new one.
+    if (provider === 'codex') {
+      forgetCodexDescription();
+      await Promise.all([account.shutdown(), appServerRunner.shutdown()]);
+      void account.status();
+    } else {
+      void claudeAccount.status();
+    }
+    return result;
   });
 
   ipcMain.handle(IPC.compatibleStatus, async (event) => { requireTrusted(event, ctx); return compatible.status(); });
@@ -379,6 +465,7 @@ export function registerCodexIpc(
           runId: req.id,
           owner,
           baseRevision: projectRevision(req.projectJSON),
+          context: req.context ?? 'project',
           // Fork rebases stage into the run's extension staging dir, which only
           // autonomous runs own. The resolver snapshots the staging root now and
           // finishes its lookup lazily, so opening the session is not delayed.
@@ -447,10 +534,21 @@ export function registerCodexIpc(
     return { accepted: await appServerRunner.steer(req) };
   });
 
+  ipcMain.handle(IPC.codexAnswer, async (event, rawRequest: unknown) => {
+    requireTrusted(event, ctx);
+    const req = requireAnswerRequest(rawRequest);
+    if (owners.get(req.id) !== event.sender) return { accepted: false };
+    return { accepted: appServerRunner.answer(req) || claudeRunner.answer(req) };
+  });
+
   ipcMain.handle(IPC.codexCancel, async (event, rawRequest: unknown) => {
     requireTrusted(event, ctx);
     const req = requireCancelRequest(rawRequest);
     if (owners.get(req.id) === event.sender) {
+      // A provider without live steering is replaced by a continuation run.
+      // Seal its completed edits before interrupting it; an explicit Stop still
+      // takes the ordinary rollback path.
+      if (req.preserveChanges) await toolBridge?.finishRun(req.id, true).catch(() => undefined);
       compatible.cancel(req.id);
       await Promise.all([runner.cancel(req.id), appServerRunner.cancel(req.id), claudeRunner.cancel(req.id)]);
     }

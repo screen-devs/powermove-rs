@@ -17,6 +17,8 @@ type InspectorLayer = Layer & {
 };
 const inspectable = (layer: Layer): InspectorLayer => layer as InspectorLayer;
 
+type ContentPatch = Extract<EditCommand, { type: 'set_content' }>['patch'];
+
 /** A selected group owns its selected members for shared inspector edits. */
 export function inspectorSelection(api: InspectorAPI, layers: Layer[]): Layer[] {
   const ids = new Set(layers.map((layer) => layer.id));
@@ -41,6 +43,18 @@ export function translatePath(primary: Layer, target: Layer, path: string): stri
     : null;
 }
 
+/**
+ * Content edits fan out to a different layer type only through the fields both
+ * types declare as content channels — a fill set on a text layer also lands on
+ * selected shapes and solids, while type-private data (an image's asset, a
+ * shader's code) stays with its own kind.
+ */
+export function translateContentPatch(primary: Layer, target: Layer, patch: ContentPatch): ContentPatch | null {
+  if (target.type === primary.type) return { ...patch };
+  const shared = Object.entries(patch ?? {}).filter(([field]) => canAnimateContent(primary, field) && canAnimateContent(target, field));
+  return shared.length ? Object.fromEntries(shared) : null;
+}
+
 function selectedLayers(api: InspectorAPI): Layer[] {
   return api.selection.layers().map((id) => api.model.layer(id)).filter((layer): layer is Layer => layer !== null);
 }
@@ -49,22 +63,22 @@ export function evaluatedValue(api: InspectorAPI, layer: Layer, value: unknown, 
   return isProperty(value) ? api.anim.evP(layer, value as Channel, time, path) : value;
 }
 
-function currentValue(api: InspectorAPI, layer: Layer | null, command: EditCommand): unknown {
+function currentValue(api: InspectorAPI, layer: Layer | null, command: EditCommand, time = api.transport.time()): unknown {
   if (!layer) return undefined;
   if (command.type === 'set_content') {
     const field = Object.keys(command.patch ?? {})[0];
-    return field ? evaluatedValue(api, layer, inspectable(layer).d[field], api.transport.time(), `c.${field}`) : undefined;
+    return field ? evaluatedValue(api, layer, inspectable(layer).d[field], time, `c.${field}`) : undefined;
   }
   if (command.type === 'set_layer') {
     const field = Object.keys(command.patch ?? {})[0];
     const key = ({ visible: 'on', motionBlur: 'mblur' } as Record<string, string>)[field!] ?? field;
-    return key ? evaluatedValue(api, layer, layer[key as keyof Layer], api.transport.time(), `l.${key}`) : undefined;
+    return key ? evaluatedValue(api, layer, layer[key as keyof Layer], time, `l.${key}`) : undefined;
   }
   if (command.type === 'set_property') {
     const prop = api.anim.findProp(layer, command.path) ?? inspectable(layer).p?.[command.path];
-    if (prop) return api.anim.evP(layer, prop, command.time ?? api.transport.time(), command.path);
-    if (command.path.startsWith('c.')) return evaluatedValue(api, layer, inspectable(layer).d[command.path.slice(2)], api.transport.time(), command.path);
-    if (command.path.startsWith('l.')) return evaluatedValue(api, layer, layer[command.path.slice(2) as keyof Layer], api.transport.time(), command.path);
+    if (prop) return api.anim.evP(layer, prop, command.time ?? time, command.path);
+    if (command.path.startsWith('c.')) return evaluatedValue(api, layer, inspectable(layer).d[command.path.slice(2)], time, command.path);
+    if (command.path.startsWith('l.')) return evaluatedValue(api, layer, layer[command.path.slice(2) as keyof Layer], time, command.path);
   }
   return undefined;
 }
@@ -118,8 +132,9 @@ export function createInspectorEdit(api: InspectorAPI) {
         const sourcePath = 'path' in command ? command.path : null;
         const path = sourcePath ? translatePath(first, target, sourcePath) : null;
         if (sourcePath && !path) return [];
-        if (command.type === 'set_content' && target.type !== first.type) return [];
-        const next = { ...command, target: target.id, ...(path ? { path } : {}) } as EditCommand;
+        const patch = command.type === 'set_content' ? translateContentPatch(first, target, command.patch) : null;
+        if (command.type === 'set_content' && !patch) return [];
+        const next = { ...command, target: target.id, ...(path ? { path } : {}), ...(patch ? { patch } : {}) } as EditCommand;
         if (relative && command.type === 'set_property' && typeof command.value === 'number' && path && next.type === 'set_property') {
           const key = `${target.id}:${path}`;
           const firstKey = `${first.id}:${sourcePath}`;
@@ -130,8 +145,7 @@ export function createInspectorEdit(api: InspectorAPI) {
           if (typeof own === 'number' && typeof base === 'number') next.value = own + command.value - base;
         }
         if (relative && command.type === 'set_content' && next.type === 'set_content') {
-          next.patch = { ...command.patch };
-          for (const [field, value] of Object.entries(command.patch)) if (typeof value === 'number') {
+          for (const [field, value] of Object.entries(next.patch)) if (typeof value === 'number') {
             const key = `${target.id}:c.${field}`;
             const firstKey = `${first.id}:c.${field}`;
             const read = (candidate: Layer) => currentValue(api, candidate, { type: 'set_content', target: candidate.id, patch: { [field]: value } });
@@ -182,7 +196,8 @@ export function createInspectorEdit(api: InspectorAPI) {
   };
 }
 
-export function inspectorMixed(api: InspectorAPI, binding: ControlEditBinding, value: unknown): boolean {
+/** `time` is the one the inspector shows; the edit paths read the transport's own. */
+export function inspectorMixed(api: InspectorAPI, binding: ControlEditBinding, value: unknown, time = api.transport.time()): boolean {
   if (binding.mode !== 'command' || typeof binding.command !== 'function') return false;
   const selected = inspectorSelection(api, selectedLayers(api)).filter((layer) => !layer.lock);
   if (selected.length < 2) return false;
@@ -193,9 +208,10 @@ export function inspectorMixed(api: InspectorAPI, binding: ControlEditBinding, v
     const sourcePath = 'path' in command ? command.path : null;
     const path = sourcePath ? translatePath(primary, target, sourcePath) : null;
     if (sourcePath && !path) return [];
-    if (command.type === 'set_content' && target.type !== primary.type) return [];
-    const next = { ...command, target: target.id, ...(path ? { path } : {}) } as EditCommand;
-    return ['set_property', 'set_content', 'set_layer'].includes(next.type) ? [currentValue(api, target, next)] : [];
+    const patch = command.type === 'set_content' ? translateContentPatch(primary, target, command.patch) : null;
+    if (command.type === 'set_content' && !patch) return [];
+    const next = { ...command, target: target.id, ...(path ? { path } : {}), ...(patch ? { patch } : {}) } as EditCommand;
+    return ['set_property', 'set_content', 'set_layer'].includes(next.type) ? [currentValue(api, target, next, time)] : [];
   }));
   return values.length > 1 && values.some((candidate) => !Object.is(candidate, values[0]));
 }

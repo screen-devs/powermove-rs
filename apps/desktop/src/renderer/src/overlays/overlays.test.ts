@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { installSvelteOverlays, unmountSvelteOverlays } from './install';
 import { paletteEntries, scorePaletteMatch } from './palette';
+import { withWhenCheck } from '../kernel/registries';
+import { BLINK_MS } from '../controls/menu-blink';
 
 let PM: Record<string, any>;
 
@@ -19,6 +21,7 @@ function registry(): Record<string, any> {
     proj: { layers: [{ id: 'layer-1', name: 'Hero title' }] },
     ICONS: {
       undo: '<path/>', redo: '<path/>', x: '<path/>', trash: '<path/>', export: '<path/>',
+      warning: '<path/>', caution: '<path/>', chevD: '<path/>',
       project: '<path/>', layers: '<path/>', plus: '<path/>', hand: '<path/>', cursor: '<path/>',
       eye: '<path/>', music: '<path/>', film: '<path/>', image: '<path/>', panel: '<path/>',
       sparkle: '<path/>', note: '<path/>', missing: '<path/>'
@@ -60,6 +63,7 @@ afterEach(async () => {
 
 describe('installSvelteOverlays', () => {
   it('renders a keyboard-accessible easing grid with actual Bézier paths', () => {
+    vi.useFakeTimers();
     const run = vi.fn();
     const curve = [0, 0, 1, 1];
     const menu = PM.menu(document.body, [
@@ -77,6 +81,7 @@ describe('installSvelteOverlays', () => {
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
     expect(document.activeElement?.textContent?.trim()).toBe('Curve 5');
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    vi.advanceTimersByTime(BLINK_MS * 2);
     expect(run).toHaveBeenCalledOnce();
   });
   it('keeps the shared toast live region intact across consecutive installs', async () => {
@@ -121,6 +126,7 @@ describe('installSvelteOverlays', () => {
   });
 
   it('renders menu actions, separators, and reachable disabled items, then restores focus', () => {
+    vi.useFakeTimers();
     const trigger = document.querySelector<HTMLButtonElement>('#trigger')!;
     trigger.focus();
     const enabled = vi.fn();
@@ -155,6 +161,7 @@ describe('installSvelteOverlays', () => {
     expect(menu.isConnected).toBe(true);
 
     items[0]?.click();
+    vi.advanceTimersByTime(BLINK_MS * 2);
     expect(enabled).toHaveBeenCalledOnce();
     expect(document.querySelector('.drop')).toBeNull();
     expect(document.activeElement).toBe(trigger);
@@ -177,6 +184,7 @@ describe('installSvelteOverlays', () => {
   });
 
   it('captures handled menu keys before global shortcuts and activates with Space or Enter', () => {
+    vi.useFakeTimers();
     const trigger = document.querySelector<HTMLButtonElement>('#trigger')!;
     const first = vi.fn();
     const second = vi.fn();
@@ -200,12 +208,14 @@ describe('installSvelteOverlays', () => {
       window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', cancelable: true }));
       expect(document.activeElement).toBe(items[0]);
       window.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', cancelable: true }));
+      vi.advanceTimersByTime(BLINK_MS * 2);
       expect(first).toHaveBeenCalledOnce();
       expect(document.querySelector('.drop')).toBeNull();
 
       items = open();
       window.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', cancelable: true }));
       window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', cancelable: true }));
+      vi.advanceTimersByTime(BLINK_MS * 2);
       expect(second).toHaveBeenCalledOnce();
 
       open();
@@ -251,6 +261,7 @@ describe('installSvelteOverlays', () => {
     second.click();
     expect(document.querySelectorAll('.drop')).toHaveLength(1);
     document.querySelector<HTMLButtonElement>('.drop .di')!.click();
+    vi.advanceTimersByTime(BLINK_MS * 2);
     expect(run).toHaveBeenCalledOnce();
     expect(document.querySelector('.drop')).toBeNull();
   });
@@ -270,6 +281,67 @@ describe('installSvelteOverlays', () => {
     trigger.dispatchEvent(new PointerEvent('pointercancel', { bubbles: true }));
     press();
     expect(document.querySelector('.drop')).not.toBeNull();
+  });
+
+  it('opens a menu whose items arrive later, unless another menu or a close came first', async () => {
+    const trigger = document.querySelector<HTMLButtonElement>('#trigger')!;
+    const later = (label: string) => {
+      let answer!: (items: unknown[]) => void;
+      return { items: new Promise<unknown[]>(resolve => { answer = resolve; }), answer: () => answer([{ label }]) };
+    };
+    const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+
+    const first = later('First target');
+    PM.menu(trigger, first.items);
+    expect(document.querySelector('.drop')).toBeNull();
+    first.answer();
+    await settle();
+    expect(document.querySelector('.drop')?.textContent).toContain('First target');
+
+    // Asked for A, then B opened before A answered: A never shows.
+    const stale = later('Stale target');
+    PM.menu(trigger, stale.items);
+    PM.menu(trigger, [{ label: 'Current target' }]);
+    stale.answer();
+    await settle();
+    expect(document.querySelectorAll('.drop')).toHaveLength(1);
+    expect(document.querySelector('.drop')?.textContent).toContain('Current target');
+
+    const dismissed = later('Dismissed');
+    PM.menu(trigger, dismissed.items);
+    PM.closeMenus();
+    dismissed.answer();
+    await settle();
+    expect(document.querySelector('.drop')).toBeNull();
+
+    PM.menu(trigger, Promise.resolve([]));
+    await settle();
+    expect(document.querySelector('.drop')).toBeNull();
+  });
+
+  it('drops a menu whose items arrive after a press, a key or a selection change', async () => {
+    const trigger = document.querySelector<HTMLButtonElement>('#trigger')!;
+    const selection = new Set<() => void>();
+    PM.bus = { on: (event: string, fn: () => void) => { if (event === 'sel') selection.add(fn); return () => selection.delete(fn); } };
+    const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+    const pending = async (act: () => void) => {
+      let answer!: (items: unknown[]) => void;
+      PM.menu(trigger, new Promise<unknown[]>(resolve => { answer = resolve; }));
+      await settle(); // the right-click that asked is over
+      act();
+      answer([{ label: 'Delete' }]);
+      await settle();
+      const drop = document.querySelector('.drop');
+      PM.closeMenus();
+      return drop;
+    };
+
+    expect(await pending(() => {})).not.toBeNull();
+    expect(await pending(() => document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 2 })))).toBeNull();
+    expect(await pending(() => document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Shift', bubbles: true })))).not.toBeNull();
+    expect(await pending(() => document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true })))).toBeNull();
+    expect(await pending(() => { for (const fn of [...selection]) fn(); })).toBeNull();
+    expect(selection.size).toBe(0);
   });
 
   it('closes a menu on an outside pointer and restores its trigger', () => {
@@ -471,7 +543,7 @@ describe('installSvelteOverlays', () => {
     expect(target.getAttribute('aria-live')).toBe('polite');
     expect((target as HTMLElement).style.zIndex).toBe('402');
     expect(document.querySelectorAll('.toast')).toHaveLength(1);
-    expect(document.querySelector('.toast [role="alert"]')).toBeTruthy();
+    expect(document.querySelector('.toast[role="alert"]')).toBeTruthy();
     expect(document.querySelector<HTMLElement>('.toast')?.classList.contains('leaving')).toBe(false);
     document.querySelector<HTMLButtonElement>('.toast[data-toast-error="true"] > button')?.click();
     flushSync();
@@ -498,6 +570,120 @@ describe('installSvelteOverlays', () => {
     flushSync();
     expect(document.querySelectorAll('.toast')).toHaveLength(1);
     document.querySelector<HTMLButtonElement>('.toast button')?.click();
+    flushSync();
+    expect(document.querySelector('.toast')).toBeNull();
+  });
+
+  it('lets a caller state the outcome instead of sniffing a user-chosen name', () => {
+    vi.useFakeTimers();
+    // A success that quotes the user's file name must not become a sticky error
+    // just because the file is called "error.png".
+    PM.toast('Imported error.png', 100, { error: false });
+    flushSync();
+
+    expect(document.querySelector('.toast[data-toast-error]')).toBeNull();
+    expect(document.querySelector('.toast [data-icon="plus"]')).toBeTruthy();
+    expect(document.querySelector('.toast button')).toBeNull();
+    vi.advanceTimersByTime(200);
+    flushSync();
+    expect(document.querySelector('.toast')).toBeNull();
+
+    // A genuine failure whose wording the sniffer does not recognize must still
+    // read as one.
+    PM.toast('The optimized video did not produce a playable frame', 100, { error: true });
+    flushSync();
+    expect(document.querySelector('.toast[data-toast-error="true"]')).toBeTruthy();
+    vi.advanceTimersByTime(10_000);
+    flushSync();
+    expect(document.querySelector('.toast[data-toast-error="true"]')).toBeTruthy();
+  });
+
+  it('closes each toast exactly once, however it leaves', async () => {
+    vi.useFakeTimers();
+    const closed: string[] = [];
+    const onClose = (name: string) => () => closed.push(name);
+    const run = vi.fn();
+    const onDismiss = vi.fn();
+    PM.toast('Timed', 100, { onClose: onClose('timed') });
+    vi.advanceTimersByTime(100);
+    PM.toast('Keyed', 100, { key: 'k', sticky: true, onClose: onClose('keyed-1') });
+    PM.toast('Keyed again', 100, { key: 'k', sticky: true, onClose: onClose('keyed-2') });
+    PM.toast('Keyed again', 100, { key: 'k', sticky: true, onClose: onClose('keyed-3') });
+    PM.toast(null, 100, { onClose: onClose('never shown') });
+    flushSync();
+    expect(closed).toEqual(['timed', 'keyed-1', 'keyed-2', 'never shown']);
+    PM.dismissToast('k');
+    expect(closed.at(-1)).toBe('keyed-3');
+
+    PM.toast('With action', 100, { sticky: true, dismissible: true, action: { label: 'Open', run }, onDismiss, onClose: onClose('action') });
+    PM.toast('Duplicate', 100, { sticky: true, dismissible: true, onClose: onClose('dismissed') });
+    PM.toast('Duplicate', 100, { sticky: true, dismissible: true, onClose: onClose('duplicate') });
+    flushSync();
+    expect(closed.at(-1)).toBe('duplicate'); // an identical notice is not stacked, so it closes at once
+    document.querySelector<HTMLButtonElement>('.toast .toast-action')?.click();
+    flushSync();
+    expect(run).toHaveBeenCalledOnce();
+    expect(onDismiss).not.toHaveBeenCalled();
+    expect(closed.at(-1)).toBe('action');
+    document.querySelector<HTMLButtonElement>('.toast .toast-dismiss')?.click();
+    flushSync();
+    expect(closed.at(-1)).toBe('dismissed');
+
+    PM.toast('Left for teardown', 100, { sticky: true, onClose: onClose('cleared') });
+    flushSync();
+    await unmountSvelteOverlays();
+    expect(closed.at(-1)).toBe('cleared');
+    expect(closed).toHaveLength(9);
+  });
+
+  it('tells an extension alert apart from an editor error', () => {
+    vi.useFakeTimers();
+    // The same wording from an extension is that extension's alert: the editor
+    // is intact, so it gets the alert marker and the extension's name, not the
+    // error card and its diagnostics.
+    PM.toast('Timeline update failed', 100, { source: { id: 'timeline', name: 'Timeline' } });
+    flushSync();
+
+    const alert = document.querySelector<HTMLElement>('.toast[data-toast-kind="alert"]')!;
+    expect(alert).toBeTruthy();
+    expect(alert.getAttribute('data-toast-error')).toBeNull();
+    expect(alert.textContent).toContain('Timeline');
+    expect(alert.textContent).toContain('Timeline update failed');
+    expect(alert.querySelector('[data-icon="caution"]')).toBeTruthy();
+    expect(alert.querySelector('.disclosure')).toBeNull();
+
+    // It stays put like an error, because it still needs reading.
+    vi.advanceTimersByTime(10_000);
+    flushSync();
+    expect(document.querySelector('.toast[data-toast-kind="alert"]')).toBeTruthy();
+    document.querySelector<HTMLButtonElement>('.toast[data-toast-kind="alert"] > button')?.click();
+    flushSync();
+    expect(document.querySelector('.toast')).toBeNull();
+
+    // The editor failing the same operation is still an error.
+    PM.toast('Timeline update failed', 100);
+    flushSync();
+    expect(document.querySelector('.toast[data-toast-error="true"]')).toBeTruthy();
+    expect(document.querySelector('.toast[data-toast-kind="error"]')).toBeTruthy();
+  });
+
+  it('keeps an extension notice out of the error family even when it states a failure', () => {
+    vi.useFakeTimers();
+    PM.toast('Could not import scene.obj', 100, { error: true, source: { id: 'layers-3d', name: '3D layers' } });
+    flushSync();
+
+    expect(document.querySelector('.toast[data-toast-error]')).toBeNull();
+    expect(document.querySelector('.toast[data-toast-kind="alert"]')?.textContent).toContain('3D layers');
+  });
+
+  it('lets a routine extension notice pass on its own', () => {
+    vi.useFakeTimers();
+    PM.toast('Copied 2 effects', 100, { source: { id: 'inspector', name: 'Inspector' } });
+    flushSync();
+
+    expect(document.querySelector('.toast[data-toast-kind="status"]')).toBeTruthy();
+    expect(document.querySelector('.toast')?.textContent).not.toContain('Inspector');
+    vi.advanceTimersByTime(200);
     flushSync();
     expect(document.querySelector('.toast')).toBeNull();
   });
@@ -529,6 +715,98 @@ describe('installSvelteOverlays', () => {
     expect(document.querySelector('#palette')).toBeNull();
     expect(document.querySelector('#scrim')?.classList.contains('on')).toBe(false);
     expect(document.querySelector<HTMLElement>('#projects-screen')?.inert).toBe(false);
+  });
+});
+
+describe('palette with asynchronous providers', () => {
+  it('shows a late answer only while its query is still the one typed', async () => {
+    const kernel = { paletteProviders: () => [{ ownerId: 'sandboxed', provider }] };
+    const answers = new Map<string, (entries: unknown[]) => void>();
+    function provider(query: string) {
+      return new Promise(resolve => answers.set(query, resolve));
+    }
+    PM.Kernel = kernel;
+    PM.commands.palette.run();
+    flushSync();
+    const input = document.querySelector<HTMLInputElement>('#palette input[role="combobox"]')!;
+    const type = (value: string) => { input.value = value; input.dispatchEvent(new InputEvent('input', { bubbles: true })); flushSync(); };
+    const labels = () => [...document.querySelectorAll('#palette [role="option"]')].map(option => option.textContent?.trim());
+    const entry = (label: string) => [{ id: label, label, category: 'Ext', run: vi.fn() }];
+
+    type('stale');
+    type('fresh');
+    answers.get('fresh')!(entry('Fresh answer'));
+    await vi.waitFor(() => { flushSync(); expect(labels()).toContain('Fresh answer'); });
+    answers.get('stale')!(entry('Stale answer'));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    flushSync();
+    expect(labels()).toEqual(['Fresh answer']);
+
+    type('fresher');
+    expect(labels()).not.toContain('Fresh answer');
+  });
+});
+
+describe('palette with sandboxed command when()', () => {
+  function sandboxedCommand(id: string, label: string, last: boolean) {
+    let answer!: (value: boolean) => void;
+    const check = { last: () => last, ask: vi.fn(() => new Promise<boolean>(resolve => { answer = resolve; })) };
+    PM.commands[id] = { id, label, cat: 'Edit', run: vi.fn() };
+    return { check, answer: async (value: boolean) => { answer(value); await new Promise(resolve => setTimeout(resolve, 0)); flushSync(); } };
+  }
+  function open(checks: Record<string, ReturnType<typeof sandboxedCommand>['check']>) {
+    PM.Kernel = { paletteProviders: () => [], commands: { get: (id: string) => checks[id] ? withWhenCheck({ id }, checks[id]!) : undefined } };
+    PM.commands.palette.run();
+    flushSync();
+    const input = document.querySelector<HTMLInputElement>('#palette input[role="combobox"]')!;
+    return {
+      type(value: string) { input.value = value; input.dispatchEvent(new InputEvent('input', { bubbles: true })); flushSync(); },
+      enter() { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); },
+      labels: () => [...document.querySelectorAll('#palette [role="option"]')].map(option => option.textContent?.trim())
+    };
+  }
+
+  it('shows a sandboxed command at once by its last answer', async () => {
+    const clean = sandboxedCommand('ext.clean', 'Clean up layers', true);
+    const palette = open({ 'ext.clean': clean.check });
+    palette.type('clean');
+    expect(palette.labels()).toEqual(['Clean up layers']);
+    await clean.answer(true); // same answer: nothing moves
+    expect(palette.labels()).toEqual(['Clean up layers']);
+    palette.enter();
+    expect(PM.cmd).toHaveBeenCalledWith('ext.clean');
+  });
+
+  it('runs the highlighted row on Enter after a late answer moves it', async () => {
+    const tidy = sandboxedCommand('ext.tidy', 'New solid tidy', false);
+    PM.commands = { 'ext.tidy': PM.commands['ext.tidy'], ...PM.commands }; // listed before New solid
+    const palette = open({ 'ext.tidy': tidy.check });
+    palette.type('new solid');
+    expect(palette.labels()).toEqual(['New solid ⌘Y']);
+    await tidy.answer(true); // lands above the highlighted row
+    expect(palette.labels()).toEqual(['New solid tidy', 'New solid ⌘Y']);
+    expect(document.querySelector('#palette [role="option"][aria-selected="true"]')?.textContent?.trim()).toBe('New solid ⌘Y');
+    palette.enter();
+    expect(PM.cmd).toHaveBeenCalledWith('newSolid');
+    expect(PM.cmd).not.toHaveBeenCalledWith('ext.tidy');
+  });
+
+  it('highlights nothing when the highlighted row goes, and Enter waits for the person', async () => {
+    const tidy = sandboxedCommand('ext.tidy', 'New solid tidy', true);
+    PM.commands = { 'ext.tidy': PM.commands['ext.tidy'], ...PM.commands };
+    const palette = open({ 'ext.tidy': tidy.check });
+    palette.type('new solid');
+    expect(palette.labels()).toEqual(['New solid tidy', 'New solid ⌘Y']);
+    await tidy.answer(false); // the highlighted row leaves
+    expect(palette.labels()).toEqual(['New solid ⌘Y']);
+    expect(document.querySelector('#palette [role="option"][aria-selected="true"]')).toBeNull();
+    palette.enter();
+    expect(PM.cmd).not.toHaveBeenCalled();
+    expect(document.querySelector('#palette')).not.toBeNull();
+    document.querySelector('#palette input[role="combobox"]')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+    flushSync();
+    palette.enter();
+    expect(PM.cmd).toHaveBeenCalledExactlyOnceWith('newSolid');
   });
 });
 
@@ -594,6 +872,17 @@ it('preserves distinct failures across success notifications and deduplicates re
   expect(document.querySelector('#toasts')?.textContent).toContain('second.mov');
 });
 
+it('keeps a non-dismissible operation visible until explicitly closed', () => {
+  const handle = PM.modal({ title: 'Exporting', dismissible: false, actions: [{ label: 'Cancel', run: () => false }] });
+  flushSync();
+  document.querySelector<HTMLElement>('#scrim')!.click();
+  expect(handle.el.isConnected).toBe(true);
+  handle.el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  expect(handle.el.isConnected).toBe(true);
+  handle.close();
+  expect(handle.el.isConnected).toBe(false);
+});
+
 it('waits for asynchronous modal validation without closing or submitting twice', async () => {
   let finish!: (result: boolean) => void;
   const run = vi.fn(() => new Promise<boolean>(resolve => { finish = resolve; }));
@@ -630,4 +919,24 @@ it('keeps failed modal actions open with useful feedback', async () => {
   await Promise.resolve();
   await Promise.resolve();
   expect(handle.el.isConnected).toBe(false);
+});
+
+it('keeps one progress popup mounted through updates and its green completion state', () => {
+  vi.useFakeTimers();
+  PM.toast('Saving Test.pmv', 2200, { key: 'save', sticky: true, progress: null });
+  const original = document.querySelector('.toast');
+  expect(original?.querySelector('[role="progressbar"]')?.hasAttribute('aria-valuenow')).toBe(false);
+  vi.advanceTimersByTime(10000);
+  expect(document.querySelector('.toast')).toBe(original);
+  PM.toast('Saving Test.pmv', 2200, { key: 'save', sticky: true, progress: .5 });
+  expect(document.querySelector('.toast')).toBe(original);
+  expect(original?.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('50');
+  PM.toast('Saved Test.pmv', 2200, { key: 'save', progress: 1, completed: true });
+  expect(document.querySelectorAll('.toast')).toHaveLength(1);
+  expect(document.querySelector('.toast')).toBe(original);
+  expect(original?.querySelector('.save-icon.complete .saved-check')).toBeTruthy();
+  expect(original?.querySelector('.save-body.complete')?.getAttribute('aria-label')).toBe('Saved Test.pmv');
+  vi.advanceTimersByTime(2200);
+  flushSync();
+  expect(document.querySelector('.toast')).toBeNull();
 });

@@ -1,13 +1,15 @@
 /* Ported from host/electron-shim.js — behavior-preserving. */
 import type { PMRegistry } from '../registry';
 import { stringifyAsync } from '../core/serialize-async';
+import { HistoryRecords, packStoredHistory, unpackStoredHistory } from '../../../../shared/history-memory';
+import { bridge as hostBridge } from '../../kernel/bridge';
 
 export function install(PM: PMRegistry): void {
   'use strict';
 
-  if (!(window as any).powermove) return;
+  if (!(hostBridge() as any)) return;
 
-  const bridge = (window as any).powermove;
+  const bridge = (hostBridge() as any);
   const encoder = new window.TextEncoder();
   // File commands cannot wait for local-font enumeration or its permission prompt.
   bridge.onMenuCommand((command: any) => {
@@ -72,7 +74,7 @@ export function install(PM: PMRegistry): void {
       ? 'editor'
       : (body.access === 'computer' ? 'computer' : 'project');
     const requestedEffort = String(body.reasoningEffort || '');
-    const reasoningEffort = ['low', 'medium', 'high', 'xhigh', 'max'].includes(requestedEffort)
+    const reasoningEffort = ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(requestedEffort)
       ? requestedEffort
       : null;
     const attachments = [];
@@ -97,6 +99,7 @@ export function install(PM: PMRegistry): void {
       model: typeof body.model === 'string' && body.model ? body.model : null,
       reasoningEffort,
       access,
+      context: body.context === 'app' ? 'app' : 'project',
       projectId: String(body.projectId || (mode === 'editor' ? 'editor' : '')),
       projectName: String(body.projectName || ''),
       projectJSON: typeof body.projectJSON === 'string' && body.projectJSON ? body.projectJSON : null,
@@ -163,7 +166,7 @@ export function install(PM: PMRegistry): void {
             try {
               const name = String(body.name || 'powermove.bin');
               const result = await bridge.saveFile({ name, data: decodeBinary(body.data) });
-              if (result.ok) PM.toast(`Saved ${savedName(result.path, name)}`);
+              if (result.ok) PM.toast(`Saved ${savedName(result.path, name)}`, 2200, { error: false });
               else if (!result.cancelled) PM.toast(result.error || 'Save failed');
             } catch (error) {
               PM.toast(errorText(error, 'Save failed'));
@@ -228,7 +231,7 @@ export function install(PM: PMRegistry): void {
       },
       pmCodexCancel: {
         postMessage(body: any = {}) {
-          void bridge.codex.cancel(String(body.id || '')).catch(() => {});
+          void bridge.codex.cancel(String(body.id || ''), body.preserveChanges === true).catch(() => {});
         }
       },
       pmCodexSteer: {
@@ -239,6 +242,18 @@ export function install(PM: PMRegistry): void {
             prompt: String(body.prompt || ''),
             images: binaryList(body.images)
           }).then((result: any) => PM.CodexBridge.resolveSteer(replyId, result.accepted === true))
+            .catch(() => PM.CodexBridge.resolveSteer(replyId, false));
+        }
+      },
+      pmCodexAnswer: {
+        postMessage(body: any = {}) {
+          const replyId = String(body.replyId || '');
+          const answers: Record<string, string[]> = {};
+          for (const [id, list] of Object.entries(body.answers && typeof body.answers === 'object' ? body.answers : {})) {
+            if (Array.isArray(list)) answers[id] = list.map(String);
+          }
+          void bridge.codex.answer({ id: String(body.id || ''), itemId: String(body.itemId || ''), answers })
+            .then((result: any) => PM.CodexBridge.resolveSteer(replyId, result.accepted === true))
             .catch(() => PM.CodexBridge.resolveSteer(replyId, false));
         }
       },
@@ -253,7 +268,7 @@ export function install(PM: PMRegistry): void {
               ok: true,
               name: file.name,
               mime: file.mime,
-              dataBase64: bytesToBase64(file.data)
+              data: file.data
             });
           }).catch((error: any) => {
             PM.AgentArtifacts.resolve(id, {
@@ -292,18 +307,38 @@ export function install(PM: PMRegistry): void {
 
   let snapshot = {};
   try {
-    snapshot = bridge.store.snapshotSerializedSync
-      ? Object.fromEntries(Object.entries(bridge.store.snapshotSerializedSync() as Record<string, string>).map(([key, value]) => [key, JSON.parse(value)]))
+    const serializedSnapshot = bridge.store.bootstrapSerializedSync || bridge.store.snapshotSerializedSync;
+    snapshot = serializedSnapshot
+      ? Object.fromEntries(Object.entries(serializedSnapshot() as Record<string, string>).map(([key, value]) => [key, JSON.parse(value)]))
       : bridge.store.snapshotSync() || {};
   } catch (error) {
     bridge.log('error', `store snapshot failed: ${errorText(error, 'unknown error')}`);
   }
   const cached = new Map(Object.entries(snapshot).map(([key, value]) => [`pm.${key}`, value]));
+  const historyRecords = new HistoryRecords();
+  const lazy = new Set<string>(Array.isArray((snapshot as any).__powermoveLazyKeys) ? (snapshot as any).__powermoveLazyKeys : []);
   const serviceKey = (key: any) => String(key).startsWith('pm.') ? String(key).slice(3) : String(key);
   const legacyKey = (key: any) => `pm.${serviceKey(key)}`;
   const saveErrors = new Map<string, string>();
   const asyncWrites = new Map<string, Promise<void>>();
   const writeVersions = new Map<string, number>();
+  /* Every window caches the store, so a sibling's write leaves this copy stale.
+     Main names the keys that moved; they are re-read from the store on the next
+     access rather than pushed, which keeps a neighbour's multi-megabyte history
+     write off this window's IPC channel. */
+  const stale = new Set<string>();
+  const refill = (service: string) => {
+    const get = bridge.store.getEncodedSync || bridge.store.getSync;
+    if (!get) return;
+    try {
+      const serialized = get(service);
+      if (serialized === null) cached.delete(legacyKey(service));
+      else cached.set(legacyKey(service), JSON.parse(serialized));
+      stale.delete(service); lazy.delete(service);
+    } catch (error) {
+      bridge.log('warn', `store refresh failed for ${service}: ${errorText(error, 'unknown error')}`);
+    }
+  };
 
   PM.store = {
     // A development renderer may reload before its native process. Keep using
@@ -311,6 +346,7 @@ export function install(PM: PMRegistry): void {
     separateHistory: (snapshot as any).__powermoveAsyncStore === true && typeof bridge.store.setSerialized === 'function',
     get(key: any, fallback: any, options: { omitHistory?: boolean } = {}) {
       const stored = legacyKey(key);
+      if (stale.has(serviceKey(key)) || lazy.has(serviceKey(key))) refill(serviceKey(key));
       if (!cached.has(stored)) return fallback;
       try {
         const value: any = cached.get(stored);
@@ -318,16 +354,18 @@ export function install(PM: PMRegistry): void {
           const { history, ...metadata } = value;
           return cloneValue(metadata);
         }
-        return cloneValue(value);
+        return unpackStoredHistory(serviceKey(key), cloneValue(value));
       } catch { return fallback; }
     },
     /** Internal immutable snapshots (history patches), serialized without blocking input. */
     setAsync(key: string, value: any) {
       if (!bridge.store.setSerialized) return Promise.resolve(PM.store.set(key, value));
       const service = serviceKey(key), version = (writeVersions.get(service) || 0) + 1;
+      stale.delete(service); lazy.delete(service);
       writeVersions.set(service, version);
-      cached.set(legacyKey(service), value);
-      const write = stringifyAsync(value, async () => {
+      const packed = packStoredHistory(service, value, historyRecords);
+      cached.set(legacyKey(service), packed);
+      const write = stringifyAsync(packed, async () => {
         await new Promise<void>(resolve => setTimeout(resolve, 0));
         if (writeVersions.get(service) !== version) throw new Error('Snapshot superseded');
       }).then(async serialized => {
@@ -342,9 +380,10 @@ export function install(PM: PMRegistry): void {
     },
     set(key: any, value: any) {
       const service = serviceKey(key);
+      stale.delete(service); lazy.delete(service);
       writeVersions.set(service, (writeVersions.get(service) || 0) + 1);
       try {
-        const copy = cloneValue(value);
+        const copy = packStoredHistory(service, cloneValue(value), historyRecords);
         saveErrors.delete(service);
         bridge.store.set(service, copy);
         cached.set(legacyKey(service), copy);
@@ -357,6 +396,7 @@ export function install(PM: PMRegistry): void {
     },
     del(key: any) {
       const service = serviceKey(key);
+      stale.delete(service); lazy.delete(service);
       writeVersions.set(service, (writeVersions.get(service) || 0) + 1);
       cached.delete(legacyKey(service));
       bridge.store.delete(service);
@@ -368,6 +408,78 @@ export function install(PM: PMRegistry): void {
     }
   };
 
+  /* Each window holds its own project tabs. Everything that opens, swaps or
+     closes a document goes through here so the native side stays the single
+     source of truth for which window owns what. A build without the native
+     bridge keeps one window: claims always succeed and nothing else is offered. */
+  PM.windows = {
+    get supported() { return !!bridge.windows; },
+    initialProject() {
+      try { return bridge.windows?.initialProject() ?? { projectId: null, tabs: [], taken: [] }; }
+      catch { return { projectId: null, tabs: [], taken: [] }; }
+    },
+    async claimProject(projectId: string | null) {
+      if (!bridge.windows) return { claimed: true, focused: false };
+      try { return await bridge.windows.claimProject(projectId); }
+      catch (error) {
+        bridge.log('warn', `window claim failed: ${errorText(error, 'unknown error')}`);
+        return { claimed: true, focused: false };
+      }
+    },
+    async releaseProject(projectId: string) {
+      if (!bridge.windows?.releaseProject) return true;
+      try { return await bridge.windows.releaseProject(projectId); }
+      catch (error) {
+        bridge.log('warn', `window release failed: ${errorText(error, 'unknown error')}`);
+        return false;
+      }
+    },
+    async reorderTabs(order: string[]) {
+      if (!bridge.windows?.reorderTabs) return true;
+      try { return await bridge.windows.reorderTabs(order); }
+      catch { return false; }
+    },
+    async tabDropTarget(point: { x: number; y: number }) {
+      if (!bridge.windows?.tabDropTarget) return false;
+      try { return await bridge.windows.tabDropTarget(point); }
+      catch { return false; }
+    },
+    async placeTab(projectId: string, point: { x: number; y: number }) {
+      if (!bridge.windows?.placeTab) return { placed: null };
+      try { return await bridge.windows.placeTab(projectId, point); }
+      catch (error) {
+        bridge.log('warn', `tab placement failed: ${errorText(error, 'unknown error')}`);
+        return { placed: null };
+      }
+    },
+    onAdoptTab(cb: (tab: { projectId: string; x: number }) => void) {
+      return bridge.windows?.onAdoptTab?.(cb) ?? (() => undefined);
+    },
+    async openProject(projectId: string) {
+      if (!bridge.windows) return { opened: false, focused: false, error: 'Windows are not available' };
+      try { return await bridge.windows.openProject(projectId); }
+      catch (error) {
+        return { opened: false, focused: false, error: errorText(error, 'The window could not be opened') };
+      }
+    },
+    async create() {
+      if (!bridge.windows) return false;
+      try { await bridge.windows.create(); return true; }
+      catch (error) {
+        PM.toast(errorText(error, 'The window could not be opened'));
+        return false;
+      }
+    },
+    close() { bridge.windows?.close(); },
+  };
+
+  bridge.store.onChanged?.((keys: string[]) => {
+    const changed = keys.filter(key => typeof key === 'string');
+    if (!changed.length) return;
+    for (const key of changed) stale.add(serviceKey(key));
+    PM.bus?.emit('store:external', changed);
+  });
+
   bridge.store.onError((event: any) => {
     saveErrors.set(event.key, String(event.error));
     PM.bus?.emit('storage:error', event);
@@ -377,17 +489,42 @@ export function install(PM: PMRegistry): void {
     PM.toast(`Could not save ${event.key}: ${event.error}`);
   });
 
-  async function publishSystemFonts() {
+  let fontRefresh: Promise<boolean> | undefined;
+  let fontSignature: string | undefined;
+  async function enumerateSystemFonts() {
     try {
-      if (typeof (window as any).queryLocalFonts === 'function') {
-        const fonts = await (window as any).queryLocalFonts();
-        const families = [...new Set(fonts.map((font: any) => font.family).filter(Boolean))];
-        PM.Fonts?.setSystemFamilies(families);
+      const native = await bridge.fontFamilies?.();
+      if (native || typeof (window as any).queryLocalFonts === 'function') {
+        const families = native ?? [...new Set((await (window as any).queryLocalFonts()).map((font: any) => font.family).filter(Boolean))];
+        families.sort();
+        const signature = JSON.stringify(families);
+        if (signature !== fontSignature) {
+          fontSignature = signature;
+          PM.Fonts?.setSystemFamilies(families);
+          PM.rasterClear?.();
+          PM.invalidate?.();
+        }
         return true;
       }
     } catch { /* PM.Fonts retains its bundled and web fallback families. */ }
     return false;
   }
+
+  function publishSystemFonts() {
+    if (!fontRefresh) fontRefresh = enumerateSystemFonts().finally(() => { fontRefresh = undefined; });
+    return fontRefresh;
+  }
+
+  // Font Book and other installers run outside the editor. Refresh when the
+  // user returns, and while visible to catch installations in the background.
+  window.addEventListener('focus', () => { void publishSystemFonts(); });
+  window.document.addEventListener('visibilitychange', () => {
+    if (!window.document.hidden) void publishSystemFonts();
+  });
+  const fontTimer = window.setInterval?.(() => {
+    if (!window.document.hidden) void publishSystemFonts();
+  }, 2000);
+  window.addEventListener('pagehide', () => window.clearInterval?.(fontTimer));
 
   async function finishBoot() {
     window.document.documentElement.classList.add('native-app');

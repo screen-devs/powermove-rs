@@ -5,12 +5,15 @@
     record,
     quiet = false,
     onToggle,
-    onMenu
+    onMenu,
+    onSetup
   }: {
     record: ExtensionRecord;
     quiet?: boolean;
     onToggle: (record: ExtensionRecord, next: boolean) => void;
     onMenu: (record: ExtensionRecord, anchor: HTMLElement) => void;
+    /** Opens the values sheet for an extension waiting on required values. */
+    onSetup?: (record: ExtensionRecord) => void;
   } = $props();
 
   const ERROR_STATES = ['build-error', 'manifest-error', 'activation-error', 'runtime-error', 'needs-update'];
@@ -26,6 +29,7 @@
   const fullError = $derived('error' in health ? health.error : '');
   const shortError = $derived(broken ? summarise(fullError) : '');
   const notes = $derived(notesFor(record));
+  const waiting = $derived(health.state === 'needs-setup' && record.enabled);
 
   /** First line, clipped — the row stays one glance; the title carries the rest. */
   function summarise(text: string): string {
@@ -48,10 +52,6 @@
     return out;
   }
 
-  function toggle(event: Event): void {
-    event.stopPropagation();
-    onToggle(record, !record.enabled);
-  }
 
   function openMenu(): void {
     if (menuElement) onMenu(record, menuElement);
@@ -100,6 +100,14 @@
     {#each notes as note (note)}
       <div class="note">{note}</div>
     {/each}
+    {#if waiting}
+      <div class="setup">Needs setup</div>
+      {#if onSetup}
+        <div class="repair">
+          <button type="button" class="link" onclick={() => onSetup?.(record)}>Set up</button>
+        </div>
+      {/if}
+    {/if}
     {#if shortError}
       <div class="error" title={fullError}>{shortError}</div>
       <div class="repair">
@@ -108,13 +116,19 @@
     {/if}
   </div>
 
-  <button
-    type="button"
-    class="toggle"
+  <div
+    class="onoff"
     class:on={record.enabled}
-    aria-pressed={record.enabled}
-    aria-label={record.enabled ? `Turn off ${name}` : `Turn on ${name}`}
-    onclick={toggle}><i aria-hidden="true"></i></button>
+    role="radiogroup"
+    tabindex="-1"
+    aria-label={`${name} enabled`}
+    data-enabled={record.enabled}
+    onpointerdown={(event) => event.stopPropagation()}
+  >
+    <span class="onoff-pill" aria-hidden="true"></span>
+    <button type="button" role="radio" aria-checked={!record.enabled} tabindex="-1" aria-label={`Turn off ${name}`} onclick={() => { if (record.enabled) onToggle(record, false); }}>Off</button>
+    <button type="button" role="radio" aria-checked={record.enabled} tabindex="-1" aria-label={`Turn on ${name}`} onclick={() => { if (!record.enabled) onToggle(record, true); }}>On</button>
+  </div>
 
   <button type="button" class="more" aria-label={`More for ${name}`} bind:this={menuElement} onclick={handleMenuClick}
     >⋯</button
@@ -192,6 +206,13 @@
     white-space: nowrap;
   }
 
+  .setup {
+    margin-top: 2px;
+    color: var(--tx-2);
+    font-size: var(--fs-xs);
+    line-height: var(--lh-tight);
+  }
+
   .repair {
     display: flex;
     gap: 10px;
@@ -211,37 +232,14 @@
     color: var(--accent-hover);
   }
 
-  .toggle {
-    position: relative;
+  /* Compact Off | On for a list row; material and motion come from .onoff. */
+  .onoff {
     flex: none;
-    width: 32px;
-    height: 18px;
+    width: 78px;
+    height: 22px;
     margin-top: 1px;
-    border-radius: var(--r-pill);
-    background: var(--ink-3);
-    box-shadow: none;
-    transition: background var(--dur-2) var(--ease-io);
   }
-
-  .toggle i {
-    position: absolute;
-    top: 2px;
-    left: 2px;
-    width: 14px;
-    height: 14px;
-    border-radius: 50%;
-    background: var(--bg-float);
-    box-shadow: var(--shadow-raise);
-    transition: transform var(--dur-2) var(--ease-io);
-  }
-
-  .toggle.on {
-    background: var(--accent);
-  }
-
-  .toggle.on i {
-    transform: translateX(14px);
-  }
+  .onoff > button { font-size: 11px; }
 
   .more {
     flex: none;
@@ -271,8 +269,6 @@
 
   @media (prefers-reduced-motion: reduce) {
     .row,
-    .toggle,
-    .toggle i,
     .more {
       transition: none;
     }

@@ -7,13 +7,16 @@ import {
   type FileFilter,
   type IpcMain,
   type IpcMainInvokeEvent,
+  type WebContents,
   type SaveDialogOptions,
   type SaveDialogReturnValue
 } from 'electron';
 
 import { isBytes, isRecord, isString, IpcValidationError } from '../shared/guards';
-import { IPC, LIMITS, PROJECT_ID, type FileSaveResult, type ProjectOpenResult, type CloseDecision } from '../shared/ipc';
+import { IPC, LIMITS, PROJECT_ID, type FileSaveResult, type ProjectOpenResult, type CloseDecision, type ProjectSaveBeginResult } from '../shared/ipc';
 import { atomicWrite, type ProjectFiles } from './project-files';
+import { FileUpload, FILE_CHUNK_BYTES } from './file-upload';
+import { validateSaveMedia, type ProjectSave } from './project-save';
 
 const MAX_SAVE_NAME_CHARS = 200;
 
@@ -39,6 +42,66 @@ export interface SaveIpcContext {
   isTrustedSender(event: IpcMainInvokeEvent): boolean;
   dialogs?: SaveDialogAdapter;
   projects?: ProjectFiles;
+}
+
+type ReaderState = {
+  readers: Map<string, { owner: WebContents; timer: ReturnType<typeof setTimeout> }>;
+  watchedOwners: WeakSet<WebContents>;
+};
+
+const readerStates = new WeakMap<ProjectFiles, ReaderState>();
+
+function projectReaderState(projects: ProjectFiles): ReaderState {
+  let state = readerStates.get(projects);
+  if (!state) {
+    state = { readers: new Map(), watchedOwners: new WeakSet() };
+    readerStates.set(projects, state);
+  }
+  return state;
+}
+
+async function closeProjectReader(projects: ProjectFiles, token: string, verify = false): Promise<void> {
+  const state = projectReaderState(projects);
+  const reader = state.readers.get(token);
+  if (!reader) return;
+  clearTimeout(reader.timer);
+  state.readers.delete(token);
+  await projects.close(token, verify);
+}
+
+function watchProjectReaderOwner(projects: ProjectFiles, owner: WebContents): void {
+  const state = projectReaderState(projects);
+  if (state.watchedOwners.has(owner)) return;
+  state.watchedOwners.add(owner);
+  owner.once('destroyed', () => {
+    for (const [token, reader] of state.readers) {
+      if (reader.owner === owner) void closeProjectReader(projects, token).catch(() => undefined);
+    }
+  });
+}
+
+export async function openProjectForWindow(
+  ctx: { projects: ProjectFiles },
+  webContents: WebContents,
+  filePath: string
+): Promise<ProjectOpenResult> {
+  try {
+    const opened = await ctx.projects.open(filePath);
+    if (webContents.isDestroyed()) {
+      await ctx.projects.close(opened.token, false);
+      throw new Error('Project window is unavailable');
+    }
+    const state = projectReaderState(ctx.projects);
+    const timer = setTimeout(() => {
+      void closeProjectReader(ctx.projects, opened.token).catch(() => undefined);
+    }, 120_000);
+    timer.unref();
+    state.readers.set(opened.token, { owner: webContents, timer });
+    watchProjectReaderOwner(ctx.projects, webContents);
+    return { ok: true, ...opened };
+  } catch (error: any) {
+    return { ok: false, cancelled: false, error: error.message || 'Could not open project.' };
+  }
 }
 
 /** Convert an untrusted suggestion into one plain filename. */
@@ -72,34 +135,178 @@ export function saveFiltersForName(name: string): FileFilter[] | undefined {
   ];
 }
 
+/** Desktop only: opens a project file the user picked in a renderer file
+ *  input. The browser host never registers it, so remote clients cannot name
+ *  arbitrary paths on the host. */
+export function registerProjectOpenPathIpc(ipcMain: Pick<IpcMain, 'handle'>, ctx: Pick<SaveIpcContext, 'isTrustedSender' | 'projects'>): void {
+  ipcMain.handle(IPC.projectOpenPath, async (event, filePath: unknown): Promise<ProjectOpenResult> => {
+    if (!ctx.isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
+    if (!isString(filePath) || !path.isAbsolute(filePath) || !/\.(pmv|json)$/i.test(filePath)) {
+      throw new IpcValidationError(IPC.projectOpenPath, 'invalid project path');
+    }
+    if (!ctx.projects) throw new Error('Project window is unavailable');
+    return openProjectForWindow({ projects: ctx.projects }, event.sender, filePath);
+  });
+}
+
 export function registerSaveIpc(ipcMain: Pick<IpcMain, 'handle'>, ctx: SaveIpcContext): void {
   const pending = new Set<object>();
+  const destinations = new Map<object, { token: string; path: string; directory: boolean }>();
   const watchedOwners = new WeakSet<object>();
-  const uploads = new Map<object, { id: string; size: number; received: number; chunks: Buffer[]; timer: ReturnType<typeof setTimeout> }>();
-  const discardUpload = (owner: object) => { const upload = uploads.get(owner); if (upload) clearTimeout(upload.timer); uploads.delete(owner); };
-  ipcMain.handle(IPC.fileSaveUpload, (event, size: unknown) => {
+  const uploads = new Map<object, { id: string; ready: Promise<FileUpload>; timer: ReturnType<typeof setTimeout> }>();
+  const projectSaves = new Map<object, { id: string; ready: Promise<ProjectSave>; timer: ReturnType<typeof setTimeout>; finishing: boolean }>();
+  const discardProjectSave = async (owner: object, id?: string) => {
+    const save = projectSaves.get(owner);
+    if (!save || (id && save.id !== id)) return;
+    clearTimeout(save.timer); projectSaves.delete(owner);
+    try { await (await save.ready.catch(() => undefined))?.dispose(); }
+    finally { pending.delete(owner); }
+  };
+  const discardUpload = async (owner: object, id?: string) => {
+    const upload = uploads.get(owner);
+    if (!upload || (id && id !== upload.id)) return;
+    clearTimeout(upload.timer); uploads.delete(owner);
+    const staged = await upload.ready.catch(() => undefined);
+    await staged?.dispose();
+  };
+  const watchOwner = (owner: IpcMainInvokeEvent['sender']) => {
+    if (watchedOwners.has(owner)) return;
+    watchedOwners.add(owner);
+    owner.once('destroyed', () => {
+      destinations.delete(owner);
+      void discardUpload(owner).catch(() => undefined);
+      void discardProjectSave(owner).catch(() => undefined);
+    });
+  };
+  ipcMain.handle(IPC.projectSaveBegin, async (event, request: unknown): Promise<ProjectSaveBeginResult> => {
     if (!ctx.isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
-    if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 1 || size > LIMITS.fileSaveBytes) throw new Error('Invalid save size');
+    if (!ctx.projects || !isRecord(request) || typeof request.projectId !== 'string' || !PROJECT_ID.test(request.projectId)
+      || (request.saveAs !== undefined && typeof request.saveAs !== 'boolean') || typeof request.documentBytes !== 'number'
+      || !Number.isSafeInteger(request.documentBytes) || request.documentBytes < 2 || request.documentBytes > 0xffffffff) throw new Error('Invalid project save request');
+    validateSaveMedia(request.media);
+    const name = sanitizeSaveName(request.name);
+    if (!name) throw new Error('Invalid project save name');
+    if (pending.has(event.sender) || uploads.has(event.sender) || projectSaves.has(event.sender)) throw new Error('A save is already in progress.');
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (!window || window.isDestroyed()) throw new Error('Save window is unavailable');
+    pending.add(event.sender); watchOwner(event.sender);
+    let id: string | undefined;
+    try {
+      const known = await ctx.projects.destination(request.projectId);
+      let selectedPath: string | undefined;
+      if (!known || request.saveAs) {
+        const options = { defaultPath: known || name, filters: saveFiltersForName(name) };
+        const result = ctx.dialogs?.showSave ? await ctx.dialogs.showSave(window, options) : await dialog.showSaveDialog(window, options);
+        if (result.canceled || !result.filePath) { pending.delete(event.sender); return { ok: false, cancelled: true }; }
+        selectedPath = result.filePath;
+      }
+      if (window.isDestroyed() || event.sender.isDestroyed()) throw new Error('Save window is unavailable');
+      id = randomUUID();
+      const timer = setTimeout(() => { void discardProjectSave(event.sender, id).catch(() => undefined); }, 120_000); timer.unref();
+      const ready = ctx.projects.beginIncremental(request.projectId, request.media, request.documentBytes, selectedPath);
+      projectSaves.set(event.sender, { id, ready, timer, finishing: false });
+      const save = await ready;
+      if (event.sender.isDestroyed() || projectSaves.get(event.sender)?.id !== id) throw new Error('Save cancelled');
+      timer.refresh();
+      return { ok: true, token: id, required: save.required };
+    } catch (error: any) {
+      if (id) await discardProjectSave(event.sender, id);
+      pending.delete(event.sender);
+      return { ok: false, cancelled: false, error: error.message || 'Could not start saving.' };
+    }
+  });
+  ipcMain.handle(IPC.projectSaveChunk, async (event, request: unknown) => {
+    if (!ctx.isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
+    const save = projectSaves.get(event.sender);
+    if (!save || save.finishing || !isRecord(request) || request.token !== save.id
+      || (request.assetId !== null && typeof request.assetId !== 'string') || !(request.data instanceof Uint8Array)
+      || request.data.length < 1 || request.data.length > FILE_CHUNK_BYTES) throw new Error('Invalid project save chunk');
+    save.timer.refresh();
+    await (await save.ready).write(request.assetId, request.data);
+    save.timer.refresh();
+  });
+  ipcMain.handle(IPC.projectSaveFinish, async (event, token: unknown): Promise<FileSaveResult> => {
+    if (!ctx.isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
+    const save = projectSaves.get(event.sender);
+    if (!save || save.finishing || save.id !== token) throw new Error('Unknown project save token');
+    save.finishing = true; clearTimeout(save.timer);
+    try { return { ok: true, path: await (await save.ready).finish() }; }
+    catch (error: any) { return { ok: false, cancelled: false, error: error.message || 'Could not save project.' }; }
+    finally { await discardProjectSave(event.sender, save.id); }
+  });
+  ipcMain.handle(IPC.projectSaveAbort, async (event, token: unknown) => {
+    if (!ctx.isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
+    if (typeof token === 'string') await discardProjectSave(event.sender, token);
+  });
+  ipcMain.handle(IPC.exportChoose, async (event, request: unknown) => {
+    if (!ctx.isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
+    if (!isRecord(request)) throw new Error('Invalid export destination');
+    const name = sanitizeSaveName(request.name);
+    if (!name || (request.directory !== undefined && typeof request.directory !== 'boolean')) throw new Error('Invalid export destination');
+    if (pending.has(event.sender) || destinations.has(event.sender)) throw new Error('An export is already in progress.');
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (!window || window.isDestroyed()) throw new Error('Save window is unavailable');
+    pending.add(event.sender);
+    watchOwner(event.sender);
+    try {
+      let selectedPath: string | undefined;
+      if (request.directory) {
+        const result = await dialog.showOpenDialog(window, { title: 'Export PNG Sequence', properties: ['openDirectory', 'createDirectory'] });
+        if (!result.canceled) selectedPath = result.filePaths[0];
+      } else {
+        const options = { defaultPath: name, filters: saveFiltersForName(name) };
+        const result = ctx.dialogs?.showSave ? await ctx.dialogs.showSave(window, options) : await dialog.showSaveDialog(window, options);
+        if (!result.canceled) selectedPath = result.filePath;
+      }
+      if (!selectedPath || window.isDestroyed()) return null;
+      const token = randomUUID();
+      destinations.set(event.sender, { token, path: selectedPath, directory: !!request.directory });
+      return token;
+    } finally { pending.delete(event.sender); }
+  });
+  ipcMain.handle(IPC.exportRelease, (event, token: unknown) => {
+    if (!ctx.isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
+    if (destinations.get(event.sender)?.token === token) destinations.delete(event.sender);
+  });
+  ipcMain.handle(IPC.fileSaveUpload, async (event, size: unknown) => {
+    if (!ctx.isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
+    if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 1) throw new Error('Invalid save size');
     if (uploads.has(event.sender) || pending.has(event.sender)) throw new Error('A save is already in progress.');
     const id = randomUUID();
-    const timer = setTimeout(() => discardUpload(event.sender), 120_000); timer.unref();
-    uploads.set(event.sender, { id, size, received: 0, chunks: [], timer });
-    if (!watchedOwners.has(event.sender)) {
-      watchedOwners.add(event.sender);
-      event.sender.once('destroyed', () => discardUpload(event.sender));
-    }
-    return id;
+    const timer = setTimeout(() => { void discardUpload(event.sender, id).catch(() => undefined); }, 120_000); timer.unref();
+    const ready = FileUpload.create(size);
+    uploads.set(event.sender, { id, ready, timer }); watchOwner(event.sender);
+    try { await ready; return id; }
+    catch (error) { await discardUpload(event.sender, id); throw error; }
   });
-  ipcMain.handle(IPC.fileSaveChunk, (event, payload: unknown) => {
+  ipcMain.handle(IPC.fileSaveChunk, async (event, payload: unknown) => {
     if (!ctx.isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
     const upload = uploads.get(event.sender);
     if (!upload || !isRecord(payload) || payload.uploadId !== upload.id || !(payload.data instanceof Uint8Array)
-      || payload.data.byteLength < 1 || payload.data.byteLength > 1024 * 1024 || upload.received + payload.data.byteLength > upload.size) throw new Error('Invalid save chunk');
-    upload.chunks.push(Buffer.from(payload.data)); upload.received += payload.data.byteLength;
+      || payload.data.byteLength < 1 || payload.data.byteLength > FILE_CHUNK_BYTES) throw new Error('Invalid save chunk');
+    upload.timer.refresh();
+    await (await upload.ready).write(payload.data);
+    upload.timer.refresh();
   });
-  ipcMain.handle(IPC.fileSaveAbort, (event, id: unknown) => {
+  ipcMain.handle(IPC.fileSaveAbort, async (event, id: unknown) => {
     if (!ctx.isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
-    if (uploads.get(event.sender)?.id === id) discardUpload(event.sender);
+    if (typeof id === 'string') await discardUpload(event.sender, id);
+  });
+  ipcMain.handle(IPC.projectRead, async (event, request: unknown) => {
+    if (!ctx.isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
+    if (!ctx.projects) throw new Error('Project storage is unavailable');
+    const readers = projectReaderState(ctx.projects).readers;
+    if (!isRecord(request) || typeof request.token !== 'string' || readers.get(request.token)?.owner !== event.sender) throw new Error('Unknown project read token');
+    const reader = readers.get(request.token)!; reader.timer.refresh();
+    const data = await ctx.projects!.read(request.token, request.offset as number, request.length as number);
+    reader.timer.refresh(); return data;
+  });
+  ipcMain.handle(IPC.projectReadClose, async (event, token: unknown) => {
+    if (!ctx.isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
+    if (!ctx.projects) throw new Error('Project storage is unavailable');
+    const readers = projectReaderState(ctx.projects).readers;
+    if (typeof token !== 'string' || readers.get(token)?.owner !== event.sender) throw new Error('Unknown project read token');
+    await closeProjectReader(ctx.projects, token, true);
   });
   ipcMain.handle(IPC.fileSave, async (event, payload: unknown): Promise<FileSaveResult> => {
     if (!ctx.isTrustedSender(event)) throw new Error('Unauthorized IPC sender');
@@ -115,29 +322,35 @@ export function registerSaveIpc(ipcMain: Pick<IpcMain, 'handle'>, ctx: SaveIpcCo
       throw new IpcValidationError(IPC.fileSave, 'invalid saveAs');
     }
 
+    const destination = payload.destinationToken === undefined ? undefined : destinations.get(event.sender);
+    if (payload.destinationToken !== undefined && (!destination || destination.token !== payload.destinationToken || projectId !== undefined)) {
+      throw new Error('Unknown export destination');
+    }
+    if (destination?.directory && (name !== payload.name || path.extname(name).toLowerCase() !== '.png')) throw new Error('Invalid export frame name');
+
     let data = payload['data'];
+    let stream: AsyncIterable<Uint8Array> | undefined;
     if (payload.uploadId !== undefined) {
       const upload = uploads.get(event.sender);
-      if (!upload || payload.uploadId !== upload.id || upload.received !== upload.size) throw new Error('The save upload is incomplete.');
-      data = Buffer.concat(upload.chunks, upload.size);
-      discardUpload(event.sender);
+      if (!upload || payload.uploadId !== upload.id) throw new Error('The save upload is incomplete.');
+      stream = (await upload.ready).claim();
+      clearTimeout(upload.timer);
     }
-    if (!(data instanceof Uint8Array)) {
+    if (!stream && !(data instanceof Uint8Array)) {
       throw new IpcValidationError(IPC.fileSave, 'data must be Uint8Array');
     }
-    if (!isBytes(data, LIMITS.fileSaveBytes)) {
+    if (!stream && !isBytes(data, LIMITS.fileSaveBytes)) {
       return { ok: false, cancelled: false, error: 'too large; use streaming export' };
     }
-
-    const window = BrowserWindow.fromWebContents(event.sender);
-    if (!window || window.isDestroyed()) throw new Error('Save window is unavailable');
 
     if (pending.has(event.sender)) return { ok: false, cancelled: false, error: 'A save is already in progress.' };
     pending.add(event.sender);
     try {
+      const window = BrowserWindow.fromWebContents(event.sender);
+      if (!window || window.isDestroyed()) throw new Error('Save window is unavailable');
       const known = projectId && ctx.projects ? await ctx.projects.destination(projectId) : undefined;
-      let selectedPath: string | undefined;
-      if (!known || payload['saveAs']) {
+      let selectedPath = destination ? (destination.directory ? path.join(destination.path, name) : destination.path) : undefined;
+      if (!destination && (!known || payload['saveAs'])) {
         const options: SaveDialogOptions = { defaultPath: known || name, filters: saveFiltersForName(name) };
         const result = ctx.dialogs?.showSave
           ? await ctx.dialogs.showSave(window, options)
@@ -146,14 +359,15 @@ export function registerSaveIpc(ipcMain: Pick<IpcMain, 'handle'>, ctx: SaveIpcCo
         selectedPath = result.filePath;
       }
       if (projectId && ctx.projects) {
-        return { ok: true, path: await ctx.projects.save(projectId, data, selectedPath) };
+        return { ok: true, path: await ctx.projects.save(projectId, stream || data as Uint8Array, selectedPath) };
       }
-      await atomicWrite(selectedPath!, data);
+      await atomicWrite(selectedPath!, stream || data as Uint8Array);
       return { ok: true, path: selectedPath! };
     } catch (error: any) {
       return { ok: false, cancelled: false, error: error.message || 'Save failed. Check disk space and folder permissions.' };
     } finally {
       pending.delete(event.sender);
+      if (typeof payload.uploadId === 'string') await discardUpload(event.sender, payload.uploadId);
     }
   });
   ipcMain.handle(IPC.projectOpen, async (event): Promise<ProjectOpenResult> => {
@@ -163,10 +377,10 @@ export function registerSaveIpc(ipcMain: Pick<IpcMain, 'handle'>, ctx: SaveIpcCo
     try {
       const result = await dialog.showOpenDialog(window, {
         title: 'Open Project', properties: ['openFile'],
-        filters: [{ name: 'Powermove Project', extensions: ['pmv', 'pmv1', 'json'] }]
+        filters: [{ name: 'Powermove Project', extensions: ['pmv', 'json'] }]
       });
       if (result.canceled || !result.filePaths[0]) return { ok: false, cancelled: true };
-      return { ok: true, ...await ctx.projects.open(result.filePaths[0]) };
+      return await openProjectForWindow({ projects: ctx.projects }, event.sender, result.filePaths[0]);
     } catch (error: any) { return { ok: false, cancelled: false, error: error.message || 'Could not open project.' }; }
   });
   ipcMain.handle(IPC.projectConfirmClose, async (event, name: unknown): Promise<CloseDecision> => {

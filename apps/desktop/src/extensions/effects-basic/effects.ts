@@ -5,6 +5,8 @@ precision highp float;
 in vec2 v_uv; in vec2 v_st; in vec2 v_px;
 uniform sampler2D u_tex;
 uniform vec2 u_res;
+uniform vec2 u_coordRes;
+uniform vec2 u_pxOrigin;
 uniform vec2 u_texel;
 uniform float u_time;
 uniform float u_prog;
@@ -67,7 +69,7 @@ const FX: Record<string, Omit<EffectDefinition, 'id' | 'rawShader'>> = {
       o = vec4(clamp(c.rgb + (c.rgb - b.rgb*.25) * (u_p0/100.), 0., 4.), c.a);`, 'uniform float u_p0;'),
   },
   glow: {
-    label: 'Glow', group: 'Stylize', passes: 3,
+    label: 'Glow', group: 'Light & Shadow', passes: 3,
     params: [{ k: 'threshold', label: 'Threshold', def: 55, min: 0, max: 100, step: 1, unit: '%' },
              { k: 'radius', label: 'Radius', def: 60, min: 0, max: 400, step: 1, unit: 'px' },
              { k: 'intensity', label: 'Intensity', def: 90, min: 0, max: 400, step: 1, unit: '%' }],
@@ -140,12 +142,12 @@ const FX: Record<string, Omit<EffectDefinition, 'id' | 'rawShader'>> = {
       o = vec4(clamp(c.rgb + n * (u_p0/100.) * c.a, 0., 8.), c.a);`, 'uniform float u_p0,u_p1;'),
   },
   vignette: {
-    label: 'Vignette', group: 'Stylize', passes: 1,
+    label: 'Vignette', group: 'Light & Shadow', passes: 1,
     params: [{ k: 'amount', label: 'Amount', def: 45, min: 0, max: 100, step: 1, unit: '%' },
              { k: 'feather', label: 'Feather', def: 60, min: 1, max: 100, step: 1, unit: '%' }],
     frag: F(`
       vec4 c = texture(u_tex, v_st);
-      vec2 q = (v_px/u_res - .5) * 2.0;
+      vec2 q = (v_uv - .5) * 2.0;
       float d = length(q) * .72;
       float v = 1. - smoothstep(1. - u_p1/100., 1.0, d) * (u_p0/100.);
       o = vec4(c.rgb * v, c.a);`, 'uniform float u_p0,u_p1;'),
@@ -154,7 +156,7 @@ const FX: Record<string, Omit<EffectDefinition, 'id' | 'rawShader'>> = {
     label: 'Chromatic Aberration', group: 'Distort', passes: 1,
     params: [{ k: 'amount', label: 'Amount', def: 6, min: 0, max: 80, step: .5, unit: 'px' }],
     frag: F(`
-      vec2 dir = (v_st - .5);
+      vec2 dir = (vec2(v_uv.x, 1. - v_uv.y) - .5);
       vec2 d = dir * u_texel * u_p0 * 2.0;
       float r = texture(u_tex, v_st + d).r;
       vec4 g = texture(u_tex, v_st);
@@ -165,11 +167,14 @@ const FX: Record<string, Omit<EffectDefinition, 'id' | 'rawShader'>> = {
     label: 'Mosaic', group: 'Stylize', passes: 1,
     params: [{ k: 'size', label: 'Block Size', def: 16, min: 1, max: 200, step: 1, unit: 'px' }],
     frag: F(`
-      vec2 s = max(u_p0, 1.) * u_texel;
-      o = texture(u_tex, (floor(v_st/s) + .5) * s);`, 'uniform float u_p0;'),
+      float block = max(u_p0, 1.);
+      vec2 local = v_px - u_pxOrigin;
+      vec2 center = (floor(local / block) + .5) * block;
+      vec2 uv = vec2(center.x / u_res.x, 1. - center.y / u_res.y);
+      o = texture(u_tex, uv);`, 'uniform float u_p0;'),
   },
   posterize: {
-    label: 'Posterize', group: 'Stylize', passes: 1,
+    label: 'Posterize', group: 'Color', passes: 1,
     params: [{ k: 'levels', label: 'Levels', def: 6, min: 2, max: 64, step: 1, unit: '' }],
     frag: F(`
       vec4 c = texture(u_tex, v_st); if (c.a<.0005){o=c;return;}
@@ -182,12 +187,12 @@ const FX: Record<string, Omit<EffectDefinition, 'id' | 'rawShader'>> = {
              { k: 'scale', label: 'Size', def: 2.2, min: .2, max: 20, step: .1, unit: '' },
              { k: 'speed', label: 'Evolution', def: .4, min: -4, max: 4, step: .05, unit: '' }],
     frag: F(`
-      vec2 p = v_st * u_p1 * 3.0 + vec2(u_time * u_p2, u_time * u_p2 * .7);
+      vec2 p = vec2(v_uv.x, 1. - v_uv.y) * u_p1 * 3.0 + vec2(u_time * u_p2, u_time * u_p2 * .7);
       vec2 d = vec2(fbm(p) - .5, fbm(p + 31.7) - .5) * u_p0 * u_texel * 2.0;
       o = texture(u_tex, v_st + d);`, 'uniform float u_p0,u_p1,u_p2;'),
   },
   shadow: {
-    label: 'Drop Shadow', group: 'Stylize', passes: 3,
+    label: 'Drop Shadow', group: 'Light & Shadow', passes: 3,
     params: [{ k: 'distance', label: 'Distance', def: 20, min: 0, max: 400, step: 1, unit: 'px' },
              { k: 'angle', label: 'Angle', def: 135, min: -360, max: 360, step: 1, unit: '°' },
              { k: 'softness', label: 'Softness', def: 40, min: 0, max: 300, step: 1, unit: 'px' },
@@ -220,12 +225,54 @@ const FX: Record<string, Omit<EffectDefinition, 'id' | 'rawShader'>> = {
       vec4 c = texture(u_tex, v_st); if (c.a<.0005){o=c;return;}
       vec3 x = c.rgb/c.a; o = vec4(mix(x, 1.-x, u_p0/100.)*c.a, c.a);`, 'uniform float u_p0;'),
   },
+  gradient: {
+    label: 'Gradient Ramp', group: 'Generate', passes: 1,
+    params: [{ k: 'startColor', label: 'Start Color', def: '#FFFFFF', type: 'color' },
+             { k: 'endColor', label: 'End Color', def: '#000000', type: 'color' },
+             { k: 'angle', label: 'Angle', def: 90, min: -360, max: 360, step: 1, unit: '°' },
+             { k: 'centerX', label: 'Center X', def: 0, min: -100, max: 100, step: .5, unit: '%' },
+             { k: 'centerY', label: 'Center Y', def: 0, min: -100, max: 100, step: .5, unit: '%' },
+             { k: 'spread', label: 'Spread', def: 100, min: 1, max: 400, step: 1, unit: '%' },
+             { k: 'midpoint', label: 'Midpoint', def: 50, min: 1, max: 99, step: .5, unit: '%' },
+             { k: 'radial', label: 'Radial', def: false, type: 'toggle' },
+             { k: 'shade', label: 'Keep Luminance', def: false, type: 'toggle' },
+             { k: 'dither', label: 'Dither', def: 1, min: 0, max: 20, step: .1, unit: '' },
+             { k: 'amount', label: 'Amount', def: 100, min: 0, max: 100, step: 1, unit: '%' }],
+    /* Named uniforms (the current param contract) rather than the positional
+       u_p<i> of the older effects above — eleven params read better by name.
+       The ramp spans the frame like Vignette, and paints inside the layer's own
+       alpha, so text and shapes keep their edges instead of being replaced by a
+       full-frame fill. */
+    frag: F(`
+      vec4 c = texture(u_tex, v_st); if (c.a < .0005) { o = c; return; }
+      vec3 x = c.rgb / c.a;
+      vec2 p = (vec2(v_uv.x, 1. - v_uv.y) - .5) - vec2(u_centerX, -u_centerY) / 200.;
+      float span = max(u_spread / 100., .001);
+      float a = radians(u_angle);
+      /* Aspect-correct the radial distance so the rings stay circular. */
+      float t = u_radial > .5
+        ? length(p * vec2(u_coordRes.x / max(u_coordRes.y, 1.), 1.)) * 2. / span
+        : dot(p, vec2(cos(a), -sin(a))) / span + .5;
+      /* Static per-pixel jitter breaks 8-bit banding without shimmering. */
+      t = clamp(t + (hash(v_px) - .5) * u_dither * .004, 0., 1.);
+      t = pow(t, log(.5) / log(clamp(u_midpoint / 100., .01, .99)));
+      vec3 g = mix(u_startColor, u_endColor, t);
+      if (u_shade > .5) { vec3 h = rgb2hsv(g); g = hsv2rgb(vec3(h.x, h.y, rgb2hsv(max(x, 0.)).z)); }
+      o = vec4(mix(x, g, u_amount / 100.) * c.a, c.a);`,
+      `uniform vec3 u_startColor,u_endColor;
+       uniform float u_angle,u_centerX,u_centerY,u_spread,u_midpoint,u_radial,u_shade,u_dither,u_amount;`),
+  },
 };
 
+const VIEWPORT_PADDING: Record<string, string[]> = {
+  blur: ['amount'], motionblurDir: ['amount'], glow: ['radius'],
+  displace: ['amount'], shadow: ['distance', 'softness'], chroma: ['amount'],
+};
 
 export const EFFECTS: EffectDefinition[] = Object.entries(FX).map(([id, definition]) => ({
   ...definition,
   id,
-  rawShader: true
+  rawShader: true,
+  viewportSafe: true,
+  viewportPadding: VIEWPORT_PADDING[id] || [],
 }));
-

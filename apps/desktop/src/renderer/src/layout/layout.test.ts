@@ -247,35 +247,33 @@ describe('Svelte DockLayout panel pool', () => {
     expect(panel.querySelector(domContract.panel.moveHandle)).not.toBeNull();
   });
 
-  it('opens a native-button menu with roving arrow focus and a pop-out entry', () => {
+  it('routes the panel options button and header right-click to the native menu bridge', () => {
     register(PM, 'alpha');
     register(PM, 'viewer', { headless: true, hideMoveHandle: true });
     register(PM, 'beta');
+    PM.menu = vi.fn();
     installSvelteLayout(PM);
     PM.Layout.apply(PM.WS.current);
-    const trigger = document.querySelector<HTMLButtonElement>('#panel-alpha .panel-options')!;
-    const removeListener = vi.spyOn(window, 'removeEventListener');
 
+    const trigger = document.querySelector<HTMLButtonElement>('#panel-alpha .panel-options')!;
+    trigger.getBoundingClientRect = () => ({ width: 20, height: 20, left: 30, right: 50, top: 10, bottom: 30, x: 30, y: 10, toJSON() {} });
     trigger.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: 40, clientY: 40 }));
-    const menu = document.querySelector<HTMLElement>('.drop[role="menu"]')!;
-    const buttons = [...menu.querySelectorAll<HTMLButtonElement>('button[role="menuitem"]')];
-    expect(menu.getAttribute('aria-label')).toBe('Alpha panel options');
-    expect(buttons).toHaveLength(2);
-    expect(buttons.every((button) => button instanceof HTMLButtonElement)).toBe(true);
-    expect(menu.textContent).toContain('Pop out to window');
-    expect(buttons.map((button) => button.textContent)).toEqual(['Pop out to window', 'Close panel']);
-    expect(buttons.every((button) => !button.disabled)).toBe(true);
-    expect(buttons.every((button) => button.style.background === '')).toBe(true);
-    // Pointer-opened: focus parks on the menu, no row is painted; arrows enter the list.
-    expect(document.activeElement).toBe(menu);
-    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
-    expect(document.activeElement).toBe(buttons[0]);
-    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
-    expect(document.activeElement).toBe(buttons[1]);
-    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    const menu = PM.menu as ReturnType<typeof vi.fn>;
+    expect(menu).toHaveBeenCalledTimes(1);
+    const [anchor, items, position] = menu.mock.calls[0]!;
+    expect(anchor).toBe(trigger);
+    // Anchored menus open from the button's bottom-left corner.
+    expect(position).toEqual({ x: 30, y: 30 });
+    expect(items[0]).toEqual({ header: 'Alpha' });
+    expect(items.slice(1).map((item: any) => item.label)).toEqual(['Pop out to window', 'Close panel']);
+    expect(items.slice(1).map((item: any) => item.icon)).toEqual(['export', 'x']);
+    // No HTML menu is ever built for panels.
     expect(document.querySelector('.drop')).toBeNull();
-    expect(document.activeElement).toBe(trigger);
-    expect(removeListener).toHaveBeenCalledWith('keydown', expect.any(Function), true);
+
+    const header = document.querySelector<HTMLElement>('#panel-alpha header')!;
+    header.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 120, clientY: 80 }));
+    expect(menu).toHaveBeenCalledTimes(2);
+    expect(menu.mock.calls[1]![2]).toEqual({ x: 120, y: 80 });
   });
 
   it('resizes and clamps a dock from the keyboard splitter', () => {
@@ -422,6 +420,36 @@ describe('Svelte DockLayout panel pool', () => {
     expect(PM.WS.save).not.toHaveBeenCalled();
   });
 
+  it('keeps subpixel horizontal resize motion through commit and restores the exact size on cancel', () => {
+    register(PM, 'alpha');
+    register(PM, 'viewer', { headless: true, hideMoveHandle: true });
+    register(PM, 'beta', { size: 140 });
+    installSvelteLayout(PM);
+    PM.Layout.apply(PM.WS.current);
+    const viewer = document.getElementById('panel-viewer')!;
+    const beta = document.getElementById('panel-beta')!;
+    viewer.getBoundingClientRect = () => ({ width: 500, height: 380, left: 0, right: 500, top: 0, bottom: 380, x: 0, y: 0, toJSON() {} });
+    beta.getBoundingClientRect = () => ({ width: 500, height: 140, left: 0, right: 500, top: 388, bottom: 528, x: 0, y: 388, toJSON() {} });
+    const splitter = document.querySelector<HTMLElement>('#dock-center [aria-orientation="horizontal"]')!;
+    let handlers: any;
+    vi.mocked(PM.drag).mockImplementation(((_event: PointerEvent, options: any) => { handlers = options; return { cancel: vi.fn() }; }) as any);
+    splitter.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, button: 0 }));
+    const positions = new Set<string>();
+    for (let frame = 0; frame < 120; frame++) {
+      handlers.move(0, 3 + frame / 4, new MouseEvent('pointermove'));
+      positions.add(beta.style.flex);
+    }
+    expect(positions.size).toBe(120);
+    expect(beta.style.flex).toBe('0 0 107.25px');
+    handlers.up();
+    expect(PM.WS.current.layout.docks[1].panels[1].size).toBe(107.25);
+    expect(beta.style.flex).toBe('0 0 107.25px');
+    splitter.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, button: 0 }));
+    handlers.move(0, 10.5, new MouseEvent('pointermove'));
+    handlers.cancel();
+    expect(beta.style.flex).toBe('0 0 107.25px');
+  });
+
   it('lerps splitter hover glow and throttles drag layout emissions to animation frames', () => {
     register(PM, 'alpha');
     register(PM, 'viewer', { headless: true, hideMoveHandle: true });
@@ -510,9 +538,11 @@ describe('Svelte DockLayout panel pool', () => {
     expect(PM.Layout.setCollapsed('beta', true)).toBe(true);
     expect(panel.dataset.collapsed).toBe('1');
     expect(panel.style.flex).toBe('0 0 var(--hdr-h)');
+    expect(panel.style.minHeight).toBe('var(--hdr-h)');
     expect(body.style.display).toBe('none');
     expect(PM.Layout.setCollapsed('beta', false)).toBe(true);
     expect(panel.style.flex).toBe('0 0 140px');
+    expect(panel.style.minHeight).toBe('88px');
   });
 
   /* A side column can only scroll if its panels stop crushing. Regression for

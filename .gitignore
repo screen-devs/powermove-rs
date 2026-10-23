@@ -24,3 +24,18 @@ packages/player/dist/
 .env
 .env.*
 !.env.example
+
+# Private deployment notes, credentials, and local verification artifacts
+DEPLOYMENT-*.md
+**/.dev.vars
+**/.dev.vars.*
+!**/.dev.vars.example
+**/neon-connections.json
+apps/desktop/dist-local-*/
+apps/desktop/test-results/
+
+# serve host build (npm package payload)
+packages/cli/dist/
+
+# also match symlinks named node_modules (a worktree once committed one)
+node_modules

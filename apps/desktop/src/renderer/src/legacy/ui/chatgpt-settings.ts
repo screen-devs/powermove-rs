@@ -1,4 +1,6 @@
 import type { ChatGPTAccountStatus, PowermoveBridge } from '../../../../shared/ipc';
+import { bridge as hostBridge } from '../../kernel/bridge';
+import { presentError } from '../../errors/presentation';
 
 function planLabel(plan: string | null): string | null {
   if (!plan) return null;
@@ -64,9 +66,12 @@ function createAccountSettingsControl(
       action.textContent = 'Checking…';
       action.disabled = true;
     } else {
-      description.textContent = status.detail || (status.state === 'unavailable'
-        ? `${runtime} could not be reached on this Mac.`
-        : `Use your ${name} subscription with Powermove.`);
+      // The same plain language as the agent panel's notices; raw transport
+      // text stays out of Settings, where there is no room for diagnostics.
+      description.textContent = status.detail
+        ? (status.state === 'unavailable' ? presentError(status.detail).message : status.detail)
+        : status.state === 'unavailable' ? `${runtime} could not be reached on this Mac.`
+          : `Use your ${name} subscription with Powermove.`;
       action.textContent = status.state === 'unavailable' ? 'Retry' : 'Connect';
       action.disabled = false;
     }
@@ -123,13 +128,13 @@ function createAccountSettingsControl(
 export function createChatGPTSettingsControl(
   api?: PowermoveBridge['chatgpt']
 ): ChatGPTSettingsControl {
-  return createAccountSettingsControl('ChatGPT', 'Codex', api ?? window.powermove?.chatgpt);
+  return createAccountSettingsControl('ChatGPT', 'Codex', api ?? hostBridge()?.chatgpt);
 }
 
 export function createClaudeSettingsControl(
   api?: PowermoveBridge['claude']
 ): ChatGPTSettingsControl {
-  return createAccountSettingsControl('Claude', 'Claude Code', api ?? window.powermove?.claude);
+  return createAccountSettingsControl('Claude', 'Claude Code', api ?? hostBridge()?.claude);
 }
 
 export const formatChatGPTPlan = planLabel;

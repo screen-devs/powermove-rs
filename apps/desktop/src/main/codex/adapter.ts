@@ -4,13 +4,14 @@ import { discoverCodexBinary } from './env';
 import { AGENT_TESTING_INSTRUCTIONS } from '../../shared/agent-testing';
 import type { NativeMcpServerConfig } from '../agent-tools/spec';
 
-export const ADAPTER_VERSION = '4';
+import { userMcpArgv, type UserMcpServers } from '../agent-tools/user-mcp';
+import { AGENT_SHELL_NETWORK_INSTRUCTIONS } from './instructions';
+
+export const ADAPTER_VERSION = '6';
 
 export const REQUIRED_CODEX_FLAGS = [
   '--ephemeral',
   '--skip-git-repo-check',
-  '--ignore-user-config',
-  '--ignore-rules',
   '--sandbox',
   '--output-schema',
   '--output-last-message',
@@ -19,11 +20,34 @@ export const REQUIRED_CODEX_FLAGS = [
   '--config',
   '--image',
   '--search',
-  '--disable',
   '--add-dir',
-  '--approve-for-me',
   '--dangerously-bypass-approvals-and-sandbox'
 ] as const;
+
+/** The permission profile sandboxed Project shells run under. */
+export const PROJECT_PERMISSION_PROFILE = 'powermove';
+
+/**
+ * `--approve-for-me` without its legacy `sandbox_mode="workspace-write"`,
+ * which would override a permission profile: a command the sandbox blocks
+ * may ask to run outside it, and Codex's automatic reviewer decides. The
+ * profile extends Codex's workspace sandbox and with shell network lets
+ * commands reach any host. They follow `exec` because root-level approval
+ * and profile overrides do not reach it; the legacy
+ * `sandbox_workspace_write.network_access` switch did not either.
+ */
+export function projectSandboxArgv(options: { shellNetwork: boolean }): string[] {
+  const profile = `permissions.${PROJECT_PERMISSION_PROFILE}`;
+  const config = [
+    'approvals_reviewer="auto_review"',
+    'approval_policy="on-request"',
+    `default_permissions=${JSON.stringify(PROJECT_PERMISSION_PROFILE)}`,
+    `${profile}.extends=":workspace"`
+  ];
+  // Direct sockets to any host: no network proxy, no domain list.
+  if (options.shellNetwork) config.push(`${profile}.network.enabled=true`);
+  return config.flatMap(value => ['--config', value]);
+}
 
 interface CommonArgvOptions {
   schemaPath: string;
@@ -32,7 +56,7 @@ interface CommonArgvOptions {
   imagePaths: readonly string[];
   model: string | null;
   reasoningEffort: ReasoningEffort | null;
-  disabledSkillPaths: readonly string[];
+  externalMcpServers?: UserMcpServers;
 }
 
 export interface EditorArgvOptions extends CommonArgvOptions {}
@@ -43,29 +67,10 @@ export interface AutonomousArgvOptions extends CommonArgvOptions {
   sessionId: string | null;
   instructions: string;
   nativeTools?: NativeMcpServerConfig;
-}
-
-/**
- * Session-level isolation is defense in depth on top of the app-owned
- * CODEX_HOME. It also suppresses user skills from $HOME/.agents/skills, which
- * live outside CODEX_HOME.
- */
-function isolatedSessionArgv(disabledSkillPaths: readonly string[]): string[] {
-  const argv = [
-    '--disable', 'plugins',
-    '--disable', 'apps',
-    '--disable', 'skill_search',
-    '--disable', 'skill_mcp_dependency_install',
-    '--config', 'mcp_servers={}',
-    '--config', 'skills.include_instructions=false',
-    '--config', 'skills.bundled.enabled=false'
-  ];
-  if (disabledSkillPaths.length > 0) {
-    const rules = disabledSkillPaths.map((skillPath) =>
-      `{path=${JSON.stringify(skillPath)},enabled=false}`).join(',');
-    argv.push('--config', `skills.config=[${rules}]`);
-  }
-  return argv;
+  /** Outbound network to any host for sandboxed shell commands. Only the
+   * Project access choice grants it; Edit project runs keep project
+   * authority without it. */
+  shellNetwork?: boolean;
 }
 
 function appendModelOptions(
@@ -89,7 +94,10 @@ function nativeMcpArgv(config?: NativeMcpServerConfig): string[] {
   const argv = [
     '--config', `mcp_servers.powermove.command=${JSON.stringify(config.command)}`,
     '--config', `mcp_servers.powermove.args=${JSON.stringify(config.args)}`,
-    '--config', 'mcp_servers.powermove.startup_timeout_sec=10',
+    '--config', 'mcp_servers.powermove.required=true',
+    // Run-scoped tools carry no annotations; approve them without a review.
+    '--config', 'mcp_servers.powermove.default_tools_approval_mode="approve"',
+    '--config', 'mcp_servers.powermove.startup_timeout_sec=30',
     '--config', 'mcp_servers.powermove.tool_timeout_sec=120'
   ];
   for (const [name, value] of Object.entries(config.env).sort(([a], [b]) => a.localeCompare(b))) {
@@ -103,9 +111,7 @@ export function buildEditorArgv(options: EditorArgvOptions): string[] {
     'exec',
     '--ephemeral',
     '--skip-git-repo-check',
-    '--ignore-user-config',
-    '--ignore-rules',
-    ...isolatedSessionArgv(options.disabledSkillPaths),
+    ...userMcpArgv(options.externalMcpServers),
     '--sandbox',
     'read-only',
     '--output-schema',
@@ -119,24 +125,22 @@ export function buildEditorArgv(options: EditorArgvOptions): string[] {
   return argv;
 }
 
+const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/;
+
 export function buildAutonomousArgv(options: AutonomousArgvOptions): string[] {
   const argv = ['--search'];
-  if (options.access === 'computer') {
-    argv.push('--dangerously-bypass-approvals-and-sandbox');
-  } else {
-    // codex ≥ 0.147 rejects an explicit --sandbox alongside --approve-for-me;
-    // --approve-for-me itself routes approvals through the workspace-write
-    // sandbox (the Swift shell's flag pair predates that change).
-    argv.push('--approve-for-me');
-  }
+  const sandboxed = options.access !== 'computer';
+  if (!sandboxed) argv.push('--dangerously-bypass-approvals-and-sandbox');
   argv.push('--add-dir', options.extensionsDir);
 
+  const sessionId = options.sessionId?.trim() || null;
+  if (sessionId !== null && !SESSION_ID.test(sessionId)) throw new Error('Invalid Codex session id.');
   argv.push('exec');
-  if (options.sessionId !== null && options.sessionId.trim() !== '') argv.push('resume');
+  if (sessionId !== null) argv.push('resume');
   argv.push(
-    '--ignore-user-config',
     '--skip-git-repo-check',
-    ...isolatedSessionArgv(options.disabledSkillPaths),
+    ...sandboxed ? projectSandboxArgv({ shellNetwork: options.shellNetwork === true }) : [],
+    ...userMcpArgv(options.externalMcpServers),
     ...nativeMcpArgv(options.nativeTools),
     '--output-schema',
     options.schemaPath,
@@ -145,9 +149,12 @@ export function buildAutonomousArgv(options: AutonomousArgvOptions): string[] {
     '--json'
   );
   appendModelOptions(argv, options.model, options.reasoningEffort);
-  if (options.sessionId !== null && options.sessionId.trim() !== '') argv.push(options.sessionId.trim());
-  const fullPrompt = `${options.instructions}\n\nUSER REQUEST\n${options.prompt}`;
-  appendPromptAndImages(argv, fullPrompt, options.imagePaths);
+  for (const imagePath of options.imagePaths) argv.push('--image', imagePath);
+  // Positionals follow `--`, so neither the session id nor the prompt can read as a flag.
+  argv.push('--');
+  if (sessionId !== null) argv.push(sessionId);
+  const network = sandboxed && options.shellNetwork ? `\n\nSHELL NETWORK\n${AGENT_SHELL_NETWORK_INSTRUCTIONS}` : '';
+  argv.push(`${options.instructions}${network}\n\nUSER REQUEST\n${options.prompt}`);
   return argv;
 }
 

@@ -15,7 +15,11 @@ import {
 import { isRecord, isString } from '../../shared/guards';
 import { EXTENSION_ID } from '../../shared/extensions';
 import { forkBuiltinExtension } from '../extensions/fork';
-import { POWERMOVE_AGENT_TOOLS, type NativeMcpServerConfig } from './spec';
+import { POWERMOVE_AGENT_TOOLS, POWERMOVE_APP_AGENT_TOOLS, POWERMOVE_STORE_TOOL_NAMES, type NativeMcpServerConfig } from './spec';
+import type { StoreAgentGateway, StoreInstallInput, StorePublishInput, StoreSearchInput } from '../cloud/store-agent';
+import { userInput, type UserInput } from '../user-input';
+
+const STORE_TOOL_NAMES = new Set<string>(POWERMOVE_STORE_TOOL_NAMES);
 
 const TOOL_TIMEOUT_MS = 120_000;
 const MAX_SOCKET_REQUEST_BYTES = 2 * 1024 * 1024;
@@ -60,6 +64,7 @@ export class PowermoveAgentToolSession {
     readonly owner: WebContents,
     readonly baseRevision: number,
     readonly token: string,
+    readonly context: 'app' | 'project',
     private readonly bridge: PowermoveAgentToolBridge,
     mcpConfig: NativeMcpServerConfig,
     private readonly resolveStagingDirectory?: (forkId: string) => Promise<string>
@@ -115,8 +120,14 @@ export interface PowermoveAgentToolBridgeOptions {
   /** Test/embedding seam. Production infers this from mcpServerPath. */
   resourcesDir?: string;
   command?: string;
+  /** Fixed Electron app entrypoint; omitted for standalone Node embeddings. */
+  commandArgs?: string[];
   timeoutMs?: number;
   stageForkRebase?(options: { forkId: string; stagingDirectory: string }): Promise<unknown>;
+  /** The Store as the agent uses it; absent when cloud is unconfigured. */
+  storeAgent?: StoreAgentGateway | null;
+  /** Test seam: the app windows' input record. */
+  userInput?: Pick<UserInput, 'drive'>;
 }
 
 export class PowermoveAgentToolBridge {
@@ -141,6 +152,7 @@ export class PowermoveAgentToolBridge {
     runId: string;
     owner: WebContents;
     baseRevision: number;
+    context?: 'app' | 'project';
     resolveStagingDirectory?: (forkId: string) => Promise<string>;
   }): Promise<PowermoveAgentToolSession> {
     if (!REQUEST_ID.test(options.runId)) throw new Error('Invalid agent tool run id.');
@@ -149,9 +161,9 @@ export class PowermoveAgentToolBridge {
     const token = randomBytes(32).toString('hex');
     const mcpConfig: NativeMcpServerConfig = {
       command: this.options.command ?? process.execPath,
-      args: [this.options.mcpServerPath],
+      args: this.options.commandArgs ?? [this.options.mcpServerPath],
       env: {
-        ELECTRON_RUN_AS_NODE: '1',
+        ...(this.options.commandArgs ? {} : { ELECTRON_RUN_AS_NODE: '1' }),
         POWERMOVE_AGENT_TOOL_PORT: String(port),
         POWERMOVE_AGENT_TOOL_TOKEN: token,
         POWERMOVE_AGENT_RUN_ID: options.runId,
@@ -163,6 +175,7 @@ export class PowermoveAgentToolBridge {
       options.owner,
       Math.max(0, Math.trunc(options.baseRevision)),
       token,
+      options.context ?? 'project',
       this,
       mcpConfig,
       options.resolveStagingDirectory
@@ -185,6 +198,12 @@ export class PowermoveAgentToolBridge {
     this.server = null;
     this.starting = null;
     if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+
+  /** Seal a live run's completed edits before a steering fallback replaces it. */
+  async finishRun(runId: string, commit: boolean): Promise<AgentToolFinishResult | null> {
+    const session = this.sessionsByRun.get(runId);
+    return session ? await session.finish(commit) : null;
   }
 
   async callRenderer(
@@ -240,7 +259,23 @@ export class PowermoveAgentToolBridge {
     ] };
   }
 
+  /* Chromium takes this input as a person's (transient user activation, and
+     main's own input record), so the window is marked driven by the agent
+     for the whole call: main and the renderer (told before the prepare
+     request, which it reads first) give no person credit until 5 s after. */
   private async computerUsePanel(session: PowermoveAgentToolSession, args: Record<string, unknown>): Promise<AgentToolResponseEvent> {
+    const owner = session.owner;
+    const release = (this.options.userInput ?? userInput).drive(owner);
+    try {
+      owner.send(IPC.agentToolInput, true);
+      return await this.sendPanelInput(session, args);
+    } finally {
+      release();
+      if (!owner.isDestroyed()) owner.send(IPC.agentToolInput, false);
+    }
+  }
+
+  private async sendPanelInput(session: PowermoveAgentToolSession, args: Record<string, unknown>): Promise<AgentToolResponseEvent> {
     const prepared = await this.callRenderer(session, '__prepare_panel_input', args);
     if (!prepared.ok) return prepared;
     const item = prepared.content[0];
@@ -349,7 +384,7 @@ export class PowermoveAgentToolBridge {
       throw new Error('Powermove tool session is not active.');
     }
     if (request.tool === '__list_tools') {
-      return { id: request.id, ok: true, tools: POWERMOVE_AGENT_TOOLS };
+      return { id: request.id, ok: true, tools: session.context === 'app' ? POWERMOVE_APP_AGENT_TOOLS : POWERMOVE_AGENT_TOOLS };
     }
     if (!POWERMOVE_AGENT_TOOLS.some((tool) => tool.name === request.tool)) {
       throw new Error(`Unknown Powermove tool: ${request.tool}`);
@@ -370,6 +405,9 @@ export class PowermoveAgentToolBridge {
   async callTool(session: PowermoveAgentToolSession, tool: string, args: Record<string, unknown>, workspace = ''): Promise<AgentToolResponseEvent> {
     if (session.isClosed() || session.owner.isDestroyed()) throw new Error('Powermove tool session is not active.');
     if (!POWERMOVE_AGENT_TOOLS.some(spec => spec.name === tool)) throw new Error(`Unknown Powermove tool: ${tool}`);
+    if (session.context === 'app' && !POWERMOVE_APP_AGENT_TOOLS.some(spec => spec.name === tool)) {
+      throw new Error('This agent has no project attached. Open a project to use composition tools.');
+    }
     if (tool === 'fork_builtin_extension') {
       const request: ToolSocketRequest = { token: session.token, runId: session.runId, id: null, tool, arguments: args, workspace };
       const result = await this.forkBuiltinExtension(session, request);
@@ -378,6 +416,9 @@ export class PowermoveAgentToolBridge {
         ok: true,
         content: [{ type: 'text', text: JSON.stringify(result) }]
       };
+    }
+    if (STORE_TOOL_NAMES.has(tool)) {
+      return this.callStoreTool(session, tool, args);
     }
     const response = tool === 'stage_fork_rebase'
       ? await this.callStageForkRebase(session, args, workspace)
@@ -388,6 +429,35 @@ export class PowermoveAgentToolBridge {
         : await this.callRenderer(session, tool, args);
     session.noteResponse(response);
     return response;
+  }
+
+  /** Store tools run entirely in main (network/install/publish), never the
+   * renderer, and never touch the live composition — so no revision or
+   * `noteResponse` bookkeeping, like the fork branch. */
+  private async callStoreTool(session: PowermoveAgentToolSession, tool: string, args: Record<string, unknown>): Promise<AgentToolResponseEvent> {
+    const store = this.options.storeAgent;
+    if (!store) throw new Error('The Powermove Store is unavailable in this run (the app may be offline or signed out).');
+    const result = await this.dispatchStoreTool(store, tool, args);
+    return {
+      runId: session.runId, callId: `tool-${randomUUID()}`,
+      ok: true,
+      content: [{ type: 'text', text: JSON.stringify(result ?? { ok: true }) }]
+    };
+  }
+
+  private dispatchStoreTool(store: StoreAgentGateway, tool: string, args: Record<string, unknown>): Promise<unknown> {
+    switch (tool) {
+      case 'store_search': return store.search(args as StoreSearchInput);
+      case 'store_extension': return store.detail(String(args['handle']), String(args['slug']));
+      case 'store_source': return store.source(String(args['releaseId']), args['path'] != null ? String(args['path']) : undefined);
+      case 'store_library': return store.library();
+      case 'store_install': return store.install(args as unknown as StoreInstallInput);
+      case 'store_update': return store.update(String(args['localId']));
+      case 'store_uninstall': return store.uninstall(String(args['localId']));
+      case 'store_publish_prepare': return store.publishPrepare(String(args['localId']));
+      case 'store_publish': return store.publish(args as unknown as StorePublishInput);
+      default: throw new Error(`Unknown Powermove Store tool: ${tool}`);
+    }
   }
 
   private async callStageForkRebase(

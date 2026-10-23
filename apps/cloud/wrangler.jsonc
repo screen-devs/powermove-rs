@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "powermove-cloud",
+  "main": "src/index.ts",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "cloud.trypowermove.com", "custom_domain": true }],
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "alias": { "@better-auth/kysely-adapter": "./src/kysely-unavailable.ts" },
+  "account_id": "98dbb6e46f4901896327e5ff4035d637",
+  "r2_buckets": [
+    { "binding": "OBJECTS", "bucket_name": "powermove-objects" },
+    { "binding": "TARS", "bucket_name": "powermove-tars" },
+    { "binding": "ICONS", "bucket_name": "powermove-icons" }
+  ],
+  "send_email": [{ "name": "EMAIL", "allowed_sender_addresses": ["sign-in@trypowermove.com"] }],
+  "unsafe": { "bindings": [
+    { "name": "RL_UPLOAD", "type": "ratelimit", "namespace_id": "1", "simple": { "limit": 60, "period": 60 } },
+    { "name": "RL_AUTH", "type": "ratelimit", "namespace_id": "2", "simple": { "limit": 10, "period": 60 } },
+    { "name": "RL_ADMIN", "type": "ratelimit", "namespace_id": "3", "simple": { "limit": 120, "period": 60 } }
+  ] },
+  "triggers": { "crons": ["0 */6 * * *"] },
+  // LOCAL_POSTGRES is intentionally unset here. Set it to "1" in .dev.vars only.
+  // ADMIN_ORIGIN is the admin panel (apps/admin); web sign-in hands its token back only there.
+  "vars": { "TURNSTILE_ENABLED": "1", "TURNSTILE_SITE_KEY": "0x4AAAAAAFEFmLgsfY1Hnm3q", "TURNSTILE_CLEARANCE_DAYS": "30", "APP_ORIGIN": "https://cloud.trypowermove.com", "ADMIN_ORIGIN": "https://admin.trypowermove.com", "HANDLE_MAIL_DOMAIN": "users.trypowermove.com", "EMAIL_FROM": "Powermove <sign-in@trypowermove.com>" },
+  "observability": { "enabled": true, "redact_query_string": true }
+}

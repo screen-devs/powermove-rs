@@ -2,6 +2,7 @@ import { CHANNELS_3D } from '../../legacy/core/space-3d';
 import { canAnimateContent, isProperty } from '../../legacy/core/content-properties';
 import { adoptTemporalEase } from '../anim/temporal-ease';
 import { compactEditLog } from '../edit-log';
+import { normalizeCompositions } from '../../legacy/core/compositions';
 import {
   BLEND_MODES,
   TYPE_META,
@@ -44,7 +45,7 @@ const FONT_AXIS_PREFIX = 'fontAxis.';
 const FORBIDDEN_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 const EFFECT_TYPES = new Set([
   'blur', 'motionblurDir', 'sharpen', 'glow', 'color', 'levels', 'duotone', 'grain',
-  'vignette', 'chroma', 'pixelate', 'posterize', 'displace', 'shadow', 'invert'
+  'vignette', 'chroma', 'pixelate', 'posterize', 'displace', 'shadow', 'invert', 'gradient'
 ]);
 
 let nextId = 0;
@@ -67,7 +68,7 @@ function copyRecord(value: unknown): UnknownRecord {
 
 function normalizeFill(value: unknown, fallback = '#000000'): Fill {
   const color = (candidate: unknown): string =>
-    typeof candidate === 'string' && /^#[0-9a-f]{6}$/i.test(candidate)
+    typeof candidate === 'string' && /^#[0-9a-f]{6}(?:[0-9a-f]{2})?$/i.test(candidate)
       ? candidate.toUpperCase()
       : fallback;
   const raw = isRecord(value) ? value : {};
@@ -192,7 +193,7 @@ function sanitizeEffect(raw: unknown): Effect | null {
 function isTransitionParamValue(value: unknown): value is ChannelValue {
   return typeof value === 'number' && Number.isFinite(value)
     || typeof value === 'boolean'
-    || typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value);
+    || typeof value === 'string' && /^#[0-9a-f]{6}(?:[0-9a-f]{2})?$/i.test(value);
 }
 
 function sanitizeTransitionChannel(raw: unknown): Channel {
@@ -368,6 +369,10 @@ function staticContentFor(type: LayerType, raw: unknown, comp: Pick<Comp, 'w' | 
           ? source.shape as (typeof shapes)[number] : 'rect',
         color: stringOr(source.color, '#E8E2CF'), w: finite(source.w, 480), h: finite(source.h, 480),
         radius: finite(source.radius, 24), stroke: finite(source.stroke),
+        ...(source.independentCorners ? { independentCorners: true } : {}),
+        ...Object.fromEntries(['radiusTL', 'radiusTR', 'radiusBR', 'radiusBL', 'smoothing']
+          .filter(key => source[key] !== undefined && !isProperty(source[key]))
+          .map(key => [key, key === 'smoothing' ? Math.min(100, Math.max(0, finite(source[key]))) : Math.max(0, finite(source[key]))])),
         strokeColor: stringOr(source.strokeColor, '#ffffff'), points: finite(source.points, 5)
       };
     }
@@ -385,6 +390,7 @@ function staticContentFor(type: LayerType, raw: unknown, comp: Pick<Comp, 'w' | 
         fit: source.fit === 'contain' || source.fit === 'stretch' ? source.fit : 'cover',
         trim: finite(source.trim), speed: finite(source.speed, 1),
         embeddedAudio: source.embeddedAudio === true,
+        audioMuted: source.audioMuted === true,
         w: finite(source.w, 1920), h: finite(source.h, 1080)
       };
     case 'audio':
@@ -519,7 +525,7 @@ function sanitizeParams(raw: unknown): Record<string, SceneParam> {
     else if (control === 'color') {
       output[key] = {
         ...common, control,
-        value: typeof value.value === 'string' && /^#[0-9a-f]{6}$/i.test(value.value)
+        value: typeof value.value === 'string' && /^#[0-9a-f]{6}(?:[0-9a-f]{2})?$/i.test(value.value)
           ? value.value : '#FF6B1A'
       };
     } else if (control === 'select') {
@@ -662,6 +668,7 @@ export function sanitizeProject(raw: unknown): Project {
       if (comp) project.comps[id] = comp;
     }
   }
+  normalizeCompositions(project, uid);
   project.layers = Array.isArray(source.layers)
     ? source.layers.map((layer, index) => sanitizeLayer(layer, index, project))
     : [];
@@ -676,7 +683,7 @@ export function sanitizeProject(raw: unknown): Project {
   }
   for (const layer of project.layers) {
     if (layer.parent && !ids.has(layer.parent)) layer.parent = null;
-    if (layer.type === 'precomp' && (!layer.d.comp || !project.comps[layer.d.comp])) layer.d.comp = null;
+    if (layer.type === 'precomp' && (!layer.d.comp || (layer.d.comp !== project.compId && !project.comps[layer.d.comp]))) layer.d.comp = null;
   }
   for (const comp of Object.values(project.comps)) {
     const compIds = new Set(comp.layers.map(layer => layer.id));

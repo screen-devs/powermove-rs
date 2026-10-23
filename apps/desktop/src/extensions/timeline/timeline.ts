@@ -3,6 +3,9 @@ import { layerDrop } from './layer-drop';
 import { graphSample, velocityDialog, scaleGraphDialog } from './graph-controls';
 import { temporalKeys, type KernelEvents, type PowermoveAPI, type Space3DAPI } from 'powermove';
 import { createGraphSampleCache } from './graph-sample-cache';
+import { createTextStagger, type StaggerHit } from './text-stagger';
+import { createDirectionalSnapper, drawDirectionalSnapGuide } from './directional-snap';
+import { graphAxisColor, graphValueTicks, graphKeyShape, graphPlotTop } from './graph-presentation';
 import { adjacentKeyframe } from './keyframe-navigation';
 import { draggedPropertyValue, propertyMetadata } from './property-values';
 import { element, iconNode, normalizeTimelineChrome, selectedLayers } from './api-helpers';
@@ -19,11 +22,16 @@ import {
 } from './bezier-drag';
 import {
   graphSelectionBounds,
+  graphTransformCursor,
+  graphTransformHandleAtPoint,
+  graphTransformHandles,
   planGraphKeyframeMove,
+  planGraphKeyframeScale,
   pointInGraphSelection,
   resolveGraphTarget,
   selectionAfterKeyGesture,
   selectionAfterMarquee,
+  type GraphTransformHandle,
 } from './graph-selection';
 
 export interface KeyframeMoveSnapshotItem<Property = unknown> {
@@ -113,13 +121,13 @@ export function propertyValueColumns(
   });
 }
 
-export function toggleTimelineDisclosure(api: PowermoveAPI, layer: any): boolean {
+export function toggleTimelineDisclosure(api: PowermoveAPI, layer: any, wasCollapsed = layer.type === 'group'
+  ? api.uiState.getGroupCollapsed(layer) : api.uiState.getLayerCollapsed(layer)): boolean {
+  const collapsed = !wasCollapsed;
   if (layer.type === 'group') {
-    const collapsed = !api.uiState.getGroupCollapsed(layer);
     api.uiState.setGroupCollapsed(layer, collapsed);
     return collapsed;
   }
-  const collapsed = !api.uiState.getLayerCollapsed(layer);
   layer.collapsed = collapsed;
   api.uiState.setLayerCollapsed(layer, collapsed);
   return collapsed;
@@ -130,6 +138,63 @@ export function toggleTimelineScaleLink(api: PowermoveAPI, layer: any): void {
     { type: 'set_layer', target: layer.id, patch: { scaleLinked: !layer.scaleLinked } },
     { label: 'Link scale axes', origin: 'timeline' },
   );
+}
+
+function translateTimelinePropertyPath(primary: any, target: any, path: string): string | null {
+  if (path.startsWith('c.')) return path;
+  if (path.startsWith('l.')) return target.type === 'audio' && path !== 'l.on' ? null : path;
+  if (target.p?.[path]) return path;
+  if (path.startsWith('u.') || path.startsWith('x.')) {
+    return primary.type === target.type
+      && (primary.type !== 'extension' || primary.d?.definition === target.d?.definition) ? path : null;
+  }
+  if (/^(g|mp|ta|ts)\./.test(path)) return primary.id === target.id ? path : null;
+  if (path.startsWith('m.')) {
+    const [, id, ...rest] = path.split('.');
+    const index = primary.masks?.findIndex((mask: any) => mask.id === id) ?? -1;
+    return index >= 0 && target.masks?.[index] ? `m.${target.masks[index].id}.${rest.join('.')}` : null;
+  }
+  const [id, ...rest] = path.split('.');
+  const index = primary.fx?.findIndex((effect: any) => effect.id === id) ?? -1;
+  return index >= 0 && target.fx?.[index]?.type === primary.fx[index]?.type
+    ? `${target.fx[index].id}.${rest.join('.')}`
+    : null;
+}
+
+/** Resolve a timeline property row across the active layer selection with the
+ * same ownership, compatibility and lock rules used by the Properties panel. */
+export function timelinePropertyTargets(api: PowermoveAPI, row: any, space: Pick<Space3DAPI, 'CHANNELS_3D'> = api.space3d) {
+  const selectedIds = new Set(api.selection.layers());
+  const selected = api.selection.layers()
+    .map(id => api.model.layer(id))
+    .filter((layer): layer is NonNullable<typeof layer> => !!layer)
+    .filter(layer => !api.groups.ancestors(layer).some(group => selectedIds.has(group.id)));
+  const layers = selected.some(layer => layer.id === row.L.id) ? selected : [row.L];
+  return layers.filter(layer => !layer.lock).flatMap(layer => trackChannels(row).flatMap((axis: any) => {
+    const path = translateTimelinePropertyPath(row.L, layer, axis.key);
+    if (!path) return [];
+    const prop = api.anim.findProp(layer, path) ?? timelineProperties(api, layer, space)
+      .flatMap((item: any) => trackChannels(item))
+      .find((item: any) => item.key === path)?.prop;
+    return prop ? [{ layer, path, prop }] : [];
+  }));
+}
+
+export function toggleTimelinePropertyKeys(api: PowermoveAPI, row: any, space: Pick<Space3DAPI, 'CHANNELS_3D'> = api.space3d) {
+  const targets = timelinePropertyTargets(api, row, space);
+  const time = api.transport.time();
+  const remove = targets.length > 0 && targets.every(target => api.anim.hasKeyAt(target.layer, target.prop, time));
+  api.history.do(remove ? 'Remove keyframe' : 'Add keyframe', () => {
+    for (const target of targets) {
+      const at = api.anim.hasKeyAt(target.layer, target.prop, time);
+      if (remove && at) api.anim.removeKey(target.prop, at);
+      else if (!at) {
+        const value = api.anim.evP(target.layer, target.prop, time, target.path);
+        if (value != null) api.anim.setKeyOn(target.prop, time - target.layer.from, value, 'linear', api.project.get().fps);
+      }
+    }
+  });
+  return targets;
 }
 
 /** Distribute one pointer delta across an ordered set of groups. The first
@@ -147,8 +212,8 @@ export function planQuickOffsetTiming(
   for (const item of items) {
     const factor = item.offsetIndex / (totalGroups - 1);
     if (!(factor > 0) || !Number.isFinite(item.time)) continue;
-    const minTime = Number.isFinite(item.minTime) ? item.minTime! : 0;
-    total = Math.max(total, (minTime - item.time) / factor);
+    const minTime = item.minTime ?? 0;
+    if (Number.isFinite(minTime)) total = Math.max(total, (minTime - item.time) / factor);
     if (Number.isFinite(item.maxTime)) total = Math.min(total, (item.maxTime! - item.time) / factor);
   }
   if (Object.is(total, -0)) total = 0;
@@ -235,6 +300,93 @@ export function resolveKeyframeGroupSnap(
     if (next < distance) { distance = next; lock = { anchor, target }; }
   }
   return lock ? { delta: lock.target - lock.anchor, lock } : { delta: rawDelta, lock: null };
+}
+
+const FRAME_EPSILON = 1e-6;
+
+/** First frame at which a strip is visible (its in edge, rounded up to a frame). */
+export function firstFrameTime(from: number, fps: number): number {
+  const rate = Math.max(1, fps);
+  return Math.ceil(from * rate - FRAME_EPSILON) / rate;
+}
+
+/** Last frame at which a strip is visible. A strip covers [from, from + dur),
+    so the out edge itself is already the first frame *after* the strip. */
+export function lastFrameTime(from: number, dur: number, fps: number): number {
+  const rate = Math.max(1, fps);
+  const first = firstFrameTime(from, rate);
+  return Math.max(first, (Math.ceil((from + dur) * rate - FRAME_EPSILON) - 1) / rate);
+}
+
+export interface PlayheadSnapInput {
+  fps: number;
+  dur: number;
+  work?: number[] | null;
+  markers?: Array<{ t: number }>;
+  layers: Array<{ from: number; dur: number; keys?: number[] }>;
+}
+
+/** Frame-aligned times the playhead may snap to. Strips contribute their first
+    and last *visible* frame rather than the exclusive out edge, so a snapped
+    playhead always lands on a frame that actually shows the strip. */
+export function playheadSnapTargets(input: PlayheadSnapInput): number[] {
+  const rate = Math.max(1, input.fps);
+  const frame = (time: number) => Math.round(time * rate) / rate;
+  const targets = new Set<number>([0, lastFrameTime(0, input.dur, rate)]);
+  for (const time of input.work ?? []) if (Number.isFinite(time)) targets.add(frame(time));
+  for (const marker of input.markers ?? []) if (Number.isFinite(marker.t)) targets.add(frame(marker.t));
+  for (const layer of input.layers) {
+    if (!(layer.dur > 0)) continue;
+    targets.add(firstFrameTime(layer.from, rate));
+    targets.add(lastFrameTime(layer.from, layer.dur, rate));
+    for (const key of layer.keys ?? []) if (Number.isFinite(key)) targets.add(frame(layer.from + key));
+  }
+  return [...targets].filter(Number.isFinite).sort((a, b) => a - b);
+}
+
+export interface EdgeSnapProbe { time: number; edge: 'in' | 'out' }
+export interface EdgeSnapTarget {
+  time: number;
+  /** Restrict the target to one kind of probe; omitted matches both. */
+  edge?: 'in' | 'out';
+  /** Above 1 makes a target win over nearer, lower-weight neighbours. */
+  weight?: number;
+}
+export interface EdgeSnapLock { probe: number; target: number }
+export interface EdgeSnapResolution { delta: number; lock: EdgeSnapLock | null }
+
+/** Snap a rigid set of strip edges. Every moving edge is tested against every
+    target; the closest weighted match wins. Once acquired, the lock survives
+    until the pointer leaves the wider release radius, so neighbouring targets
+    cannot make the strip chatter. A snapped delta is exact (`target - probe`),
+    and callers must not frame-round it again. */
+export function resolveEdgeSnap(
+  probes: EdgeSnapProbe[], requestedDelta: number, targets: EdgeSnapTarget[], tolerance: number,
+  locked: EdgeSnapLock | null = null, releaseTolerance = tolerance * 1.5,
+): EdgeSnapResolution {
+  const raw = Number.isFinite(requestedDelta) ? requestedDelta : 0;
+  const acquire = Math.max(0, Number.isFinite(tolerance) ? tolerance : 0);
+  const release = Math.max(acquire, Number.isFinite(releaseTolerance) ? releaseTolerance : acquire);
+  if (locked) {
+    const probe = probes[locked.probe];
+    if (probe && Math.abs(probe.time + raw - locked.target) <= release) {
+      return { delta: locked.target - probe.time, lock: locked };
+    }
+  }
+  let found: EdgeSnapLock | null = null;
+  let best = Infinity;
+  for (let index = 0; index < probes.length; index++) {
+    const probe = probes[index]!;
+    if (!Number.isFinite(probe.time)) continue;
+    for (const target of targets) {
+      if (!Number.isFinite(target.time) || (target.edge && target.edge !== probe.edge)) continue;
+      const distance = Math.abs(probe.time + raw - target.time);
+      if (distance > acquire + Number.EPSILON) continue;
+      const score = distance / Math.max(0.1, target.weight ?? 1);
+      if (score < best) { best = score; found = { probe: index, target: target.time }; }
+    }
+  }
+  return found ? { delta: found.target - probes[found.probe]!.time, lock: found } : { delta: raw, lock: null };
 }
 
 export type KeyframeContextEntry = { key: { i?: string }; prop: unknown };
@@ -346,6 +498,19 @@ export function pickKeyframeHit<T extends { i?: string }>(
   return hits.find((key) => keyMembers(key).some(member => selected.has(member.key.i))) || hits[0]!;
 }
 
+const GRAPH_POINT_HIT = 8;
+const GRAPH_HANDLE_HIT = 7;
+/** Bias for overlapping graph targets: a key point outranks a handle unless the
+    handle is clearly the closer target. Handles collapse onto their key on flat
+    or near-vertical segments, where grabbing the handle silently reshapes the
+    curve instead of moving the key the user aimed at. */
+const GRAPH_POINT_BIAS = 4;
+export function preferGraphPoint(pointDistance: number, handleDistance: number): boolean {
+  if (!(pointDistance < GRAPH_POINT_HIT)) return false;
+  if (!(handleDistance < GRAPH_HANDLE_HIT)) return true;
+  return handleDistance + GRAPH_POINT_BIAS >= pointDistance;
+}
+
 export const timelinePanelOptions = {
   title: 'Timeline', flush: true, noscroll: true, headless: true, size: 340, moveSlot: '#tl-head',
   library: { width: 800, height: 440 },
@@ -383,12 +548,13 @@ const T: any = previous || {
 /* Built-in extensions activate after project hydration. Restore the current
    project session here, matching the former app bootstrap path that ran after
    the legacy timeline installer. */
-const sessionTimeline = previous ?? api.storage.get<{ pps?: number; scrollT?: number; scrollY?: number; graph?: boolean }>(`session:${api.project.get().id}`);
+const sessionTimeline = previous ?? api.storage.get<{ pps?: number; scrollT?: number; scrollY?: number; graph?: boolean; graphCombined?: boolean }>(`session:${api.project.get().id}`);
 if (sessionTimeline) {
   T.pps = Number.isFinite(sessionTimeline.pps) ? sessionTimeline.pps : T.pps;
   T.scrollT = Number.isFinite(sessionTimeline.scrollT) ? sessionTimeline.scrollT : T.scrollT;
   T.scrollY = Number.isFinite(sessionTimeline.scrollY) ? sessionTimeline.scrollY : T.scrollY;
   T.graph = !!sessionTimeline.graph;
+  T.graphCombined = !!sessionTimeline.graphCombined;
 }
 runtimes.set(api, T);
 mountedRuntime = T;
@@ -416,6 +582,10 @@ let resizeObserver: ResizeObserver | null = null;
 let disposed = false;
 let shiftHeld = false;
 let refreshActiveScrub: (() => void) | null = null;
+// Pointer feedback remains continuous; the transport still selects project frames.
+let scrubPresentationTime: number | null = null;
+const playheadTime = () => scrubPresentationTime ?? api.transport.time();
+const textStagger = createTextStagger(api);
 
 function listen(target: any, event: string, handler: any, options?: any, bucket = runtimeCleanups) {
   target?.addEventListener?.(event, handler, options);
@@ -439,13 +609,23 @@ function scheduleTimer(fn: () => void, delay: number) {
   timerIds.add(id);
   return id;
 }
-let drawPending = false;
+let backdrop: HTMLCanvasElement | null = null;
+let backdropKey: unknown[] | null = null;
+let backdropDirty = true;
+let timePaintPending = false;
+function releaseBackdrop() {
+  if (backdrop) { backdrop.width = 0; backdrop.height = 0; }
+  backdrop = null; backdropKey = null;
+}
+function invalidateTime() {
+  timePaintPending = true;
+  api.transport.invalidate('timeline');
+}
 function invalidate(what?: string) {
+  // The host already coalesces timeline paints on RAF. Scheduling another
+  // local draw paints every playback/scrub frame twice.
+  if (what == null || what === 'timeline') backdropDirty = true;
   api.transport.invalidate(what);
-  if ((what == null || what === 'timeline') && T.cv && !drawPending) {
-    drawPending = true;
-    scheduleFrame(() => { drawPending = false; draw(); });
-  }
 }
 function evaluatedValue(layer: any, value: any, time: number, path: string): any {
   return value && typeof value === 'object' && Array.isArray(value.kf) && 'v' in value
@@ -476,6 +656,8 @@ listen(window, 'keyup', (event: KeyboardEvent) => {
   if (event.key === 'Shift') updateShiftHeld(false);
 }, true);
 listen(window, 'blur', () => updateShiftHeld(false), undefined);
+const SNAP_ACQUIRE_PX = 10;
+const SNAP_RELEASE_PX = 15;
 function shiftSnapping(event?: any) {
   return shiftHeld || !!event?.shiftKey || !!event?.getModifierState?.('Shift');
 }
@@ -492,6 +674,7 @@ function beginDrag(event: any, options: any) {
 function disposeRuntime() {
   if (disposed) return;
   disposed = true;
+  releaseBackdrop();
   [...activeDrags].forEach((control) => control?.cancel?.()); activeDrags.clear();
   runCleanups(canvasCleanups);
   runCleanups(headCleanups);
@@ -499,7 +682,7 @@ function disposeRuntime() {
   resizeObserver?.disconnect(); resizeObserver = null;
   frameIds.forEach((id) => window.cancelAnimationFrame?.(id)); frameIds.clear();
   timerIds.forEach((id) => window.clearTimeout?.(id)); timerIds.clear();
-  api.storage.set(`session:${api.project.get().id}`, { pps: T.pps, scrollT: T.scrollT, scrollY: T.scrollY, graph: T.graph });
+  api.storage.set(`session:${api.project.get().id}`, { pps: T.pps, scrollT: T.scrollT, scrollY: T.scrollY, graph: T.graph, graphCombined: T.graphCombined });
   if (T.__timelineRuntimeToken === TIMELINE_RUNTIME_TOKEN) {
     T.__timelineRuntimeDisposed = true;
     T.__timelineRuntimeToken = null;
@@ -566,32 +749,48 @@ function buildHead(head: any) {
   };
   const playBtn = btn('play', () => api.transport.toggle(), 'Play / Pause (Space)');
   const time = h('div#tl-time');
-  const graph = h('button.iconbtn' + (T.graph ? '.on' : ''), { title: 'Graph editor (Shift+F3)' }, iconNode(api, 'bezier'));
-  listen(graph, 'click', () => { T.graph = !T.graph; syncGraphControls(); invalidate('timeline'); }, undefined, headCleanups);
+  const viewButton = (position: string, icon: string, title: string) =>
+    h('button.iconbtn.tl-view-button.' + position, { type: 'button', title, 'aria-label': title }, iconNode(api, icon));
+  const dope = viewButton('first', 'dopeSheet', 'Dope sheet');
+  const both = viewButton('mid', 'dopeGraph', 'Dope sheet and graph');
+  const graph = viewButton('last', 'bezier', 'Graph editor (Shift+F3)');
+  listen(dope, 'click', () => { T.graph = false; syncGraphControls(); invalidate('timeline'); }, undefined, headCleanups);
+  listen(both, 'click', () => { T.graph = true; T.graphCombined = true; syncGraphControls(); invalidate('timeline'); }, undefined, headCleanups);
+  listen(graph, 'click', () => { T.graph = true; T.graphCombined = false; syncGraphControls(); invalidate('timeline'); }, undefined, headCleanups);
   const graphOptions = btn('more', () => api.ui.menu(graphOptions, [
     { label: 'Value graph', on: T.graphType !== 'speed', run: () => { T.graphType = 'value'; invalidate('timeline'); } },
     { label: 'Speed graph', on: T.graphType === 'speed', run: () => { T.graphType = 'speed'; invalidate('timeline'); } },
+    { label: 'Merge selected curves', on: Boolean(T.graphMerge), disabled: (T._graph?.series?.length ?? 0) < 2,
+      run: () => { T.graphMerge = !T.graphMerge; T.graphViewBounds = null; invalidate('timeline'); } },
     { label: 'Fit selected curves', disabled: !T._graph, run: () => {
+      /* Merged curves draw no per-key points, so fall back to the selected
+         series' keys: "fit" still has something to frame. */
       const points = T._graph?.points || [];
-      if (!points.length) return;
-      const times = points.map((point: any) => point.axis.L.from + point.key.t);
+      const times = points.length
+        ? points.map((point: any) => point.axis.L.from + point.key.t)
+        : (T._graph?.series ?? []).flatMap((axis: any) => axis.prop.kf.map((key: any) => axis.L.from + key.t));
+      if (!times.length) return;
       const first = Math.min(...times), last = Math.max(...times);
       T.pps = clamp((T.w - T.gut - 48) / Math.max(1 / api.project.get().fps, last - first), 4, 4000);
       T.scrollT = Math.max(-.4, first - 24 / T.pps);
       T.graphViewBounds = null; invalidate('timeline');
     } },
   ]), 'Graph options');
-  let graphShown: boolean | undefined;
+  let graphShown: string | undefined;
   syncGraphControls = () => {
     const shown = Boolean(T.graph);
-    if (graphShown === shown) return;
-    graphShown = shown;
-    graph.classList.toggle('on', shown);
-    graph.setAttribute('aria-pressed', String(shown));
+    const mode = shown ? (T.graphCombined ? 'both' : 'graph') : 'dope';
+    if (graphShown === mode) return;
+    graphShown = mode;
+    graph.classList.toggle('on', mode === 'graph');
+    for (const [button, active] of [[dope, mode === 'dope'], [both, mode === 'both']] as const) {
+      button.classList.toggle('on', active); button.setAttribute('aria-pressed', String(active));
+    }
+    graph.setAttribute('aria-pressed', String(mode === 'graph'));
     graphOptions.hidden = !shown;
     graphOptions.style.display = shown ? '' : 'none';
   };
-  const graphSlot = h('div.tl-group.tl-graph-slot', graphOptions, graph);
+  const graphSlot = h('div.tl-group.tl-graph-slot', graphOptions, dope, both, graph);
   const transport = h('div.tl-group.tl-transport',
     playBtn,
     time,
@@ -603,7 +802,13 @@ function buildHead(head: any) {
      controls and the draggable timecode remain excluded. */
   listen(head, 'pointerdown', (event: PointerEvent) => {
     const target = event.target as Element | null;
-    if (event.button !== 0 || target?.closest('button,input,select,#tl-time')) return;
+    if (event.button !== 0 || target?.closest('button,input,select')) return;
+    /* Timeline drags prevent Chromium's normal pointer focus change. Release a
+       previously focused editor ourselves so the next Space reaches the
+       global play/pause binding. This must cover the toolbar gutter and
+       draggable timecode as well as the canvas below. */
+    releaseExternalFieldFocus();
+    if (target?.closest('#tl-time')) return;
     const panel = head.closest('.panel[data-panel="timeline"]') as HTMLElement | null;
     const panelHeader = panel?.querySelector(':scope > header');
     if (!panelHeader) return;
@@ -705,6 +910,8 @@ onEvent('layout', () => {
 /* ── row model ─────────────────────────────────────────── */
 let rowsDirty = true;
 let rowsAnimationVersion: number | undefined;
+let rowsUIVersion: number | undefined;
+let rowsSearch: string | undefined;
 let propertyLabelWidth: number | null = null;
 // Selection reveals its ancestor groups without filtering out sibling rows.
 // Only the disclosure control should hide children in an expanded group.
@@ -718,29 +925,43 @@ function revealSelectedAncestors() {
 }
 function buildRows() {
   const animationVersion = api.anim.version();
-  if (!rowsDirty && rowsAnimationVersion === animationVersion && Array.isArray(T.rows)) return T.rows;
+  const uiVersion = api.uiState.timelineVersion?.();
+  if (!rowsDirty && rowsAnimationVersion === animationVersion && rowsUIVersion === uiVersion
+      && rowsSearch === T.search && Array.isArray(T.rows)) return T.rows;
   const rows = [];
   const source = api.project.get().layers;
   const layers: any[] = [];
+  const children = new Map<string | null, any[]>();
+  const sourceIndices = new Map<any, number>();
+  source.forEach((layer: any, index: number) => {
+    const parent = layer.group || null;
+    const siblings = children.get(parent);
+    if (siblings) siblings.push(layer);
+    else children.set(parent, [layer]);
+    if (!sourceIndices.has(layer)) sourceIndices.set(layer, index);
+  });
   const seen = new Set<string>();
-  const visit = (parent: string | null) => {
-    for (const layer of source) {
-      if ((layer.group || null) !== parent || seen.has(layer.id)) continue;
-      seen.add(layer.id); layers.push(layer);
-      if (layer.type === 'group') visit(layer.id);
+  // Iterative depth-first traversal preserves sibling order without rescanning
+  // the project for each group or consuming the call stack for deep nesting.
+  const pending = [...(children.get(null) || [])].reverse();
+  while (pending.length) {
+    const layer = pending.pop();
+    if (seen.has(layer.id)) continue;
+    seen.add(layer.id); layers.push(layer);
+    if (layer.type === 'group') {
+      const siblings = children.get(layer.id) || [];
+      for (let i = siblings.length - 1; i >= 0; i--) pending.push(siblings[i]);
     }
-  };
-  visit(null);
+  }
   for (const layer of source) if (!seen.has(layer.id)) layers.push(layer);
+  const query = String(T.search || '').trim().toLowerCase();
   for (let i = 0; i < layers.length; i++) {
     const L = layers[i];
     const ancestors = api.groups.ancestors(L) || [];
     if (!T.search && ancestors.some((group: any) => api.uiState.getGroupCollapsed(group))) continue;
-    if (L.shy && !T.showShy) continue;
-    const query = String(T.search || '').trim().toLowerCase();
     const matching = query ? visibleProps(L).filter((p: any) => String(p.label).toLowerCase().includes(query)) : [];
     if (query && !L.name.toLowerCase().includes(query) && !matching.length) continue;
-    rows.push({ kind: 'layer', L, i: source.indexOf(L), depth: ancestors.length });
+    rows.push({ kind: 'layer', L, i: sourceIndices.get(L), depth: ancestors.length });
     if (!api.uiState.getLayerCollapsed(L) || query) {
       const props = query && matching.length ? matching : visibleProps(L);
       props.forEach((p: any) => rows.push({ kind: 'prop', L, ...p }));
@@ -749,6 +970,9 @@ function buildRows() {
   T.rows = rows;
   rowsDirty = false;
   rowsAnimationVersion = animationVersion;
+  // Initial disclosure reads may initialize side tables during the build.
+  rowsUIVersion = api.uiState.timelineVersion?.();
+  rowsSearch = T.search;
   propertyLabelWidth = null;
   return rows;
 }
@@ -761,17 +985,26 @@ const t2x = (t: any) => T.gut + (t - T.scrollT) * T.pps;
 /* Unshifted row geometry. While a media drag is over the canvas, rows at or
    below the insertion slot move down one row so the ghost lands in a real
    gap: a new layer strip, never on top of an existing one. */
-const rawRowY = (idx: any) => Math.round(T.ruler + idx * T.row - T.scrollY);
+const rawRowY = (idx: any) => T.ruler + idx * T.row - T.scrollY;
 const rowShift = (idx: any) => T.drop && !T.graph && idx >= T.drop.rowIdx ? 1 : 0;
 const rowY = (idx: any) => rawRowY(idx + rowShift(idx));
+const graphTop = () => graphPlotTop(T.ruler, T.hgt, Boolean(T.graphCombined), T.graphSplit);
+const inGraph = (x: number, y: number) => Boolean(T.graph && x >= T.gut && y >= graphTop());
 
 /* ── draw ──────────────────────────────────────────────── */
 onEvent('project:changed', () => { rowsDirty = true; invalidate('timeline'); });
-// Host-side invalidations (reveal, collapse, history and selection restore)
-// arrive as a coalesced 'timeline' repaint request; rows depend on UI state,
-// so they are rebuilt, not just repainted.
-onEvent('invalidate', (what) => { if (what === 'timeline') { rowsDirty = true; draw(); } });
-onEvent('time', () => invalidate('timeline'));
+// A time-only repaint reuses rows. Disclosure/reveal and animation revisions
+// retire them independently; older hosts retain the conservative rebuild.
+onEvent('invalidate', (what) => {
+  if (what !== 'timeline') return;
+  // Unexplained host repaints (for example waveform completion while paused)
+  // refresh the backdrop. Time and trail frames have an explicit cheap path.
+  if (!timePaintPending) backdropDirty = true;
+  timePaintPending = false;
+  if (!api.uiState.timelineVersion) rowsDirty = true;
+  draw();
+});
+onEvent('time', invalidateTime);
 onEvent('selection', () => {
   revealSelectedAncestors();
   buildRows();
@@ -799,7 +1032,17 @@ const refreshTheme = () => {
     line: css('--line') || 'rgba(15,15,20,.09)',
   };
 };
-onEvent('theme:changed', () => { refreshTheme(); refreshInk(); invalidate('timeline'); });
+/* Colors are re-read on the next draw rather than inside the event: listeners
+   run in registration order and the document may not have finished switching
+   when this one fires. The attribute observer covers system-appearance
+   changes, which flip data-theme without a kernel event. */
+const invalidateTheme = () => { theme = null; invalidate('timeline'); };
+onEvent('theme:changed', invalidateTheme);
+if (typeof MutationObserver === 'function') {
+  const themeObserver = new MutationObserver(invalidateTheme);
+  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme', 'data-timeline-surfaces', 'style'] });
+  runtimeCleanups.push(() => themeObserver.disconnect());
+}
 
 /* Ink-on-paper colors for canvas chrome. Light theme uses black alpha;
    dark theme uses white alpha — resolved on every theme refresh. */
@@ -820,6 +1063,55 @@ function draw() {
 }
 type TimelinePreviewTarget = { canvas: HTMLCanvasElement; width: number; height: number };
 
+function visibleRowRange(): [number, number] {
+  // Include the partially visible rows and the extra drop insertion slot.
+  return [Math.max(0, Math.floor(T.scrollY / T.row) - 1),
+    Math.min(T.rows.length, Math.ceil((T.scrollY + T.hgt - T.ruler) / T.row) + 1)];
+}
+
+function animatedTimelineFlag(value: any): boolean {
+  return !!value && typeof value === 'object' && !!(value.kf?.length || value.expr);
+}
+
+function timelineBackdropKey(): unknown[] | null {
+  // Graph curves and active drag adornments keep their full drawing path.
+  // One bounded viewport bitmap is sufficient; no frame history is retained.
+  if (T.graph || T.drop || T.reorder || T.marquee || T.quickOffset || !api.uiState.timelineVersion
+      || T.cv.width * T.cv.height * 4 > 32 * 1024 * 1024) return null;
+  const p = api.project.get();
+  const key: unknown[] = [T.cv, T.ctx, T.cv.width, T.cv.height, T.w, T.hgt, T.dpr,
+    T.rows, T.gut, T.row, T.ruler, T.pps, T.scrollT, T.scrollY, T.hoverRow, T.dropRow,
+    T.style.clipRadius, T.style.keyframeSize, T.style.showLayerNumbers, T.style.showTypeBadges,
+    theme, p, p.dur, p.fps, p.work?.[0], p.work?.[1], api.project.revision(),
+    api.anim.version(), api.uiState.timelineVersion()];
+  const [first, end] = visibleRowRange();
+  for (let i = first; i < end; i++) {
+    const row = T.rows[i];
+    if (row.kind !== 'layer') continue;
+    // Clip opacity itself can be animated; do not reuse those source pixels.
+    if (animatedTimelineFlag(row.L.on)) return null;
+    if (row.L.type === 'audio') {
+      const asset: any = api.media.assets.get(row.L.d?.asset);
+      // Decoding can finish between two time ticks, without a project edit.
+      key.push(asset?.peaks, asset?.peaks?.length, asset?.dur, asset?.audioDecodeError);
+    }
+  }
+  return key;
+}
+
+function rememberBackdrop(key: unknown[] | null) {
+  if (!key) { releaseBackdrop(); return; }
+  backdrop ??= document.createElement('canvas');
+  if (backdrop.width !== T.cv.width) backdrop.width = T.cv.width;
+  if (backdrop.height !== T.cv.height) backdrop.height = T.cv.height;
+  const context = backdrop.getContext('2d');
+  if (!context) { releaseBackdrop(); return; }
+  context.globalCompositeOperation = 'copy';
+  context.drawImage(T.cv, 0, 0);
+  backdropKey = key;
+  backdropDirty = false;
+}
+
 function drawInner(preview?: TimelinePreviewTarget) {
   if (!preview) refreshTimelineManifest();
   /* Re-resolve the live canvas every frame: workspace rebuilds can replace the
@@ -839,7 +1131,7 @@ function drawInner(preview?: TimelinePreviewTarget) {
     /* Unconditional size sync: measure the wrap every draw so the bitmap always
        matches the laid-out size, regardless of missed observer/RAF frames. */
     const host = T.cv && T.cv.parentElement;
-    if (host && (!api.transport.playing() || !T.w || !T.hgt)) {
+    if (host && ((!api.transport.playing() && scrubPresentationTime === null) || !T.w || !T.hgt)) {
       const r = host.getBoundingClientRect();
       if (r.width >= 8 && r.height >= 8) {
         const bw = Math.max(2, Math.round(r.width * T.dpr));
@@ -851,17 +1143,20 @@ function drawInner(preview?: TimelinePreviewTarget) {
     }
   }
   const c = T.ctx; if (!c) return null;
-  if (!theme) refreshTheme();
+  if (!theme) { refreshTheme(); refreshInk(); }
   const p = api.project.get();
   const W = T.w, H = T.hgt;
   c.setTransform(T.dpr, 0, 0, T.dpr, 0, 0);
-  c.fillStyle = theme.panel; c.fillRect(0, 0, W, H);
   buildRows();
   // Column widths are based on full labels, never on the fluctuating values.
   // Keep enough room for both Scale dimensions even at narrow saved gutters.
-  c.font = '400 11px ' + fui();
-  if (propertyLabelWidth == null) propertyLabelWidth = Math.max(64, ...T.rows.filter((row: any) => row.kind === 'prop')
-    .map((row: any) => Math.ceil(c.measureText(row.label).width)));
+  if (propertyLabelWidth == null) {
+    // Setting a Canvas2D font can enter the browser's font/style machinery.
+    // Cached playback does not measure labels, so leave that state untouched.
+    c.font = '400 11px ' + fui();
+    propertyLabelWidth = Math.max(64, ...T.rows.filter((row: any) => row.kind === 'prop')
+      .map((row: any) => Math.ceil(c.measureText(row.label).width)));
+  }
   const labelWidth = propertyLabelWidth;
   T.propertyValueX = 100 + labelWidth + 12;
   T.gut = Math.max(T.gut, T.propertyValueX + 90);
@@ -871,42 +1166,84 @@ function drawInner(preview?: TimelinePreviewTarget) {
     T.pps = Math.max(.01, (W - T.gut - 16) / Math.max(.5, Number(api.project.get().dur) || .5));
   } else syncHeadGeometry();
 
-  const maxScroll = Math.max(0, T.rows.length * T.row - (H - T.ruler));
+  const rowBottom = T.graph && T.graphCombined ? graphTop() : H;
+  const maxScroll = Math.max(0, T.rows.length * T.row - (rowBottom - T.ruler));
   T.scrollY = clamp(T.scrollY, 0, maxScroll);
 
-  /* keep playhead in view while playing (AE follow) */
-  if (api.transport.playing()) {
+  /* Keep the playhead visible by advancing a page at the edge. Pinning it to
+     the edge moved every clip, ruler label and waveform every display tick,
+     defeating retained artwork and making long playback continuously busy. */
+  if (api.transport.playing() && W > T.gut) {
     const px = t2x(api.transport.time());
-    if (px > W - 50) T.scrollT = api.transport.time() - (W - T.gut - 50) / T.pps;
-    else if (px < T.gut) T.scrollT = api.transport.time() - 60 / T.pps;
+    const visibleWidth = W - T.gut;
+    if (px > W - Math.min(50, visibleWidth * .1)) T.scrollT = api.transport.time() - visibleWidth * .2 / T.pps;
+    else if (px < T.gut) T.scrollT = api.transport.time() - visibleWidth * .8 / T.pps;
     T.scrollT = Math.max(-.4, T.scrollT);
   }
 
-  drawTracksBg(c, W, H);
-  if (T.graph) drawGraph(c, W, H);
-  else { drawClips(c, W, H); drawDropGhost(c, W, H); }
-  drawGutter(c, W, H);
-  if (T.reorder) {
-    const d = T.reorder, y = rowY(d.row), left = 74 + Math.min(48, d.depth * 12);
-    c.save(); c.beginPath(); c.rect(0, T.ruler, W, H - T.ruler); c.clip();
-    c.strokeStyle = theme.accent; c.fillStyle = theme.accent; c.lineWidth = 2;
-    if (d.mode === 'inside') {
-      c.fillStyle = rgba(theme.accent, .16); c.fillRect(left - 12, y, W - left + 12, T.row);
-      c.strokeRect(left - 12, y + 1, W - left + 11, T.row - 2);
-    } else {
-      c.beginPath(); c.moveTo(left, y); c.lineTo(W, y); c.stroke();
-      c.beginPath(); c.arc(left, y, 3, 0, Math.PI * 2); c.fill();
+  const backgroundKey = preview ? null : timelineBackdropKey();
+  const reuseBackdrop = !backdropDirty && backdrop && backgroundKey && backdropKey
+    && backgroundKey.length === backdropKey.length && backgroundKey.every((value, i) => value === backdropKey![i]);
+  if (reuseBackdrop && backdrop) {
+    // Match backing pixels exactly even when flex layout has fractional CSS
+    // dimensions; scaling to W/H would soften the entire cached timeline.
+    c.drawImage(backdrop, 0, 0, backdrop.width / T.dpr, backdrop.height / T.dpr);
+    // Only property readouts and animated gutter indicators follow time.
+    if (drawGutter(c, W, H, true)) {
+      // Retain the latest readouts too. Otherwise restoring the backdrop on
+      // the next tick would replace unchanged values with their initial text.
+      const context = backdrop.getContext('2d');
+      const top = Math.max(0, Math.floor(T.ruler * T.dpr));
+      const width = Math.min(backdrop.width, Math.floor(T.gut * T.dpr));
+      const height = backdrop.height - top;
+      if (context && width > 0 && height > 0) {
+        context.globalCompositeOperation = 'source-over';
+        context.drawImage(T.cv, 0, top, width, height, 0, top, width, height);
+      }
     }
-    const label = `${d.mode === 'inside' ? 'Move into' : d.mode === 'before' ? 'Move before' : 'Move after'} ${d.name}`;
-    c.font = '11px system-ui';
-    const width = c.measureText(label).width + 16, top = Math.max(T.ruler + 2, Math.min(H - 24, y - 24));
-    c.fillStyle = theme.accent; c.fillRect(T.gut + 10, top, width, 20);
-    c.fillStyle = '#fff'; c.fillText(label, T.gut + 18, top + 14); c.restore();
+  } else {
+    c.fillStyle = theme.panel; c.fillRect(0, 0, W, H);
+    drawTracksBg(c, W, H);
+    if (T.graph) {
+      if (T.graphCombined) {
+        c.save(); c.beginPath(); c.rect(T.gut, T.ruler, W - T.gut, graphTop() - T.ruler); c.clip();
+        drawClips(c, W, graphTop()); c.restore();
+      }
+      drawGraph(c, W, H);
+    }
+    else { drawClips(c, W, H); drawDropGhost(c, W, H); }
+    drawGutter(c, W, H);
+    if (T.graph) drawGraphReadout(c, W, H);
+    if (T.reorder) {
+      const d = T.reorder, y = rowY(d.row), left = 74 + Math.min(48, d.depth * 12);
+      c.save(); c.beginPath(); c.rect(0, T.ruler, W, H - T.ruler); c.clip();
+      c.strokeStyle = theme.accent; c.fillStyle = theme.accent; c.lineWidth = 2;
+      if (d.mode === 'inside') {
+        c.fillStyle = rgba(theme.accent, .16); c.fillRect(left - 12, y, W - left + 12, T.row);
+        c.strokeRect(left - 12, y + 1, W - left + 11, T.row - 2);
+      } else {
+        c.beginPath(); c.moveTo(left, y); c.lineTo(W, y); c.stroke();
+        c.beginPath(); c.arc(left, y, 3, 0, Math.PI * 2); c.fill();
+      }
+      const label = `${d.mode === 'inside' ? 'Move into' : d.mode === 'before' ? 'Move before' : 'Move after'} ${d.name}`;
+      c.font = '11px system-ui';
+      const width = c.measureText(label).width + 16, top = Math.max(T.ruler + 2, Math.min(H - 24, y - 24));
+      c.fillStyle = theme.accent; c.fillRect(T.gut + 10, top, width, 20);
+      c.fillStyle = '#fff'; c.fillText(label, T.gut + 18, top + 14); c.restore();
+    }
+    drawRuler(c, W, H);
+    if (!preview) rememberBackdrop(backgroundKey ? timelineBackdropKey() : null);
   }
-  drawRuler(c, W, H);
   drawPlayhead(c, W, H);
+  if (T.snapGuide != null) drawDirectionalSnapGuide(c, {
+    x: t2x(T.snapGuide), top: T.ruler, bottom: H, left: T.gut, right: W,
+  }, '#e7c84b');
+  if (T.cv) {
+    if (T.snapGuide != null) T.cv.dataset.snapTarget = String(T.snapGuide);
+    else delete T.cv.dataset.snapTarget;
+  }
   drawQuickOffset(c, W, H);
-  drawScrollThumb(c, W, H, maxScroll);
+  drawScrollThumb(c, W, rowBottom, maxScroll);
   if ((window as any).__tlDebug) {
     const px = t2x(api.transport.time());
     const msg = '[tl] t=' + api.transport.time().toFixed(3) + ' px=' + (isFinite(px) ? px.toFixed(1) : String(px)) + ' gut=' + T.gut + ' W=' + W + ' sT=' + T.scrollT.toFixed(3) + ' pps=' + T.pps + ' rows=' + T.rows.length + ' graph=' + T.graph;
@@ -930,6 +1267,11 @@ function drawInner(preview?: TimelinePreviewTarget) {
 }
 
 T.renderPreview = (canvas: HTMLCanvasElement, width: number, height: number) => {
+  // A library thumbnail shares the renderer, but must not consume the live
+  // canvas's pending row rebuild or claim that its readouts were painted.
+  const savedCache = { rowsDirty, rowsAnimationVersion, rowsUIVersion, rowsSearch, propertyLabelWidth, propertyReadouts };
+  const savedTrail = { ...trail };
+  propertyReadouts = new WeakMap();
   const saved = {
     cv: T.cv, ctx: T.ctx, w: T.w, hgt: T.hgt, dpr: T.dpr,
     gut: T.gut, row: T.row, ruler: T.ruler, pps: T.pps,
@@ -956,6 +1298,8 @@ T.renderPreview = (canvas: HTMLCanvasElement, width: number, height: number) => 
     return drawInner({ canvas, width, height }) || { gutter: T.gut, ruler: T.ruler, pps: T.pps };
   } finally {
     Object.assign(T, saved);
+    ({ rowsDirty, rowsAnimationVersion, rowsUIVersion, rowsSearch, propertyLabelWidth, propertyReadouts } = savedCache);
+    Object.assign(trail, savedTrail);
   }
 };
 
@@ -973,7 +1317,7 @@ function drawScrollThumb(c: any, W: any, H: any, maxScroll: any) {
 /* After expanding/collapsing a layer, scroll just enough to keep the toggled
    row and its newly revealed children inside the viewport (AE behavior). */
 function keepRowsVisible(rowIdx: any, childCount: any) {
-  const viewH = T.hgt - T.ruler;
+  const viewH = (T.graph && T.graphCombined ? graphTop() : T.hgt) - T.ruler;
   if (viewH <= 0) return;
   const top = rowIdx * T.row;
   const bottom = top + (1 + childCount) * T.row;
@@ -997,13 +1341,14 @@ function drawTracksBg(c: any, W: any, H: any) {
   c.strokeStyle = INK.grid; c.lineWidth = 1;
   c.beginPath();
   for (let t = Math.floor(T.scrollT / step) * step; t2x(t) < W; t += step) {
-    const x = Math.round(t2x(t)) + .5;
+    const x = t2x(t) + .5;
     if (x < T.gut) continue;
     c.moveTo(x, T.ruler); c.lineTo(x, H);
   }
   c.stroke();
   /* row stripes + lane hairlines */
-  for (let i = 0; i < T.rows.length; i++) {
+  const [first, end] = visibleRowRange();
+  for (let i = first; i < end; i++) {
     const y = rowY(i);
     if (y + T.row < T.ruler || y > H) continue;
     const r = T.rows[i];
@@ -1042,14 +1387,14 @@ function drawRuler(c: any, W: any, H: any) {
   c.strokeStyle = INK.tick;
   c.beginPath();
   for (let t = Math.floor(T.scrollT / step) * step; t2x(t) < W; t += step) {
-    const x = Math.round(t2x(t)) + .5;
+    const x = t2x(t) + .5;
     if (x >= T.gut - 1) {
       c.moveTo(x, T.ruler - 8); c.lineTo(x, T.ruler);
       c.fillText(fmtRuler(t, step, p.fps), x, WORK_BAR.height + 8);
     }
     /* minor ticks between labeled steps */
     for (let m = 1; m < 4; m++) {
-      const mx = Math.round(t2x(t + step * m / 4)) + .5;
+      const mx = t2x(t + step * m / 4) + .5;
       if (mx > T.gut && mx < W) { c.moveTo(mx, T.ruler - 3); c.lineTo(mx, T.ruler); }
     }
   }
@@ -1084,7 +1429,8 @@ const fmono = () => '"JetBrains Mono","SF Mono",ui-monospace,Menlo,monospace';
 
 function drawClips(c: any, W: any, H: any) {
   c.save(); c.beginPath(); c.rect(T.gut, T.ruler, W - T.gut, H - T.ruler); c.clip();
-  for (let i = 0; i < T.rows.length; i++) {
+  const [first, end] = visibleRowRange();
+  for (let i = first; i < end; i++) {
     const y = rowY(i);
     if (y + T.row < T.ruler || y > H) continue;
     const r = T.rows[i];
@@ -1166,7 +1512,7 @@ function drawAudioClipWaveform(c: any, L: any, { x, y, width, height, color }: a
   const top = 2;
   try {
     if (api.media.audio.drawWaveform(c, L, {
-      x, y: y + top, width, height: height - top - 2, clipLeft, color, placeholderColor: color,
+      x, y: y + top, width, height: height - top - 2, clipLeft, clipRight: T.w, color, placeholderColor: color,
       step: 1, anchor: 1,
     })) {
       c.restore();
@@ -1276,6 +1622,7 @@ function drawClip(c: any, L: any, y: any) {
     c.fill();
   }
   c.restore();
+  if (L.type === 'text') textStagger.draw(c, L, t2x, yy, hh, pal.primary);
   if (L.type === 'audio') drawAudioClipWaveform(c, L, {
     x: x0, y: yy, width: w, height: hh, color: pal.primary,
   });
@@ -1332,16 +1679,54 @@ function drawPropKeys(c: any, r: any, y: any) {
   }
 }
 
-function drawGutter(c: any, W: any, H: any) {
+type PropertyReadout = { dynamic: boolean; values: any[]; valueKeys: Array<number | string>; previous: boolean; next: boolean; current: boolean; animated: boolean };
+let propertyReadouts = new WeakMap<object, PropertyReadout>();
+function propertyReadout(row: any): PropertyReadout {
+  const channels = trackChannels(row), time = api.transport.time();
+  const values = channels.map(axis => api.anim.evP(row.L, axis.prop, time, axis.key));
+  return {
+    dynamic: channels.some(axis => animatedTimelineFlag(axis.prop)),
+    values,
+    // Snapshot array/object readouts too; evaluators may reuse their containers.
+    valueKeys: values.map(value => typeof value === 'number' ? value : String(value).slice(0, 20)),
+    previous: !!row.prop.kf.length && adjacentKeyframe(api, -1, row, space3d) != null,
+    next: !!row.prop.kf.length && adjacentKeyframe(api, 1, row, space3d) != null,
+    animated: channels.some(axis => axis.prop.kf.length > 0),
+    current: channels.some(axis => !!api.anim.hasKeyAt(row.L, axis.prop, time)),
+  };
+}
+function sameReadout(a: PropertyReadout, b: PropertyReadout): boolean {
+  return a.previous === b.previous && a.next === b.next && a.current === b.current
+    && a.valueKeys.length === b.valueKeys.length && a.valueKeys.every((value, i) => Object.is(value, b.valueKeys[i]));
+}
+function drawGutter(c: any, W: any, H: any, dynamicOnly = false): boolean {
+  let changed = false;
+  if (!dynamicOnly) {
   c.fillStyle = theme.panel;
   c.fillRect(0, T.ruler, T.gut, H - T.ruler);
   c.strokeStyle = theme.line; c.beginPath();
   c.moveTo(T.gut - .5, 0); c.lineTo(T.gut - .5, H); c.stroke();
+  }
   c.save(); c.beginPath(); c.rect(0, T.ruler, T.gut, H - T.ruler); c.clip();
-  for (let i = 0; i < T.rows.length; i++) {
+  c.textBaseline = 'middle';
+  const [first, end] = visibleRowRange();
+  for (let i = first; i < end; i++) {
     const y = rowY(i);
     if (y + T.row < T.ruler || y > H) continue;
     const r = T.rows[i];
+    let readout: PropertyReadout | undefined;
+    if (r.kind !== 'layer') {
+      const previous = propertyReadouts.get(r);
+      if (dynamicOnly && previous && !previous.dynamic) continue;
+      readout = propertyReadout(r);
+      if (dynamicOnly && previous && sameReadout(previous, readout)) continue;
+      propertyReadouts.set(r, readout);
+    }
+    if (dynamicOnly) {
+      if (r.kind === 'layer' && !animatedTimelineFlag(r.L.on) && !animatedTimelineFlag(r.L.mblur)) continue;
+      c.fillStyle = theme.panel; c.fillRect(0, y, T.gut - 1, T.row);
+    }
+    changed = true;
     if (r.kind === 'layer') {
       const L = r.L, sel = api.selection.layers().includes(L.id);
       if (sel) { c.fillStyle = INK.over2; c.fillRect(0, y, T.gut, T.row); }
@@ -1373,15 +1758,14 @@ function drawGutter(c: any, W: any, H: any) {
       const iy = y + T.row / 2;
       c.fillStyle = pal.body; roundRect(c, 74 + indent, iy - 8, 16, 16, 3); c.fill();
       c.strokeStyle = pal.ring; c.lineWidth = 1; c.stroke();
-      c.font = '600 8px ' + fui(); c.fillStyle = pal.primary; c.textAlign = 'center';
-      c.fillText((L.type === 'group' ? 'G' : BADGE[L.type] || '·').toUpperCase().slice(0, 1), 82 + indent, iy + .5);
-      c.textAlign = 'left';
+      icoLayerType(c, L.type, 82 + indent, iy, pal.primary);
       c.font = (sel ? '500 ' : '400 ') + '12px ' + fui();
       c.fillStyle = sel ? theme.tx : theme.tx2;
       const hasParentControl = layerSupportsTransform(L.type);
       const showParentControl = hasParentControl && (active || !!L.parent);
       const statusWidth = (L.solo ? 12 : 0) + (evaluatedValue(L, L.mblur, api.transport.time(), 'l.mblur') ? 12 : 0);
-      const nameRight = T.gut - (hasParentControl ? 50 : 12) - statusWidth;
+      const audioX = embeddedAudioToggleX(L);
+      const nameRight = T.gut - (hasParentControl ? 50 : 12) - statusWidth - (audioX == null ? 0 : AUDIO_TOGGLE_WIDTH);
       clipText(c, L.name, 96 + indent, iy, Math.max(0, nameRight - 96 - indent));
       if (showParentControl) {
         c.strokeStyle = L.parent ? theme.accent : theme.tx3; c.lineWidth = 1.2;
@@ -1399,6 +1783,8 @@ function drawGutter(c: any, W: any, H: any) {
       if (evaluatedValue(L, L.mblur, api.transport.time(), 'l.mblur')) {
         c.fillStyle = theme.accent; c.beginPath(); c.arc(statusX, iy, 2, 0, 7); c.fill();
       }
+      /* embedded soundtrack: shown on hover/selection, and always while muted */
+      if (audioX != null && (active || L.d.audioMuted === true)) icoSpeaker(c, audioX, iy, L.d.audioMuted !== true);
     } else {
       const L = r.L;
       const selected = api.selection.layers().includes(L.id) && trackSelected(r, api.selection.chan() ?? '');
@@ -1408,13 +1794,13 @@ function drawGutter(c: any, W: any, H: any) {
       c.fillStyle = selected ? theme.accent : theme.tx3;
       const labelX = 100, valueX = T.propertyValueX;
       if (r.prop.kf.length) {
-        drawKeyArrow(c, 28, y + T.row / 2, -1, adjacentKeyframe(api, -1, r, space3d) != null);
-        drawKeyArrow(c, 52, y + T.row / 2, 1, adjacentKeyframe(api, 1, r, space3d) != null);
+        drawKeyArrow(c, 28, y + T.row / 2, -1, readout!.previous);
+        drawKeyArrow(c, 52, y + T.row / 2, 1, readout!.next);
       }
-      icoAnimationDiamond(c, 85, y + T.row / 2, trackChannels(r).some(axis => axis.prop.kf.length > 0), trackChannels(r).some(axis => !!api.anim.hasKeyAt(r.L, axis.prop, api.transport.time())));
+      icoAnimationDiamond(c, 85, y + T.row / 2, readout!.animated, readout!.current);
       clipText(c, r.label, labelX, y + T.row / 2, valueX - labelX - 12);
       /* value at playhead */
-      const values = trackChannels(r).map(axis => api.anim.evP(L, axis.prop, api.transport.time(), axis.key));
+      const values = readout!.values;
       c.font = '400 10px ' + fmono();
       c.fillStyle = theme.accent;
       c.textAlign = 'right';
@@ -1443,15 +1829,14 @@ function drawGutter(c: any, W: any, H: any) {
       c.globalAlpha = .7;
       c.fillStyle = pal.body; roundRect(c, 74, iy - 8, 16, 16, 3); c.fill();
       c.setLineDash([3, 2]); c.strokeStyle = pal.primary; c.lineWidth = 1; c.stroke(); c.setLineDash([]);
-      c.font = '600 8px ' + fui(); c.fillStyle = pal.primary; c.textAlign = 'center'; c.textBaseline = 'middle';
-      c.fillText((type ? BADGE[type] : 'new').toUpperCase().slice(0, 1), 82, iy + .5);
-      c.textAlign = 'left';
+      icoLayerType(c, type, 82, iy, pal.primary);
       c.font = '400 12px ' + fui(); c.fillStyle = theme.tx2;
       clipText(c, d.name, 96, iy, Math.max(0, T.gut - 12 - 96));
       c.globalAlpha = 1;
     }
   }
   c.restore();
+  return changed;
 }
 const clippedLabels = new Map<string, string>();
 listen(document.fonts, 'loadingdone', () => { clippedLabels.clear(); invalidate('timeline'); });
@@ -1489,11 +1874,61 @@ function icoAnimationDiamond(c: any, x: number, y: number, animated: boolean, cu
   c.beginPath(); c.moveTo(x, y - 5); c.lineTo(x + 4, y); c.lineTo(x, y + 5); c.lineTo(x - 4, y); c.closePath();
   if (current) c.fill(); else c.stroke(); c.restore();
 }
+const LAYER_TYPE_ICONS: Record<string, string> = {
+  group: 'stack', text: 'type', shape: 'shape', solid: 'solid', shader: 'wand', extension: 'puzzle',
+  null: 'anchor', image: 'image', video: 'film', audio: 'music'
+};
+type IconPart = { path: Path2D; fill: boolean; stroke: boolean; width: number };
+const layerIconParts = new Map<string, IconPart[]>();
+/* Draws the app-registry (Phosphor-style) glyph for a layer type, tinted to `color`. */
+function icoLayerType(c: any, type: string | null, x: number, y: number, color: string) {
+  const name = LAYER_TYPE_ICONS[type ?? ''] ?? 'dot';
+  let parts = layerIconParts.get(name);
+  if (!parts) {
+    const inherited = (el: Element, attr: string) => {
+      for (let n: Element | null = el; n && n.tagName.toLowerCase() !== 'svg'; n = n.parentElement) if (n.hasAttribute(attr)) return n.getAttribute(attr);
+      return null;
+    };
+    parts = Array.from(iconNode(api, name).querySelectorAll('path,rect,circle'), el => {
+      const num = (k: string) => Number(el.getAttribute(k) ?? 0);
+      let path: Path2D;
+      if (el.tagName === 'path') path = new Path2D(el.getAttribute('d') ?? '');
+      else {
+        path = new Path2D();
+        if (el.tagName === 'rect') {
+          const rx = num('rx');
+          path.roundRect(num('x'), num('y'), num('width'), num('height'), rx);
+        } else path.arc(num('cx'), num('cy'), num('r'), 0, Math.PI * 2);
+      }
+      const fillAttr = inherited(el, 'fill'), strokeAttr = inherited(el, 'stroke');
+      return {
+        path, fill: fillAttr !== 'none', stroke: !!strokeAttr && strokeAttr !== 'none',
+        width: Number(inherited(el, 'stroke-width') ?? 16)
+      };
+    });
+    layerIconParts.set(name, parts);
+  }
+  const size = 11, k = size / 256;
+  c.save(); c.translate(x - size / 2, y - size / 2); c.scale(k, k);
+  c.fillStyle = color; c.strokeStyle = color; c.lineCap = 'round'; c.lineJoin = 'round';
+  for (const part of parts) {
+    if (part.fill) c.fill(part.path);
+    if (part.stroke) { c.lineWidth = part.width; c.stroke(part.path); }
+  }
+  c.restore();
+}
+let scaleLinkPaths: Path2D[] | null = null;
 function icoScaleLink(c: any, x: number, y: number, linked: boolean) {
-  c.save(); c.translate(x, y); c.rotate(-Math.PI / 4);
-  c.strokeStyle = linked ? theme.accent : theme.tx3; c.lineWidth = 1.3;
-  roundRect(c, -7, -4, 9, 5, 2.5); c.stroke();
-  roundRect(c, -2, -1, 9, 5, 2.5); c.stroke();
+  // Canvas and Properties consume the same Phosphor glyph from the app registry.
+  scaleLinkPaths ??= Array.from(iconNode(api, 'aspectRatio').querySelectorAll('path'), path => new Path2D(path.getAttribute('d') ?? ''));
+  c.save(); c.translate(x, y);
+  c.fillStyle = linked ? theme.accent : INK.over;
+  if (linked) c.globalAlpha = .14;
+  roundRect(c, -10, -10, 20, 20, 4); c.fill();
+  c.globalAlpha = 1;
+  c.fillStyle = linked ? theme.accent : theme.tx3;
+  c.translate(-8, -8); c.scale(16 / 256, 16 / 256);
+  for (const path of scaleLinkPaths) c.fill(path);
   c.restore();
 }
 function drawKeyArrow(c: any, x: number, y: number, direction: number, enabled: boolean) {
@@ -1514,6 +1949,25 @@ function icoEye(c: any, x: any, y: any, on: any) {
   c.lineWidth = 1.1; c.beginPath();
   c.ellipse(x, y, 5, 3.2, 0, 0, 7); c.stroke();
   if (on) { c.fillStyle = INK.hi; c.beginPath(); c.arc(x, y, 1.5, 0, 7); c.fill(); }
+}
+const AUDIO_TOGGLE_WIDTH = 16;
+/** Centre of a video row's mute toggle, or null when it has no embedded audio. */
+function embeddedAudioToggleX(L: any): number | null {
+  if (L.type !== 'video' || L.d?.embeddedAudio !== true) return null;
+  return T.gut - (layerSupportsTransform(L.type) ? 50 : 12) - AUDIO_TOGGLE_WIDTH / 2;
+}
+function icoSpeaker(c: any, x: any, y: any, on: any) {
+  c.save();
+  c.strokeStyle = on ? INK.hi : theme.accent;
+  c.lineWidth = 1.1; c.lineJoin = 'round'; c.lineCap = 'round';
+  c.beginPath();
+  c.moveTo(x - 5, y - 1.6); c.lineTo(x - 3, y - 1.6); c.lineTo(x, y - 4); c.lineTo(x, y + 4);
+  c.lineTo(x - 3, y + 1.6); c.lineTo(x - 5, y + 1.6); c.closePath(); c.stroke();
+  c.beginPath();
+  if (on) c.arc(x + 1, y, 3, -Math.PI / 4, Math.PI / 4);
+  else { c.moveTo(x + 2, y - 2); c.lineTo(x + 6, y + 2); c.moveTo(x + 6, y - 2); c.lineTo(x + 2, y + 2); }
+  c.stroke();
+  c.restore();
 }
 function icoLock(c: any, x: any, y: any, on: any) {
   c.strokeStyle = on ? theme.accent : INK.lo;
@@ -1538,8 +1992,8 @@ const trail = { time: NaN, stamp: 0, width: 0, velocity: 0 };
 function stepTrail(): number {
   const now = performance.now() / 1000;
   const dt = trail.stamp ? Math.min(now - trail.stamp, .25) : 0;
-  const moved = Number.isFinite(trail.time) ? (api.transport.time() - trail.time) * T.pps : 0;
-  trail.time = api.transport.time(); trail.stamp = now;
+  const moved = Number.isFinite(trail.time) ? (playheadTime() - trail.time) * T.pps : 0;
+  trail.time = playheadTime(); trail.stamp = now;
   const target = dt > 0 ? clamp(TRAIL.pxPerVelocity * moved / dt, -TRAIL.maxWidth, TRAIL.maxWidth) : 0;
   if (dt > 0) {
     const omega = 2 / TRAIL.response, decay = Math.exp(-omega * dt);
@@ -1552,10 +2006,12 @@ function stepTrail(): number {
 }
 
 function drawPlayhead(c: any, W: any, H: any) {
-  const x = Math.round(t2x(api.transport.time())) + .5;
+  // Whole-pixel rounding visibly caps a slow-moving head to ~30 steps/second,
+  // even on a 120 Hz display. Canvas coverage handles fractional positions.
+  const x = t2x(playheadTime()) + .5;
   const width = stepTrail();
   /* Keep animating until the trail has fully settled. */
-  if (width !== 0) scheduleFrame(() => invalidate('timeline'));
+  if (width !== 0) invalidateTime();
   if (x < T.gut) return;
   c.save(); c.beginPath(); c.rect(T.gut, 0, W - T.gut, H); c.clip();
   /* glow trail behind the direction of travel */
@@ -1617,8 +2073,85 @@ function drawQuickOffset(c: any, W: number, H: number) {
 }
 
 /* ── graph editor ──────────────────────────────────────── */
+const GRAPH_VERTEX = 8;
+const GRAPH_BOX_INSET = 8;
+function drawGraphVertex(c: any, x: number, y: number, color: string, selected: boolean, key: any) {
+  const shape = graphKeyShape(key), r = GRAPH_VERTEX / 2;
+  const path = (radius: number) => {
+    c.beginPath();
+    if (shape === 'hold') c.rect(x - radius, y - radius, radius * 2, radius * 2);
+    else if (shape === 'bezier') {
+      c.moveTo(x - radius, y - radius); c.lineTo(x + radius, y - radius);
+      c.lineTo(x - radius, y + radius); c.lineTo(x + radius, y + radius); c.closePath();
+    } else {
+      c.moveTo(x, y - radius - 1); c.lineTo(x + radius + 1, y);
+      c.lineTo(x, y + radius + 1); c.lineTo(x - radius - 1, y); c.closePath();
+    }
+  };
+  c.save();
+  if (selected) { path(r + 2); c.strokeStyle = '#62ee88'; c.lineWidth = 1.3; c.stroke(); }
+  path(r); c.fillStyle = color; c.fill(); c.restore();
+}
+
+function drawGraphTransformBox(c: any, bounds: any, grips: boolean) {
+  c.save();
+  c.fillStyle = rgba(theme.accent, .12);
+  c.fillRect(bounds.x0, bounds.y0, bounds.x1 - bounds.x0, bounds.y1 - bounds.y0);
+  c.strokeStyle = theme.accent; c.lineWidth = 1; c.setLineDash([3, 3]);
+  c.strokeRect(Math.round(bounds.x0) + .5, Math.round(bounds.y0) + .5,
+    Math.round(bounds.x1 - bounds.x0), Math.round(bounds.y1 - bounds.y0));
+  c.setLineDash([]);
+  if (grips) for (const grip of graphTransformHandles(bounds)) {
+    c.fillStyle = theme.accent;
+    c.fillRect(Math.round(grip.x) - 3, Math.round(grip.y) - 3, 6, 6);
+  }
+  c.restore();
+}
+
+/* AE keeps the dragged key's numbers under the pointer instead of making you
+   read them off the axis. One key reports where it landed; a group reports how
+   far it travelled. */
+function drawGraphReadout(c: any, W: number, H: number) {
+  const readout = T.graphReadout;
+  if (!readout) return;
+  c.save();
+  c.font = '500 10px ' + fui(); c.textBaseline = 'middle';
+  const width = c.measureText(readout.text).width + 12, height = 18;
+  const x = clamp(readout.x + 14, T.gut + 4, Math.max(T.gut + 4, W - width - 4));
+  const y = clamp(readout.y - height - 8, graphTop() + 32, Math.max(graphTop() + 32, H - height - 4));
+  roundRect(c, x, y, width, height, 3);
+  c.fillStyle = theme.accent; c.fill();
+  c.fillStyle = css('--on-accent') || '#fff';
+  c.fillText(readout.text, x + 6, y + height / 2);
+  c.restore();
+}
+
+function graphValueText(value: any) {
+  return typeof value === 'number' && Number.isFinite(value) ? String(api.util.round(value, 2)) : '';
+}
+
+/* One selected key reads as an absolute position; several read as the offset
+   applied to the whole group, which is the only number shared by all of them. */
+function graphMoveReadout(snapshot: any, x: number, y: number, timeDelta: number, valueDelta: number) {
+  const selected = snapshot.items.filter((item: any) => item.selected);
+  const fps = api.project.get().fps;
+  /* The speed graph plots rate of change, so a key's stored value is not the
+     number the pointer is reading off the axis: report the time alone there. */
+  const plotsValue = T.graphType !== 'speed';
+  if (selected.length === 1) {
+    const item = selected[0];
+    const layerFrom = (Number.isFinite(item.compositionTime) ? item.compositionTime : item.time) - item.time;
+    const value = plotsValue ? graphValueText(item.key.v) : '';
+    return { x, y, text: (value && value + '  ·  ') + api.util.tc(layerFrom + item.key.t, fps) };
+  }
+  const time = (timeDelta >= 0 ? '+' : '\u2212') + api.util.tc(Math.abs(timeDelta), fps);
+  const value = plotsValue ? graphValueText(valueDelta) : '';
+  return { x, y, text: (value ? '\u0394 ' + value + '  ·  ' : '') + time };
+}
+
 const graphSamples = createGraphSampleCache((axis, time, speed) => graphSample(api, axis, time, speed));
 function drawGraph(c: any, W: any, H: any) {
+  const plotTop = graphTop();
   graphSamples.begin(api.project.get(), [api.anim.version(), api.project.get().fps, T.pps, T.scrollT, W, T.graphType].join(':'));
   T._graph = null;
   /* Build from every project property, not only expanded timeline rows. A
@@ -1628,23 +2161,70 @@ function drawGraph(c: any, W: any, H: any) {
     .filter((r: any) => trackSelected(r, api.selection.chan() ?? '') || r.prop.kf.length);
   const target = resolveGraphTarget(rows, T.graphFocus, api.selection.layers(), (r: any) => trackSelected(r, api.selection.chan() ?? ''));
   if (target) T.graphFocus = { layerId: target.L.id, trackKey: target.key };
-  c.save(); c.beginPath(); c.rect(T.gut, T.ruler, W - T.gut, H - T.ruler); c.clip();
+  c.save(); c.beginPath(); c.rect(T.gut, plotTop, W - T.gut, H - plotTop); c.clip();
+  c.fillStyle = theme.sunken; c.fillRect(T.gut, plotTop, W - T.gut, H - plotTop);
+  c.strokeStyle = INK.grid; c.lineWidth = 1; c.beginPath();
+  const timeStep = niceStep(T.pps);
+  for (let time = Math.ceil(T.scrollT / timeStep) * timeStep; t2x(time) < W; time += timeStep) {
+    const x = Math.round(t2x(time)) + .5; c.moveTo(x, plotTop); c.lineTo(x, H);
+  }
+  c.stroke();
   if (!target) {
     c.fillStyle = theme.tx3; c.font = '400 11.5px ' + fui(); c.textAlign = 'center';
-    c.fillText('Select an animated property to edit its curve', (W + T.gut) / 2, (H + T.ruler) / 2);
+    c.fillText('Select an animated property to edit its curve', (W + T.gut) / 2, (H + plotTop) / 2);
     c.textAlign = 'left'; c.restore(); return;
   }
   const selectedKeyIds = new Set(T.graphMarqueeIds ?? api.selection.keys());
-  const series = rows
+  const allAxes = rows
     .flatMap((r:any)=>trackChannels(r).map((axis:any)=>({...axis,L:r.L,trackKey:r.key})))
-    .filter((axis:any)=>typeof axis.prop.v==='number' && axis.prop.kf.some((key:any)=>selectedKeyIds.has(key.i)));
+    .filter((axis:any)=>typeof axis.prop.v==='number');
+  let series = allAxes.filter((axis:any)=>axis.prop.kf.some((key:any)=>selectedKeyIds.has(key.i)));
+  // Keep sibling dimensions in view while editing just one axis.
+  const families = new Set(series.filter((axis: any) => /\.[xyz]$/.test(axis.key))
+    .map((axis: any) => axis.L.id + ':' + axis.key.slice(0, -2)));
+  if (families.size) series = allAxes.filter((axis: any) => series.includes(axis)
+    || (axis.prop.kf.length && /\.[xyz]$/.test(axis.key) && families.has(axis.L.id + ':' + axis.key.slice(0, -2))));
+  /* Deselecting keys must not blank the graph: keep showing the curves that
+     were last shown, or the focused track when none remain valid. */
+  if (series.length) T.graphShown = series.map((axis:any)=>axis.L.id + ':' + axis.key);
+  else {
+    const shown = new Set<string>(T.graphShown ?? []);
+    series = allAxes.filter((axis:any)=>shown.has(axis.L.id + ':' + axis.key));
+    if (!series.length) series = allAxes.filter((axis:any)=>axis.L.id === target.L.id && axis.trackKey === target.key);
+  }
   if (!series.length) {
     c.fillStyle = theme.tx3; c.font = '400 11.5px ' + fui(); c.textAlign = 'center';
-    c.fillText('Select keyframes in the timeline to edit their curves', (W + T.gut) / 2, (H + T.ruler) / 2);
+    c.fillText('Select keyframes in the timeline to edit their curves', (W + T.gut) / 2, (H + plotTop) / 2);
     c.textAlign = 'left'; c.restore(); return;
   }
+  /* The same property on several layers edits as one curve: draw the focused
+     layer's and let easing and key edits fan out to the rest through `linked`. */
+  const linked = series;
+  const shared = new Map<string, any>();
+  for (const axis of series) {
+    const current = shared.get(axis.key);
+    if (!current || (axis.L.id === target.L.id && current.L.id !== target.L.id)) shared.set(axis.key, axis);
+  }
+  series = series.filter((axis: any) => shared.get(axis.key) === axis);
+  // Hidden curves must not keep hit targets from a frame that still drew them.
+  for (const axis of linked) if (!series.includes(axis)) axis.prop.kf.forEach((key: any) => api.uiState.setKeyHandles(key, { ho: null, hi: null, pt: null }));
+  const layerCount = (axis: any) => linked.filter((other: any) => other.key === axis.key).length;
   const L = target.L, speedMode=T.graphType==='speed';
-  const viewKey = api.project.get().id + ':' + T.graphType + ':' + series.map((axis: any) => axis.L.id + ':' + axis.key).join('|');
+  /* "Merge selected curves" folds the selected channels into the single curve
+     they describe together: the magnitude of the combined vector (combined
+     speed in speed mode). Two axes of one motion read as one motion curve
+     instead of two that have to be compared by eye. It is a view of the same
+     keys, so per-key handles stay hidden while it is on. */
+  const merged = Boolean(T.graphMerge) && series.length > 1;
+  const mergedSample = (time: number) => {
+    let total = 0;
+    for (const axis of series) {
+      const v = graphSamples.sample(axis, time, speedMode);
+      if (Number.isFinite(v)) total += v * v;
+    }
+    return Math.sqrt(total);
+  };
+  const viewKey = api.project.get().id + ':' + T.graphType + ':' + (merged ? 'merged:' : '') + series.map((axis: any) => axis.L.id + ':' + axis.key).join('|');
   if (T.graphViewKey !== viewKey) { T.graphViewKey = viewKey; T.graphViewBounds = null; }
   series.forEach((axis:any)=>temporalKeys(axis.prop.kf));
   let vmin = Infinity, vmax = -Infinity;
@@ -1652,7 +2232,7 @@ function drawGraph(c: any, W: any, H: any) {
     const keys=axis.prop.kf;
     for(let i=0;i<keys.length;i++) for(let sample=0;sample<=48;sample++) {
       const t=axis.L.from+keys[i].t+((keys[i+1]?.t ?? keys[i].t)-keys[i].t)*sample/48;
-      const v=graphSamples.sample(axis,t,speedMode); if(Number.isFinite(v)){vmin=Math.min(vmin,v);vmax=Math.max(vmax,v);}
+      const v=merged?mergedSample(t):graphSamples.sample(axis,t,speedMode); if(Number.isFinite(v)){vmin=Math.min(vmin,v);vmax=Math.max(vmax,v);}
     }
   });
   if (!isFinite(vmin)) { vmin = 0; vmax = 1; }
@@ -1661,23 +2241,43 @@ function drawGraph(c: any, W: any, H: any) {
   vmin -= padv; vmax += padv;
   if (T.graphViewBounds) [vmin, vmax] = T.graphViewBounds;
   if (T.graphDragBounds) [vmin, vmax] = T.graphDragBounds;
-  const top = T.ruler + 42, bot = Math.max(top + 1, H - 16);
+  const top = plotTop + 42, bot = Math.max(top + 1, H - 16);
   const v2y = (v: any) => bot - (v - vmin) / (vmax - vmin) * (bot - top);
-  T._graph = { target, series, vmin, vmax, v2y, y2v: (y: any) => vmin + (bot - y) / (bot - top) * (vmax - vmin), points: [], selectionBounds: null };
+  T._graph = { target, series, linked, vmin, vmax, v2y, y2v: (y: any) => vmin + (bot - y) / (bot - top) * (vmax - vmin), points: [], selectionBounds: null, transform: null };
 
   /* value gridlines */
   c.strokeStyle = INK.grid; c.font = '400 9.5px ' + fui(); c.fillStyle = theme.tx3;
-  for (let i = 0; i <= 4; i++) {
-    const v = vmin + (vmax - vmin) * i / 4, y = Math.round(v2y(v)) + .5;
+  for (const v of graphValueTicks(vmin, vmax, bot - top)) {
+    const y = Math.round(v2y(v)) + .5;
+    c.strokeStyle = v === 0 ? INK.sub : INK.grid;
     c.beginPath(); c.moveTo(T.gut, y); c.lineTo(W, y); c.stroke();
     c.fillText(api.util.round(v, 1), T.gut + 5, y - 4);
   }
   /* curve */
+  if (merged) {
+    const x0 = Math.max(T.gut, Math.min(...series.map((axis: any) => t2x(axis.L.from + Math.min(0, ...axis.prop.kf.map((key: any) => key.t))))));
+    const x1 = Math.min(W, Math.max(...series.map((axis: any) => t2x(axis.L.from + Math.max(axis.L.dur, ...axis.prop.kf.map((key: any) => key.t))))));
+    c.strokeStyle = theme.accent; c.lineWidth = 1.8;
+    c.beginPath();
+    for (let x = x0; x <= x1; x += 1.5) {
+      const y = v2y(mergedSample(x2t(x)));
+      x === x0 ? c.moveTo(x, y) : c.lineTo(x, y);
+    }
+    c.stroke();
+    /* The merged curve has no keys of its own; drop any handles left from the
+       per-axis pass so hit-testing cannot pick up a stale point. */
+    series.forEach((axis: any) => axis.prop.kf.forEach((key: any) => api.uiState.setKeyHandles(key, { ho: null, hi: null, pt: null })));
+  } else {
+  /* Vertex fill and tangents follow the live selection, so a marquee lights
+     keys up as it sweeps. `selectedKeyIds` only decides which curves are on
+     screen, and stays frozen for the duration of that marquee. */
+  const liveSelected = new Set(api.selection.keys());
+  const labelPositions: number[] = [];
   series.forEach((axis: any, axisIndex: number) => {
   const L = axis.L;
   const kf = axis.prop.kf;
-  const curveColor = [theme.accent,'#5495dc','#a276d4','#309886','#ba8541'][axisIndex%5];
-  c.strokeStyle = curveColor; c.lineWidth = 1.8;
+  const curveColor = graphAxisColor(axis.key, axisIndex);
+  c.strokeStyle = curveColor; c.lineWidth = 1.35;
   c.beginPath();
   const x0 = Math.max(T.gut, t2x(L.from + Math.min(0, ...kf.map((key: any) => key.t))));
   const x1 = Math.min(W, t2x(L.from + Math.max(L.dur, ...kf.map((key: any) => key.t))));
@@ -1691,58 +2291,98 @@ function drawGraph(c: any, W: any, H: any) {
   /* handles + keys */
   kf.forEach((k: any, i: any) => {
     api.uiState.setKeyHandles(k, { ho: null, hi: null, pt: null });
-    if (!selectedKeyIds.has(k.i)) return;
     const x = t2x(L.from + k.t), y = v2y(speedMode ? graphSamples.sample(axis,L.from+k.t,true) : k.v);
+    const sel = liveSelected.has(k.i);
     const nx = kf[i + 1], pv = kf[i - 1];
-    c.strokeStyle = INK.sub; c.lineWidth = 1;
-    if (nx && !k.hold && !speedMode) {
-      const handle = visibleBezierHandle(k, nx, 'eo');
-      const [hx, hy] = pointForBezierHandle(handle, [x, y], [t2x(L.from + nx.t), v2y(nx.v)]);
-      c.beginPath(); c.moveTo(x, y); c.lineTo(hx, hy); c.stroke();
-      c.fillStyle = INK.handle; c.beginPath(); c.arc(hx, hy, 3, 0, 7); c.fill();
-      api.uiState.setKeyHandles(k, { ho: [hx, hy] });
+    // Curved keys retain hollow tangents; selected tangents become yellow.
+    {
+      const handleColor = sel ? '#e7c84b' : curveColor;
+      c.strokeStyle = handleColor; c.lineWidth = 1; c.setLineDash([2, 2]);
+      if (nx && !k.hold && !speedMode && (sel || k.outInterp === 'bezier')) {
+        const handle = visibleBezierHandle(k, nx, 'eo');
+        const [hx, hy] = pointForBezierHandle(handle, [x, y], [t2x(L.from + nx.t), v2y(nx.v)]);
+        c.beginPath(); c.moveTo(x, y); c.lineTo(hx, hy); c.stroke();
+        c.setLineDash([]); c.beginPath(); c.arc(hx, hy, 3, 0, 7);
+        c.fillStyle = sel ? handleColor : theme.sunken; c.fill(); c.stroke(); c.setLineDash([2, 2]);
+        api.uiState.setKeyHandles(k, { ho: [hx, hy] });
+      }
+      if (pv && !pv.hold && !speedMode && (sel || k.inInterp === 'bezier')) {
+        const handle = visibleBezierHandle(k, pv, 'ei');
+        const px = t2x(L.from + pv.t), py = v2y(pv.v);
+        const [hx, hy] = pointForBezierHandle(handle, [px, py], [x, y]);
+        c.beginPath(); c.moveTo(x, y); c.lineTo(hx, hy); c.stroke();
+        c.setLineDash([]); c.beginPath(); c.arc(hx, hy, 3, 0, 7);
+        c.fillStyle = sel ? handleColor : theme.sunken; c.fill(); c.stroke(); c.setLineDash([2, 2]);
+        api.uiState.setKeyHandles(k, { hi: [hx, hy] });
+      }
     }
-    if (pv && !pv.hold && !speedMode) {
-      const handle = visibleBezierHandle(k, pv, 'ei');
-      const px = t2x(L.from + pv.t), py = v2y(pv.v);
-      const [hx, hy] = pointForBezierHandle(handle, [px, py], [x, y]);
-      c.beginPath(); c.moveTo(x, y); c.lineTo(hx, hy); c.stroke();
-      c.fillStyle = INK.handle; c.beginPath(); c.arc(hx, hy, 3, 0, 7); c.fill();
-      api.uiState.setKeyHandles(k, { hi: [hx, hy] });
-    }
-    const sel = api.selection.keys().includes(k.i);
-    c.fillStyle = sel ? curveColor : INK.inv;
-    c.beginPath(); c.arc(x, y, 4.2, 0, 7); c.fill();
+    c.setLineDash([]);
+    drawGraphVertex(c, x, y, curveColor, sel, k);
     api.uiState.setKeyHandles(k, { pt: [x, y] });
   });
+  // Read the value where the playhead meets each curve, as in the reference.
+  const time = api.transport.time(), playX = t2x(time);
+  const current = graphSamples.sample(axis, time, speedMode), currentY = v2y(current);
+  c.font = '500 10px ' + fmono(); c.fillStyle = curveColor;
+  if (playX >= T.gut + 35 && playX < W - 40 && currentY >= top && currentY <= bot) {
+    c.beginPath(); c.arc(playX, currentY, 3, 0, Math.PI * 2); c.fill();
+    let labelY = clamp(currentY - 7, top + 10, bot - 3);
+    while (labelPositions.some(y => Math.abs(y - labelY) < 13) && labelY < bot - 16) labelY += 13;
+    if (labelPositions.some(y => Math.abs(y - labelY) < 13)) {
+      labelY = currentY - 20;
+      while (labelPositions.some(y => Math.abs(y - labelY) < 13)) labelY -= 13;
+    }
+    if (labelY >= top + 10) { labelPositions.push(labelY); c.fillText(graphValueText(current), playX + 7, labelY); }
+  }
+  const last = kf[kf.length - 1];
+  if (last && t2x(L.from + last.t) < W - 55) {
+    const endValue = graphSamples.sample(axis, x2t(W - 16), speedMode);
+    const endY = v2y(endValue);
+    if (endY >= top && endY <= bot) { c.textAlign = 'right'; c.fillText(graphValueText(endValue), W - 16, endY - 6); c.textAlign = 'left'; }
+  }
   });
+  }
   const graphPoints: any[] = series.flatMap((axis: any) => axis.prop.kf.map((key: any) => {
     const point = keyHandles(key)?.pt;
     return point ? { id: key.i, key, axis, x: point[0], y: point[1] } : null;
   })).filter(Boolean);
   const selectedIds = new Set(api.selection.keys());
   T._graph.points = graphPoints;
-  T._graph.selectionBounds = graphSelectionBounds(graphPoints.filter(point => selectedIds.has(point.id)));
-  if (T._graph.selectionBounds) {
-    const bounds = T._graph.selectionBounds;
-    c.save(); c.strokeStyle = rgba(theme.accent, .4); c.lineWidth = 1;
-    c.setLineDash([3, 3]);
-    c.strokeRect(bounds.x0 + .5, bounds.y0 + .5, bounds.x1 - bounds.x0, bounds.y1 - bounds.y0);
-    c.restore();
-  }
+  const boxed = graphPoints.filter((point: any) => selectedIds.has(point.id));
+  /* The box stands off the outermost keys so its corner grips never land on
+     top of the very keys they scale. */
+  T._graph.selectionBounds = graphSelectionBounds(boxed, 16, GRAPH_BOX_INSET);
+  /* Scaling reads key values straight off the curve, which the speed graph
+     does not plot; there the box only marks the movable group. */
+  T._graph.transform = !speedMode && !merged && boxed.length > 1 ? {
+    t0: Math.min(...boxed.map((point: any) => point.axis.L.from + point.key.t)),
+    t1: Math.max(...boxed.map((point: any) => point.axis.L.from + point.key.t)),
+    v0: Math.min(...boxed.map((point: any) => point.key.v)),
+    v1: Math.max(...boxed.map((point: any) => point.key.v)),
+  } : null;
+  if (T._graph.selectionBounds) drawGraphTransformBox(c, T._graph.selectionBounds, Boolean(T._graph.transform));
   // Keep the legend in its own strip, clear of curves and value ticks.
-  c.fillStyle = theme.panel; c.fillRect(T.gut, T.ruler, W - T.gut, 28);
+  c.fillStyle = theme.panel; c.fillRect(T.gut, plotTop, W - T.gut, 28);
+  c.strokeStyle = theme.line; c.beginPath(); c.moveTo(T.gut, plotTop + .5); c.lineTo(W, plotTop + .5); c.stroke();
   c.font = '500 10px ' + fui();
   let legendX = T.gut + 12;
+  if (merged) {
+    c.fillStyle = theme.accent;
+    c.fillRect(legendX, plotTop + 11, 10, 2);
+    c.fillStyle = theme.tx2;
+    c.fillText(`Merged · ${series.length} curves${speedMode ? ' (/s)' : ''}`, legendX + 15, plotTop + 17);
+    c.restore(); return;
+  }
   for (const [index, axis] of series.entries()) {
     const label = axis.label === 'fontAxis.wght' ? 'Weight' : axis.label;
     const unit = api.model.CH[axis.key]?.unit;
-    const text = label + (unit ? ` (${unit}${speedMode ? '/s' : ''})` : speedMode ? ' /s' : '');
+    const layers = layerCount(axis);
+    const text = label + (unit ? ` (${unit}${speedMode ? '/s' : ''})` : speedMode ? ' /s' : '') + (layers > 1 ? ` · ${layers} layers` : '');
     const width = c.measureText(text).width + 25;
-    if (legendX + width > W - 8) { c.fillStyle = theme.tx3; c.fillText('…', legendX, T.ruler + 17); break; }
-    c.fillStyle = [theme.accent,'#5495dc','#a276d4','#309886','#ba8541'][index % 5];
-    c.fillRect(legendX, T.ruler + 11, 10, 2);
-    c.fillStyle = theme.tx2; c.fillText(text, legendX + 15, T.ruler + 17);
+    if (legendX + width > W - 8) { c.fillStyle = theme.tx3; c.fillText('…', legendX, plotTop + 17); break; }
+    c.fillStyle = graphAxisColor(axis.key, index);
+    c.fillRect(legendX, plotTop + 11, 10, 2);
+    c.fillStyle = theme.tx2; c.fillText(text, legendX + 15, plotTop + 17);
     legendX += width;
   }
   c.restore();
@@ -1853,6 +2493,11 @@ function bind(cv: any, wrap: any) {
     if (!asset && !files.length) return;
     e.preventDefault(); e.stopPropagation();
     const { at, index } = placement;
+    if (asset?.kind === 'comp') {
+      /* A composition from the Project panel nests as a precomp layer. */
+      api.commands.run('addCompositionToTimeline', asset.id, { from: at, index });
+      return;
+    }
     if (asset) {
       const command = api.media.commandForAsset(asset.id, at);
       if (!command || command.type !== 'add_layer') return;
@@ -1876,12 +2521,12 @@ function bind(cv: any, wrap: any) {
     } else if (e.shiftKey) {
       T.scrollT += e.deltaY / T.pps;
     } else {
-      if (T.graph && e.offsetX >= T.gut && T._graph && !T.graphDragBounds) {
+      if (inGraph(e.offsetX, e.offsetY) && T._graph && !T.graphDragBounds) {
         const g = T._graph;
         const pixels = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? T.hgt : 1);
         const delta = g.y2v(pixels) - g.y2v(0);
         T.graphViewBounds = [g.vmin + delta, g.vmax + delta];
-      } else if (!T.graph || e.offsetX < T.gut) T.scrollY += e.deltaY;
+      } else T.scrollY += e.deltaY;
       T.scrollT += e.deltaX / T.pps;
     }
     T.scrollT = Math.max(-.4, T.scrollT);
@@ -1897,17 +2542,21 @@ function setHoverRow(index: number | null) {
 function onMove(e: any) {
   const x = e.offsetX, y = e.offsetY;
   setHoverRow(hitRow(y)?.i ?? null);
-  if (T.graph && x > T.gut && y >= T.ruler) {
+  if (T.graph && T.graphCombined && x > T.gut && Math.abs(y - graphTop()) < 4) { T.cv.style.cursor = 'ns-resize'; return; }
+  if (inGraph(x, y)) {
     const graph = T._graph;
+    const grip = graph?.transform ? graphTransformHandleAtPoint(graph.selectionBounds, x, y) : null;
+    if (grip) { T.cv.style.cursor = graphTransformCursor(grip); return; }
     const keys = graph?.series?.flatMap((axis: any) => axis.prop.kf) ?? [];
-    const nearHandle = keys.some((key: any) => {
+    const distanceTo = (point: any) => point ? Math.hypot(x - point[0], y - point[1]) : Infinity;
+    const handleDistance = Math.min(...keys.map((key: any) => {
       const handles = keyHandles(key);
-      return [handles?.ho, handles?.hi].some((point: any) => point && Math.hypot(x - point[0], y - point[1]) < 7);
-    });
-    const nearPoint = keys.some((key: any) => {
-      const point = keyHandles(key)?.pt;
-      return point && Math.hypot(x - point[0], y - point[1]) < 8;
-    });
+      return Math.min(distanceTo(handles?.ho), distanceTo(handles?.hi));
+    }), Infinity);
+    const pointDistance = Math.min(...keys.map((key: any) => distanceTo(keyHandles(key)?.pt)), Infinity);
+    // Same precedence as graphDown, so the cursor never promises a handle the click gives to the point.
+    const nearPoint = preferGraphPoint(pointDistance, handleDistance);
+    const nearHandle = !nearPoint && handleDistance < GRAPH_HANDLE_HIT;
     T.cv.style.cursor = nearHandle ? 'crosshair'
       : pointInGraphSelection(graph?.selectionBounds, x, y) ? 'move'
       : nearPoint ? 'pointer' : 'crosshair';
@@ -1923,7 +2572,9 @@ function onMove(e: any) {
     if (!workHit && hr && hr.row.kind === 'layer') {
       const L = hr.row.L;
       const x0 = t2x(L.from), x1 = t2x(L.from + L.dur);
+      const stagger = L.lock ? null : textStagger.hit(L, x, y, t2x, rowY(hr.i) + 1, T.row - 2);
       if (Math.abs(x - x0) < 5 || Math.abs(x - x1) < 5) cur = 'ew-resize';
+      else if (stagger) { cur = stagger.part === 'end' ? 'ew-resize' : 'grab'; title = stagger.band.animator.name; }
       else if (x > x0 && x < x1) cur = 'grab';
     } else if (!workHit && hr && hr.row.kind === 'prop') {
       const nearKey = hr.row.prop.kf.some((key: any) => Math.abs(t2x(hr.row.L.from + key.t) - x) < 6);
@@ -1941,7 +2592,7 @@ function onMove(e: any) {
     } else if (row?.kind === 'prop' && !row.L.lock) {
       if (isScaleTrack(row) && x >= T.gut - 24) {
         cur = 'pointer';
-        title = row.L.scaleLinked ? 'Adjust Scale X and Y separately' : 'Link Scale X and Y';
+        title = row.L.scaleLinked ? 'Unlock aspect ratio' : 'Lock aspect ratio';
       } else if (x >= 76 && x < 96) cur = 'pointer';
       else if (x >= T.propertyValueX - 4) cur = trackChannels(row).every(axis => typeof api.anim.evP(row.L, axis.prop, api.transport.time(), axis.key) === 'number') ? 'ew-resize' : 'pointer';
     }
@@ -1981,7 +2632,13 @@ function onDown(e: any) {
     return scrub(e);
   }
   if (x < T.gut) return gutterDown(e, x, y);
-  if (T.graph) return graphDown(e, x, y);
+  if (T.graph && T.graphCombined && Math.abs(y - graphTop()) < 4) {
+    const start = graphTop();
+    return beginDrag(e, { cursor: 'ns-resize', move: (_dx: number, dy: number) => {
+      T.graphSplit = clamp((start + dy - T.ruler) / (T.hgt - T.ruler), .2, .65); invalidate('timeline');
+    } });
+  }
+  if (inGraph(x, y)) return graphDown(e, x, y);
   const hr = hitRow(y);
   if (!hr) return marquee(e, { additive: e.shiftKey || e.metaKey });
   const r = hr.row;
@@ -1995,19 +2652,45 @@ function onDown(e: any) {
     if (L.lock) return;
     return quickOffsetLayers(e);
   }
-  if (!selectLayerForPointer(L, e) || L.lock) return;
+  if (!selectLayerForPointer(L, e)) return;
+  // Locking protects clip content and trim edits, while the clip body remains
+  // movable in time so locked layers can still be arranged in the timeline.
+  if (L.lock && (Math.abs(x - x0) < 5 || Math.abs(x - x1) < 5)) return;
   if (Math.abs(x - x0) < 5) return trim(e, 'in');
   if (Math.abs(x - x1) < 5) return trim(e, 'out');
+  const stagger = L.lock ? null : textStagger.hit(L, x, y, t2x, rowY(hr.i) + 1, T.row - 2);
+  if (stagger) return dragStagger(e, L, stagger);
   if (x > x0 && x < x1) return slide(e);
+}
+
+/* Moves a stagger text animator's Start, or stretches its timing from the end. */
+function dragStagger(e: any, L: any, { band, part }: StaggerHit) {
+  const fps = api.project.get().fps;
+  const label = part === 'body' ? 'Move text animation' : 'Stretch text animation';
+  let moved = false;
+  api.edit.begin(label, { origin: 'timeline' });
+  beginDrag(e, {
+    cursor: part === 'body' ? 'grabbing' : 'ew-resize',
+    move: (dx: number) => {
+      moved = true;
+      for (const [key, value] of Object.entries(textStagger.drag(band, part, dx / T.pps, fps)))
+        api.edit.dispatch({ type: 'set_property', target: L.id, path: `ta.${band.animator.id}.${key}`, value, time: api.transport.time(), mode: 'auto', preserveHandEdits: false });
+      invalidate();
+    },
+    up: () => { moved ? api.edit.commit(label) : api.edit.cancel(); invalidate(); },
+    cancel: () => { api.edit.cancel(); invalidate(); },
+  });
 }
 
 function panViewport(e: PointerEvent) {
   e.preventDefault();
   const start = T.scrollT;
+  const g = inGraph(e.offsetX, e.offsetY) ? T._graph : null;
   beginDrag(e, {
     cursor: 'grabbing',
-    move: (dx: number) => {
+    move: (dx: number, dy: number) => {
       T.scrollT = Math.max(-.4, start - dx / T.pps);
+      if (g) { const delta = g.y2v(0) - g.y2v(dy); T.graphViewBounds = [g.vmin + delta, g.vmax + delta]; }
       invalidate('timeline');
     },
   });
@@ -2034,7 +2717,7 @@ function quickOffsetLayers(e: any) {
   if (groups.some((members: any[]) => members.some((layer: any) => layer.lock
       || api.groups.ancestors(layer).some((group: any) => group.lock)))) return;
   const timing = groups.flatMap((members: any[], offsetIndex: number) => members.map((L: any) => ({
-    L, time: Number(L.from) || 0, offsetIndex, offsetCount: groups.length, minTime: 0,
+    L, time: Number(L.from) || 0, offsetIndex, offsetCount: groups.length, minTime: L.type === 'group' ? -Infinity : 0,
   })));
   api.edit.begin('Quick offset layers', { origin: 'timeline' });
   let moved = false;
@@ -2125,25 +2808,31 @@ function workAreaMove(e: any) {
 function scrub(e: any) {
   // Most drags do not snap. Enumerate the project's property/keyframe graph
   // only if Shift is actually pressed, including midway through a drag.
-  let targets: number[] | undefined;
-  let rawTime = 0;
-  let lockedTarget: number | null = null;
+  let targets: EdgeSnapTarget[] | undefined;
+  let rawTime = x2t(e.clientX - T.cv.getBoundingClientRect().left);
+  const snapper = createDirectionalSnapper(rawTime);
+  const present = (time: number) => {
+    scrubPresentationTime = time;
+    api.transport.setTime(time);
+    // A pointer can move several times within one selected project frame.
+    invalidateTime();
+  };
   const apply = () => {
     const time = clamp(rawTime, 0, api.project.get().dur);
-    if (!shiftSnapping()) { lockedTarget = null; api.transport.setTime(time); return; }
+    if (!shiftSnapping()) { snapper.resolve([{ time: 0 }], time, [], 0, false); T.snapGuide = null; present(time); return; }
     if (!targets) {
-      targets = [];
-      for (const L of api.project.get().layers) {
-        targets.push(L.from, L.from + L.dur);
-        for (const item of api.anim.allProps(L) || []) {
-          for (const key of item.prop?.kf || []) targets.push(L.from + key.t);
-        }
-      }
-  }
-    const tolerance = 10 / Math.max(1, T.pps);
-    const resolved = resolveTimelineSnap(time, targets, tolerance, lockedTarget, 15 / Math.max(1, T.pps));
-    lockedTarget = resolved.target;
-    api.transport.setTime(resolved.time);
+      const project = api.project.get();
+      targets = playheadSnapTargets({
+        fps: project.fps, dur: project.dur, work: project.work, markers: project.markers,
+        layers: project.layers.map((L: any) => ({
+          from: L.from, dur: L.dur,
+          keys: (api.anim.allProps(L) || []).flatMap((item: any) => (item.prop?.kf || []).map((key: any) => key.t)),
+        })),
+      }).map(time => ({ time }));
+    }
+    const resolved = snapper.resolve([{ time: 0 }], time, targets, SNAP_RELEASE_PX / Math.max(1, T.pps));
+    T.snapGuide = resolved.lock?.target ?? null;
+    present(resolved.delta);
   };
   const set = (ev: any) => {
     const r = T.cv.getBoundingClientRect();
@@ -2152,7 +2841,11 @@ function scrub(e: any) {
     apply();
   };
   const refresh = () => apply();
-  const cleanup = () => { if (refreshActiveScrub === refresh) refreshActiveScrub = null; };
+  const cleanup = () => {
+    if (refreshActiveScrub === refresh) refreshActiveScrub = null;
+    scrubPresentationTime = null; T.snapGuide = null;
+    if (!disposed) invalidateTime();
+  };
   refreshActiveScrub = refresh;
   set(e);
   beginDrag(e, {
@@ -2163,19 +2856,8 @@ function scrub(e: any) {
 }
 
 function togglePropertyAnimation(row: any) {
-  const axes = trackChannels(row);
-  const remove = axes.every(axis => api.anim.hasKeyAt(row.L, axis.prop, api.transport.time()));
-  api.history.do(remove ? 'Remove keyframe' : 'Add keyframe', () => {
-    for (const axis of axes) {
-      const at = api.anim.hasKeyAt(row.L, axis.prop, api.transport.time());
-      if (remove && at) api.anim.removeKey(axis.prop, at);
-      else if (!at) {
-        const value = api.anim.evP(row.L, axis.prop, api.transport.time(), axis.key);
-        if (value != null) api.anim.setKeyOn(axis.prop, api.transport.time() - row.L.from, value, 'linear', api.project.get().fps);
-      }
-    }
-  });
-  T.reveal(row.L, axes.map(axis => axis.key));
+  const targets = toggleTimelinePropertyKeys(api, row, space3d);
+  for (const target of targets) T.reveal(target.layer, [target.path]);
   rowsDirty = true; invalidate();
 }
 
@@ -2183,16 +2865,71 @@ function isScaleTrack(row: any) {
   return row?.key === 'scale' && trackChannels(row).length === 2;
 }
 
+function scaleValueIndex(x: number) {
+  const columns = propertyValueColumns(T.propertyValueX, T.gut, 2, 24);
+  return x < (columns[0]!.right + columns[1]!.left) / 2 ? 0 : 1;
+}
+
+function scaleValueCommand(row: any, index: number, time: number) {
+  const binding = api.ui.controls.binding.channelBinding(row.L.id, trackChannels(row)[index]!.key, { time });
+  if (binding.mode !== 'command') throw new Error('Scale requires a channel command binding');
+  // Share the inspector's ratio snapshot, paired keyframes, and zero handling.
+  binding.prepare?.();
+  return (value: number) => typeof binding.command === 'function' ? binding.command(value) : { ...binding.command, value };
+}
+
+/** The dragged row plus the same property on every other selected, unlocked layer. */
+function propertyDragRows(row: any) {
+  const peers = api.selection.layers()
+    .filter((id: string) => id !== row.L.id)
+    .map((id: string) => api.model.layer(id))
+    .filter((L: any) => L && !L.lock && !api.groups.ancestors(L).some((group: any) => group.lock))
+    .map((L: any) => {
+      const peer = timelineProperties(api, L, space3d).find((item: any) => item.key === row.key);
+      return peer && { kind: 'prop', L, ...peer };
+    })
+    .filter(Boolean);
+  return [row, ...peers];
+}
+
+/** Selected keyframes this value field should edit. With the playhead resting
+ *  between selected keys (no key under it), editing the field adjusts those keys
+ *  rather than dropping a new keyframe at the playhead. */
+function selectedValueKeys(row: any, axes: any[], time: number) {
+  const selected = new Set(api.selection.resolveSelectedKeys());
+  if (!selected.size || axes.some(axis => api.anim.hasKeyAt(row.L, axis.prop, time))) return null;
+  const perAxis = axes.map(axis => axis.prop.kf.filter((key: any) => selected.has(key) && typeof key.v === 'number')
+    .map((key: any) => ({ key, start: key.v as number })));
+  return perAxis.some(keys => keys.length) ? perAxis : null;
+}
+/** Move every selected key by the same amount (`to - from`), so gaps between keys never change;
+ *  a linked scale applies that amount to both axes. */
+function applySelectedValueKeys(keys: Array<Array<{ key: any; start: number }>>, index: number, from: number, to: number, linked: boolean) {
+  keys.forEach((axisKeys, axisIndex) => {
+    if (!linked && axisIndex !== index) return;
+    axisKeys.forEach(({ key, start }) => { key.v = start + (to - from); });
+  });
+  api.anim.touch();
+}
+
 function dragPropertyValue(event: any, row: any, rowIndex: number) {
-  let axes = trackChannels(row).map(axis => ({ ...axis, value: api.anim.evP(row.L, axis.prop, api.transport.time(), axis.key), meta: propertyMetadata(api, row.L, axis.key) }));
-  if (!axes.every(axis => typeof axis.value === 'number')) {
-    editPropertyValue(row, rowIndex); return;
-  }
-  if (row.channels && !row.L.scaleLinked) {
-    const index = Math.min(axes.length - 1, Math.max(0, Math.floor((event.offsetX - T.propertyValueX) / ((T.gut - T.propertyValueX - 8) / axes.length))));
-    axes = [axes[index]];
-  }
   const time = api.transport.time();
+  const scaleIndex = isScaleTrack(row) ? scaleValueIndex(event.offsetX) : 0;
+  const channels = (target: any) => trackChannels(target).map(axis => ({ ...axis, value: api.anim.evP(target.L, axis.prop, time, axis.key), meta: propertyMetadata(api, target.L, axis.key) }));
+  if (!channels(row).every(axis => typeof axis.value === 'number')) {
+    editPropertyValue(row, rowIndex, scaleIndex); return;
+  }
+  // Every selected layer showing this property moves by the same drag delta,
+  // each from its own starting value.
+  const targets = propertyDragRows(row).flatMap((target: any) => {
+    const axes = channels(target);
+    if (!axes.every(axis => typeof axis.value === 'number')) return [];
+    const keyed = selectedValueKeys(target, trackChannels(target), time);
+    const scaleCommand = !keyed && isScaleTrack(target) ? scaleValueCommand(target, scaleIndex, time) : null;
+    return [{ target, axes: scaleCommand || (keyed && isScaleTrack(target)) ? [axes[scaleIndex]!] : axes, scaleCommand, keyed }];
+  });
+  const keyedEdit = targets.some(item => item.keyed);
+  const label = targets.length > 1 ? `Adjust ${row.label} on ${targets.length} layers` : `Adjust ${row.label}`;
   let editing = false;
   let control: any;
   const cancelOnEscape = (event: KeyboardEvent) => {
@@ -2206,53 +2943,84 @@ function dragPropertyValue(event: any, row: any, rowIndex: number) {
     cursor: 'ew-resize',
     move: (dx: number, _dy: number, ev: any) => {
       if (!editing && Math.abs(dx) < 3) return;
-      if (!editing) { api.edit.begin(`Adjust ${row.label}`, { origin: 'timeline' }); editing = true; }
-      axes.forEach((axis, index) => {
-        const delta = draggedPropertyValue(axes[0].value, dx, axes[0].meta, !!ev.altKey, !!ev.shiftKey) - axes[0].value;
-        const value = row.channels && row.L.scaleLinked && index > 0
-          ? axis.value + delta * (axes[0].value ? axis.value / axes[0].value : 1)
-          : draggedPropertyValue(axis.value, dx, axis.meta, !!ev.altKey, !!ev.shiftKey);
-        api.edit.dispatch({ type: 'set_property', target: row.L.id, path: axis.key, value, time, mode: 'auto', preserveHandEdits: false });
+      if (!editing) { keyedEdit ? api.history.begin(label) : api.edit.begin(label, { origin: 'timeline' }); editing = true; }
+      for (const { target, axes, scaleCommand, keyed } of targets) axes.forEach(axis => {
+        const value = draggedPropertyValue(axis.value, dx, axis.meta, !!ev.altKey, !!ev.shiftKey);
+        if (keyed) applySelectedValueKeys(keyed, trackChannels(target).findIndex(item => item.key === axis.key), axis.value, value, !!target.L.scaleLinked && isScaleTrack(target));
+        else if (scaleCommand) {
+          const commands = scaleCommand(value);
+          for (const command of Array.isArray(commands) ? commands : [commands]) api.edit.dispatch(command);
+        } else api.edit.dispatch({ type: 'set_property', target: target.L.id, path: axis.key, value, time, mode: 'auto', preserveHandEdits: false });
       });
       invalidate();
     },
-    up: () => { cleanup(); if (editing) api.edit.commit(`Adjust ${row.label}`); else editPropertyValue(row, rowIndex); },
-    cancel: () => { cleanup(); if (editing) api.edit.cancel(); }
+    up: () => { cleanup(); if (editing) keyedEdit ? api.history.commit(label) : api.edit.commit(label); else editPropertyValue(row, rowIndex, scaleIndex); },
+    cancel: () => { cleanup(); if (editing) keyedEdit ? (api.history.cancel(), api.anim.touch()) : api.edit.cancel(); }
   });
 }
 
-function editPropertyValue(row: any, rowIndex: number) {
+function editPropertyValue(row: any, rowIndex: number, scaleIndex = 0) {
   if (row.L.lock) return;
-  const axes = trackChannels(row);
+  const scale = isScaleTrack(row);
+  const axes = scale ? [trackChannels(row)[scaleIndex]!] : trackChannels(row);
   const values = axes.map(axis => api.anim.evP(row.L, axis.prop, api.transport.time(), axis.key));
   const time = api.transport.time();
+  const scaleCommand = scale ? scaleValueCommand(row, scaleIndex, time) : null;
+  const column = scale ? propertyValueColumns(T.propertyValueX, T.gut, 2, 24)[scaleIndex]! : null;
   const choices: Record<string, readonly string[]> = {
     'l.blend': api.model.BLENDS, 'c.align': ['left', 'center', 'right'], 'c.shape': ['rect', 'ellipse', 'polygon', 'star', 'line'],
     'c.fit': ['cover', 'contain', 'stretch']
   };
   const options = typeof values[0] === 'boolean' ? ['true', 'false'] : choices[row.key]
     ?? (/^m\..+\.shape$/.test(row.key) ? ['rect', 'ellipse'] : /^m\..+\.mode$/.test(row.key) ? ['add', 'subtract'] : null);
-  const input = h(options ? 'select' : 'input', { value: values.join(', '), 'aria-label': row.label,
-    style: { position: 'absolute', left: `${T.propertyValueX}px`, top: `${rowY(rowIndex) + 3}px`,
-      width: `${T.gut - T.propertyValueX - 6}px`, height: `${T.row - 6}px`, background: 'var(--bg-row)',
-      border: '1px solid var(--accent)', color: 'var(--tx)', padding: '0 4px', zIndex: 9 } });
+  const isColor = !options && typeof values[0] === 'string' && /^#[0-9a-f]{6}$/i.test(values[0]);
+  const input = h(options ? 'select' : 'input', { value: values.join(', '), 'aria-label': scale ? `Scale ${scaleIndex === 0 ? 'X' : 'Y'}` : row.label,
+    style: { position: 'absolute', left: `${column?.left ?? T.propertyValueX}px`, top: `${rowY(rowIndex) + 3}px`,
+      width: `${column?.width ?? T.gut - T.propertyValueX - 6}px`, height: `${T.row - 6}px`, background: 'var(--bg-row)',
+      border: '1px solid var(--accent)', color: 'var(--tx)', padding: isColor ? '1px' : '0 4px', zIndex: 9 } });
   if (options) { options.forEach(value => input.appendChild(h('option', { value }, value))); input.value = String(values[0]); }
-  else if (typeof values[0] === 'string' && /^#[0-9a-f]{6}$/i.test(values[0])) input.type = 'color';
-  document.querySelector<HTMLElement>('#tl-canvas-wrap')?.appendChild(input); input.focus(); input.select?.();
+  else if (isColor) { input.type = 'color'; input.value = String(values[0]).toLowerCase(); }
+  document.querySelector<HTMLElement>('#tl-canvas-wrap')?.appendChild(input); input.focus(); if (!isColor) input.select?.();
+  // The OS color panel is its own window, so the swatch blurs the moment it opens:
+  // a color edit lives on input/change and an outside click, never on blur.
+  let previewing = false;
+  const preview = () => {
+    if (!previewing) { api.edit.begin(`Edit ${row.label}`, { origin: 'timeline' }); previewing = true; }
+    for (const axis of axes) api.edit.dispatch({ type: 'set_property', target: row.L.id, path: axis.key, value: input.value, time, mode: 'auto', preserveHandEdits: false });
+    invalidate();
+  };
   let closed = false;
   const finish = (save: boolean) => {
     if (closed) return;
     closed = true;
-    if (save) {
+    if (previewing) { save ? api.edit.commit(`Edit ${row.label}`) : api.edit.cancel(); }
+    else if (save) {
       const parts = axes.length > 1 ? input.value.split(',').map((value: string) => value.trim()) : [input.value];
       const next = values.map((value, index) => typeof value === 'number' ? Number(parts[index] ?? parts[0]) : typeof value === 'boolean' ? parts[index] === 'true' : parts[index]);
-      if (next.every(value => typeof value !== 'number' || Number.isFinite(value))) api.edit.apply(axes.map((axis, index) => ({
+      const keyed = next.every(value => typeof value === 'number' && Number.isFinite(value)) ? selectedValueKeys(row, trackChannels(row), time) : null;
+      if (keyed) {
+        const all = trackChannels(row);
+        api.history.do(`Edit ${row.label}`, () => axes.forEach((axis, index) => applySelectedValueKeys(keyed, all.findIndex(item => item.key === axis.key), values[index] as number, next[index] as number, scale && !!row.L.scaleLinked)));
+        api.transport.invalidate();
+      } else if (next.every(value => typeof value !== 'number' || Number.isFinite(value))) api.edit.apply(scaleCommand ? scaleCommand(Number(next[0])) : axes.map((axis, index) => ({
         type: 'set_property', target: row.L.id, path: axis.key, value: next[index], time, mode: 'auto', preserveHandEdits: false
       })), { label: `Edit ${row.label}`, origin: 'timeline' });
     }
     input.remove(); invalidate();
   };
   if (options) input.onchange = () => finish(true);
+  else if (isColor) {
+    input.oninput = preview;
+    const outside = (event: Event) => { if (event.target !== input) close(true); };
+    const detach = () => document.removeEventListener('pointerdown', outside, true);
+    const close = (save: boolean) => { detach(); finish(save); };
+    setTimeout(() => document.addEventListener('pointerdown', outside, true));
+    input.onchange = preview;
+    input.onkeydown = (event: KeyboardEvent) => { event.stopPropagation(); if (event.key === 'Enter' || event.key === 'Escape') { event.preventDefault(); close(event.key === 'Enter'); } };
+    canvasCleanups.push(() => { detach(); input.remove(); });
+    try { input.showPicker?.(); } catch { input.click(); }
+    return;
+  }
   input.onblur = () => finish(true);
   input.onkeydown = (event: KeyboardEvent) => { event.stopPropagation(); if (event.key === 'Enter' || event.key === 'Escape') { event.preventDefault(); finish(event.key === 'Enter'); } };
   canvasCleanups.push(() => { input.onblur = null; input.remove(); });
@@ -2265,17 +3033,27 @@ function gutterDown(e: any, x: any, y: any) {
   if (r.kind !== 'layer') {
     api.selection.set({ chan: r.key });
     T.focusGraph(r.L, r.key);
-    api.selection.select(r.L.id); T.keySelectionActive = true; invalidate('timeline');
+    if (!api.selection.layers().includes(r.L.id)) api.selection.select(r.L.id);
+    T.keySelectionActive = true; invalidate('timeline');
     if (r.prop.kf.length && x >= 16 && x < 64) { navigateKeyframe(x < 40 ? -1 : 1, r); return; }
     if (r.L.lock) return;
-    if (isScaleTrack(r) && x >= T.gut - 24) { toggleTimelineScaleLink(api, r.L); return; }
+    if (isScaleTrack(r) && x >= T.gut - 24) { toggleTimelineScaleLink(api, r.L); onMove(e); return; }
     if (x >= 76 && x < 96) { togglePropertyAnimation(r); return; }
     if (x >= T.propertyValueX - 4) dragPropertyValue(e, r, hr.i);
     return;
   }
+  const L = r.L;
+  // Clearing selected keys can reveal the selected child's ancestors. Toggle
+  // from the disclosure the user clicked, before that selection notification.
+  const wasCollapsed = L.type === 'group' ? api.uiState.getGroupCollapsed(L) : api.uiState.getLayerCollapsed(L);
   T.keySelectionActive = false;
   api.selection.set({ keys: [] });
-  const L = r.L;
+  const audioX = embeddedAudioToggleX(L);
+  if (audioX != null && Math.abs(x - audioX) <= AUDIO_TOGGLE_WIDTH / 2) {
+    const muted = L.d.audioMuted === true;
+    api.edit.apply({ type: 'set_content', target: L.id, patch: { audioMuted: !muted }, overrideLock: true }, { label: muted ? 'Unmute audio' : 'Mute audio', origin: 'timeline' });
+    return;
+  }
   if (layerSupportsTransform(L.type) && x >= T.gut - 40) {
     const ids = api.selection.layers().includes(L.id) ? api.selection.layers() : [L.id];
     if (x < T.gut - 20) api.ui.beginParentPick(e, ids);
@@ -2286,7 +3064,7 @@ function gutterDown(e: any, x: any, y: any) {
   else if (x < 40) { api.edit.apply({ type: 'set_layer', target: L.id, patch: { visible: !evaluatedValue(L, L.on, api.transport.time(), 'l.on') } }, { label: 'Toggle visibility', origin: 'timeline' }); return; }
   else if (x < 58) { api.edit.apply({ type: 'set_layer', target: L.id, patch: { locked: !L.lock } }, { label: 'Toggle lock', origin: 'timeline' }); return; }
   else if (x >= 58 + Math.min(48, (r.depth || 0) * 12) && x < 74 + Math.min(48, (r.depth || 0) * 12)) {
-    const collapsed = toggleTimelineDisclosure(api, L);
+    const collapsed = toggleTimelineDisclosure(api, L, wasCollapsed);
     rowsDirty = true;
     if (!collapsed) {
       buildRows();
@@ -2348,52 +3126,90 @@ function gutterDown(e: any, x: any, y: any) {
 }
 
 function slide(e: any) {
-  const selectedIds = api.groups.expand(api.selection.layers()) || api.selection.layers();
-  if (selectedLayers(api).some((layer: any) => layer.type === 'group') && api.project.get().layers.some((layer: any) => selectedIds.includes(layer.id) && layer.lock)) return;
-  const layers = api.project.get().layers.filter((l: any) => (api.groups.expand(api.selection.layers()) || api.selection.layers()).includes(l.id) && l.type !== 'group' && !l.lock && !(api.groups.ancestors(l) || []).some((g: any) => g.lock));
-  const groupIds = api.groups.expand(api.selection.layers()) || api.selection.layers();
-  const groups = api.project.get().layers.filter((L: any) => groupIds.includes(L.id) && L.type === 'group' && !L.lock && !(api.groups.ancestors(L) || []).some((g: any) => g.lock));
+  const selectedIds = new Set(api.groups.expand(api.selection.layers()) || api.selection.layers());
+  if (selectedLayers(api).some((layer: any) => layer.type === 'group') && api.project.get().layers.some((layer: any) => selectedIds.has(layer.id) && layer.lock)) return;
+  const layers = api.project.get().layers.filter((l: any) => selectedIds.has(l.id) && l.type !== 'group' && !l.lock && !(api.groups.ancestors(l) || []).some((g: any) => g.lock));
+  const groups = api.project.get().layers.filter((L: any) => selectedIds.has(L.id) && L.type === 'group' && !L.lock && !(api.groups.ancestors(L) || []).some((g: any) => g.lock));
   const groupStart = groups.map((L: any) => ({L, from:L.from}));
   const start = layers.map((L: any) => ({ L, from: L.from }));
   api.edit.begin('Move clip', { origin: 'timeline' });
+  const snapper = layerEdgeSnapper([...start, ...groupStart].map((s: any) => s.L.id));
+  const probes: EdgeSnapProbe[] = start.flatMap((s: any) => [
+    { time: s.from, edge: 'in' as const }, { time: s.from + s.L.dur, edge: 'out' as const },
+  ]);
+  const earliest = Math.min(...start.map((item: any) => item.from));
   let moved = false;
   beginDrag(e, {
     cursor: 'grabbing',
     move: (dx: any, dy: any, ev: any) => {
       moved = true;
-      let dt = dx / T.pps;
-      if (shiftSnapping(ev)) dt = snapDelta(start, dt);
-      dt = Math.max(dt, -Math.min(...start.map((item: any) => item.from)));
-      groupStart.forEach((s: any) => api.edit.dispatch({type:'set_layer',target:s.L.id,patch:{from:api.util.snapF(s.from+dt,api.project.get().fps)}}));
-      start.forEach((s: any) => api.edit.dispatch({ type: 'set_layer', target: s.L.id, patch: { from: Math.max(0, api.util.snapF(s.from + dt, api.project.get().fps)) } }));
+      const requested = dx / T.pps;
+      const { delta, snapped } = shiftSnapping(ev) ? snapper.resolve(probes, requested) : snapper.release(requested);
+      const dt = Math.max(delta, -earliest);
+      if (Math.abs(dt - delta) > 1e-9) T.snapGuide = null;
+      const at = (from: number) => snapped ? Math.max(0, from + dt) : Math.max(0, api.util.snapF(from + dt, api.project.get().fps));
+      groupStart.forEach((s: any) => api.edit.dispatch({ type: 'set_layer', target: s.L.id, patch: { from: snapped ? s.from + dt : api.util.snapF(s.from + dt, api.project.get().fps) } }));
+      start.forEach((s: any) => api.edit.dispatch({ type: 'set_layer', target: s.L.id, patch: { from: at(s.from) } }));
     },
-    up: () => { moved ? api.edit.commit('Move clip') : api.edit.cancel(); },
-    cancel: () => api.edit.cancel(),
+    up: () => { T.snapGuide = null; moved ? api.edit.commit('Move clip') : api.edit.cancel(); invalidate('timeline'); },
+    cancel: () => { T.snapGuide = null; api.edit.cancel(); invalidate('timeline'); },
   });
 }
-function snapDelta(start: any, dt: any, side?: 'in' | 'out') {
-  const pts = [api.transport.time(), 0, api.project.get().dur, ...(api.project.get().work || []), ...api.project.get().markers.map((m: any) => m.t)];
-  api.project.get().layers.forEach((L: any) => { if (!start.some((s: any) => s.L === L)) { pts.push(L.from, L.from + L.dur); } });
-  const tol = 8 / T.pps;
-  let best = dt, bd = tol;
-  for (const s of start) for (const edge of (side === 'in' ? [s.from + dt] : side === 'out' ? [s.from + s.dur + dt] : [s.from + dt, s.from + s.L.dur + dt])) {
-    for (const p of pts) { const d = Math.abs(edge - p); if (d < bd) { bd = d; best = dt + (p - edge); } }
-  }
-  return best;
+
+/** Shift-snapping for strip drags. Fixed targets (other strips, markers, work
+    area, composition ends) are gathered once per gesture; the playhead is read
+    live and weighted higher, and also offers the frame *after* it to out edges
+    so a strip can end exactly on the playhead's frame. */
+function layerEdgeSnapper(movingIds: string[]) {
+  const moving = new Set(movingIds);
+  let fixed: EdgeSnapTarget[] | null = null;
+  const snapper = createDirectionalSnapper();
+  return {
+    resolve(probes: EdgeSnapProbe[], requested: number) {
+      if (!fixed) {
+        const project = api.project.get();
+        fixed = [{ time: 0 }, { time: project.dur }];
+        for (const time of project.work || []) fixed.push({ time });
+        for (const marker of project.markers || []) fixed.push({ time: marker.t });
+        for (const L of project.layers) {
+          if (moving.has(L.id) || !(L.dur > 0)) continue;
+          fixed.push({ time: L.from }, { time: L.from + L.dur });
+        }
+      }
+      const frame = 1 / Math.max(1, api.project.get().fps);
+      const head = api.transport.time();
+      const resolved = snapper.resolve(
+        probes, requested,
+        [...fixed, { time: head, weight: 1.5 }, { time: head + frame, edge: 'out', weight: 1.5 }],
+        SNAP_RELEASE_PX / Math.max(1, T.pps),
+      );
+      T.snapGuide = resolved.lock?.target ?? null;
+      return { delta: resolved.delta, snapped: !!resolved.lock };
+    },
+    release(requested: number) {
+      snapper.reset(requested); T.snapGuide = null;
+      return { delta: requested, snapped: false };
+    },
+  };
 }
 
 function trim(e: any, side: any) {
-  const layers = api.project.get().layers.filter((l: any) => (api.groups.expand(api.selection.layers()) || api.selection.layers()).includes(l.id) && l.type !== 'group' && !l.lock && !(api.groups.ancestors(l) || []).some((g: any) => g.lock));
+  const selectedIds = new Set(api.groups.expand(api.selection.layers()) || api.selection.layers());
+  const layers = api.project.get().layers.filter((l: any) => selectedIds.has(l.id) && l.type !== 'group' && !l.lock && !(api.groups.ancestors(l) || []).some((g: any) => g.lock));
   const start = layers.map((L: any) => ({ L, from: L.from, dur: L.dur, trim: Number(L.d && L.d.trim) || 0 }));
   api.edit.begin('Trim clip', { origin: 'timeline' });
+  const snapper = layerEdgeSnapper(start.map((s: any) => s.L.id));
+  const probes: EdgeSnapProbe[] = start.map((s: any) => side === 'in'
+    ? { time: s.from, edge: 'in' as const }
+    : { time: s.from + s.dur, edge: 'out' as const });
   let moved = false;
   beginDrag(e, {
     cursor: 'ew-resize',
     move: (dx: any, _dy: any, ev: any) => {
       moved = true;
-      let dt = dx / T.pps;
-      if (shiftSnapping(ev)) dt = snapDelta(start, dt, side);
-      dt = api.util.snapF(dt, api.project.get().fps);
+      const requested = dx / T.pps;
+      const { delta, snapped } = shiftSnapping(ev) ? snapper.resolve(probes, requested) : snapper.release(requested);
+      const dt = snapped ? delta : api.util.snapF(delta, api.project.get().fps);
       start.forEach((s: any) => {
         if (side === 'in') {
           let nf = clamp(s.from + dt, 0, s.from + s.dur - 1 / api.project.get().fps);
@@ -2405,9 +3221,12 @@ function trim(e: any, side: any) {
           }
         } else api.edit.dispatch({ type: 'set_layer', target: s.L.id, patch: { duration: Math.max(1 / api.project.get().fps, s.dur + dt) } });
       });
+      if (T.snapGuide != null && !start.some((s: any) => Math.abs(
+        (side === 'in' ? s.L.from : s.L.from + s.L.dur) - T.snapGuide,
+      ) < 1e-9)) T.snapGuide = null;
     },
-    up: () => { moved ? api.edit.commit('Trim clip') : api.edit.cancel(); },
-    cancel: () => api.edit.cancel(),
+    up: () => { T.snapGuide = null; moved ? api.edit.commit('Trim clip') : api.edit.cancel(); invalidate('timeline'); },
+    cancel: () => { T.snapGuide = null; api.edit.cancel(); invalidate('timeline'); },
   });
 }
 
@@ -2568,7 +3387,11 @@ function keyDown(e: any, r: any, x: any, y: any, rowIdx: any) {
 
 function graphDown(e: any, x: any, y: any) {
   const g = T._graph; if (!g) return;
-  if (y < T.ruler + 28) return;
+  if (y < graphTop() + 28) return;
+  /* The box is inset from the outermost keys, so a grip and the key it scales
+     never compete for the same press. */
+  const grip = g.transform ? graphTransformHandleAtPoint(g.selectionBounds, x, y) : null;
+  if (grip) return dragGraphTransform(e, g, grip);
   let L = g.target.L;
   const series = g.series as any[];
   // Pick the closest visible point/handle, not whichever axis was iterated first.
@@ -2578,20 +3401,23 @@ function graphDown(e: any, x: any, y: any) {
     return { ...item, i: item.key.i, distance: pt ? Math.hypot(x - pt[0], y - pt[1]) : Infinity };
   }).sort((a, b) => a.distance - b.distance);
   const closestDistance = pointHits[0]?.distance ?? Infinity;
-  const pointHit = pickKeyframeHit(pointHits.filter(item => item.distance <= closestDistance + 1), api.selection.keys(), item => item.distance, 8) ?? pointHits[0];
-  if (!pointHit || pointHit.distance >= 6) {
+  const pointHit = pickKeyframeHit(pointHits.filter(item => item.distance <= closestDistance + 1), api.selection.keys(), item => item.distance, GRAPH_POINT_HIT) ?? pointHits[0];
+  const pointDistance = pointHit?.distance ?? Infinity;
+  {
     const handles = points.flatMap(item => (['eo', 'ei'] as const).map(which => {
       const pt = keyHandles(item.key)?.[which === 'eo' ? 'ho' : 'hi'];
       return { ...item, which, distance: pt ? Math.hypot(x - pt[0], y - pt[1]) : Infinity };
     })).sort((a, b) => a.distance - b.distance);
     const nearest = handles[0]?.distance ?? Infinity;
     const handle = handles.find(item => item.distance <= nearest + 1 && api.selection.keys().includes(item.key.i)) ?? handles[0];
-    if (handle && handle.distance < 7) return dragHandle(e, handle.key, handle.which, g, handle.axis.prop.kf, handle.axis.L, handle.axis);
+    if (handle && handle.distance < GRAPH_HANDLE_HIT && !preferGraphPoint(pointDistance, handle.distance)) {
+      return dragHandle(e, handle.key, handle.which, g, handle.axis.prop.kf, handle.axis.L, handle.axis);
+    }
   }
-  if ((!pointHit || pointHit.distance >= 8) && pointInGraphSelection(g.selectionBounds, x, y)) {
+  if (pointDistance >= GRAPH_POINT_HIT && pointInGraphSelection(g.selectionBounds, x, y)) {
     return dragGraphSelection(e, g, L);
   }
-  if (!pointHit || pointHit.distance >= 8) return marquee(e, { additive: e.shiftKey || e.metaKey, graph: true });
+  if (!pointHit || pointDistance >= GRAPH_POINT_HIT) return marquee(e, { additive: e.shiftKey || e.metaKey, graph: true });
   L = pointHit.axis.L;
   const hit = pointHit.key;
   const additive = e.shiftKey || e.metaKey;
@@ -2607,12 +3433,13 @@ function graphDown(e: any, x: any, y: any) {
 }
 
 function dragGraphSelection(e: any, g: any, L: any, click?: () => void) {
-  const visibleProperties = new Set(g.series.map((axis: any) => axis.prop));
+  const visibleProperties = new Set((g.linked ?? g.series).map((axis: any) => axis.prop));
   const entries = selectedKeyEntries().filter((entry: any) => !entry.L.lock && visibleProperties.has(entry.prop));
   if (!entries.length) return;
   const snapshot = captureKeyframeGesture(entries);
   const speeds = entries.map((e:any)=>({key:e.key,inSpeed:e.key.inEase?.speed ?? 0,outSpeed:e.key.outEase?.speed ?? 0}));
   const canvasBounds = T.cv.getBoundingClientRect();
+  const anchorX = e.clientX - canvasBounds.left;
   const anchorY = e.clientY - canvasBounds.top;
   T.graphDragBounds = [g.vmin, g.vmax];
   const timeScale = T.pps;
@@ -2634,18 +3461,113 @@ function dragGraphSelection(e: any, g: any, L: any, click?: () => void) {
         const snap = snapKeyframeGesture(snapshot, delta, snapLock);
         delta = snap.delta; snapLock = snap.lock;
       } else snapLock = null;
-      applyKeyframeGesture(snapshot, delta, (item: any) => item.value + (T.graphType==='speed'?0:dv), planGraphKeyframeMove);
+      const plan = applyKeyframeGesture(snapshot, delta, (item: any) => item.value + (T.graphType==='speed'?0:dv), planGraphKeyframeMove);
+      T.graphReadout = graphMoveReadout(snapshot, anchorX + dx, anchorY + dy, plan.delta, dv);
       if(T.graphType==='speed'){ for(const item of speeds){ item.key.inInterp=item.key.outInterp='bezier'; item.key.inEase.speed=item.inSpeed+dv; item.key.outEase.speed=item.outSpeed+dv; } api.anim.touch(); invalidate(); }
     },
     up: () => {
-      T.graphDragBounds = null;
+      T.graphDragBounds = null; T.graphReadout = null;
       if (moved) api.history.commit('Edit curve');
       else click?.();
       invalidate();
     },
     cancel: () => {
       if (moved) { restoreKeyframeGesture(snapshot); api.history.cancel(); api.anim.touch(); }
-      T.graphDragBounds = null;
+      T.graphDragBounds = null; T.graphReadout = null;
+      invalidate();
+    },
+  });
+}
+
+/* Rebuild from the pointer-down snapshot on every move, like the move gesture:
+   a scale the box later backs away from leaves nothing behind. */
+function applyGraphKeyframeScale(snapshot: any, request: any, eases: any[]) {
+  restoreKeyframeGesture(snapshot);
+  const plan = planGraphKeyframeScale(snapshot.items, request, api.project.get().fps);
+  plan.moves.forEach(({ item, time, value }: any) => {
+    item.key.t = time;
+    if (typeof item.key.v === 'number' && Number.isFinite(value)) item.key.v = api.util.round(value, 3);
+  });
+  /* Influence is a ratio and survives a scale untouched, but the stored speed
+     is value-per-second, so it has to follow value over time to keep the drawn
+     curve through the rescaled keys. */
+  const ratio = plan.timeScale > 1e-6 ? plan.valueScale / plan.timeScale : 1;
+  for (const ease of eases) {
+    if (typeof ease.inSpeed === 'number' && ease.key.inEase) ease.key.inEase.speed = ease.inSpeed * ratio;
+    if (typeof ease.outSpeed === 'number' && ease.key.outEase) ease.key.outEase.speed = ease.outSpeed * ratio;
+  }
+  snapshot.properties.forEach(({ prop, keys }: any) => {
+    const order = new Map(keys.map(({ key, order }: any) => [key, order]));
+    prop.kf = keys.map(({ key }: any) => key)
+      .sort((a: any, b: any) => a.t - b.t || (order.get(a) as number) - (order.get(b) as number));
+  });
+  api.anim.touch(); invalidate();
+  return plan;
+}
+
+/* Drag a transform-box grip: corners scale time and value together, edges one
+   axis. The opposite edge stays put, or the box centre while Cmd/Ctrl is held. */
+function dragGraphTransform(e: any, g: any, grip: GraphTransformHandle) {
+  const box = g.transform;
+  const visibleProperties = new Set(g.series.map((axis: any) => axis.prop));
+  const entries = selectedKeyEntries().filter((entry: any) => !entry.L.lock && visibleProperties.has(entry.prop));
+  if (!box || entries.length < 2) return;
+  const snapshot = captureKeyframeGesture(entries);
+  const eases = snapshot.items.filter((item: any) => item.selected).map((item: any) => ({
+    key: item.key, inSpeed: item.key.inEase?.speed, outSpeed: item.key.outEase?.speed,
+  }));
+  /* y grows downward, so the northern grips carry the *highest* value. */
+  const east = grip.includes('e'), west = grip.includes('w');
+  const north = grip.includes('n'), south = grip.includes('s');
+  const canvasBounds = T.cv.getBoundingClientRect();
+  const anchorX = e.clientX - canvasBounds.left, anchorY = e.clientY - canvasBounds.top;
+  T.graphDragBounds = [g.vmin, g.vmax];
+  let moved = false;
+  beginDrag(e, {
+    cursor: graphTransformCursor(grip),
+    move: (dx: any, dy: any, event: PointerEvent) => {
+      if (!moved && Math.hypot(dx, dy) < 3) return;
+      if (!moved) { moved = true; api.history.begin('Scale keyframes'); }
+      const centered = Boolean(event?.metaKey || event?.ctrlKey);
+      const midTime = (box.t0 + box.t1) / 2, midValue = (box.v0 + box.v1) / 2;
+      const anchorTime = centered ? midTime : east ? box.t0 : box.t1;
+      const movingTime = east ? box.t1 : box.t0;
+      const anchorValue = centered ? midValue : north ? box.v0 : box.v1;
+      const movingValue = north ? box.v1 : box.v0;
+      const timeSpan = movingTime - anchorTime, valueSpan = movingValue - anchorValue;
+      const request = {
+        anchorTime: east || west ? anchorTime : midTime,
+        anchorValue: north || south ? anchorValue : midValue,
+        timeScale: (east || west) && Math.abs(timeSpan) > 1e-9
+          ? (x2t(anchorX + dx) - anchorTime) / timeSpan : 1,
+        valueScale: (north || south) && Math.abs(valueSpan) > 1e-9
+          ? (g.y2v(anchorY + dy) - anchorValue) / valueSpan : 1,
+      };
+      const plan = applyGraphKeyframeScale(snapshot, request, eases);
+      const percent = (scale: number) => Math.round(scale * 1000) / 10 + '%';
+      const parts = [
+        ...(east || west ? ['T ' + percent(plan.timeScale)] : []),
+        ...(north || south ? ['V ' + percent(plan.valueScale)] : []),
+      ];
+      T.graphReadout = { x: anchorX + dx, y: anchorY + dy, text: parts.join('  ·  ') };
+    },
+    up: () => {
+      T.graphDragBounds = null; T.graphReadout = null;
+      if (moved) api.history.commit('Scale keyframes');
+      invalidate();
+    },
+    cancel: () => {
+      if (moved) {
+        /* restoreKeyframeGesture only knows times and values; the eases this
+           gesture rescaled have to be put back by hand. */
+        restoreKeyframeGesture(snapshot);
+        for (const ease of eases) {
+          if (typeof ease.inSpeed === 'number' && ease.key.inEase) ease.key.inEase.speed = ease.inSpeed;
+          if (typeof ease.outSpeed === 'number' && ease.key.outEase) ease.key.outEase.speed = ease.outSpeed;
+        }
+        api.history.cancel(); api.anim.touch();
+      }
+      T.graphDragBounds = null; T.graphReadout = null;
       invalidate();
     },
   });
@@ -2653,7 +3575,7 @@ function dragGraphSelection(e: any, g: any, L: any, click?: () => void) {
 function dragHandle(e: any, k: any, which: 'eo' | 'ei', g: any, kf: any, L: any, clickedAxis: any) {
   if (L.lock) return;
   const trackKey = clickedAxis?.trackKey ?? clickedAxis?.key;
-  const axes = g.series.filter((axis: any) => (axis.trackKey ?? axis.key) === trackKey && !axis.L.lock);
+  const axes = (g.linked ?? g.series).filter((axis: any) => (axis.trackKey ?? axis.key) === trackKey && !axis.L.lock);
   const candidates = axes.flatMap((axis: any) => axis.prop.kf.map((key: any) => ({ axis, key })));
   const clickedIndex = kf.indexOf(k);
   const explicitlySelected = new Set(api.selection.keys());
@@ -2850,6 +3772,32 @@ function marquee(e: any, opt: any = {}) {
 
 function onDbl(e: any) {
   const x = e.offsetX, y = e.offsetY;
+  if (inGraph(x, y) && y >= graphTop() + 28) {
+    const hit = [...(T._graph?.points || [])]
+      .map((point: any) => ({ point, distance: Math.hypot(x - point.x, y - point.y) }))
+      .sort((a: any, b: any) => a.distance - b.distance)[0];
+    if (hit && hit.distance < GRAPH_POINT_HIT) {
+      const clicked = [{ key: hit.point.key, prop: hit.point.axis.prop, L: hit.point.axis.L }];
+      editKeyframeValues(keyframeContextEntries(clicked, api.selection.keys(), selectedKeyEntries()));
+    }
+    return;
+  }
+  // Double-clicking a keyframe in the timeline should use the same editor as
+  // graph points. When the clicked key is part of the current selection,
+  // keyframeContextEntries expands this to the complete selection so a bulk
+  // value edit is available without opening the context menu first.
+  if (!inGraph(x, y) && x > T.gut && y >= T.ruler) {
+    const hr = hitRow(y);
+    if (hr?.row.kind === 'prop') {
+      const row = hr.row;
+      const key = row.prop.kf.find((candidate: any) => Math.abs(t2x(row.L.from + candidate.t) - x) < 7);
+      if (key) {
+        const members = key.members ?? [{ key, prop: row.prop, L: row.L }];
+        editKeyframeValues(keyframeContextEntries(members, api.selection.keys(), selectedKeyEntries()));
+        return;
+      }
+    }
+  }
   const workHit: any = x > T.gut && workAreaHit(x, y);
   if (workHit?.kind === 'bar') {
     api.edit.apply({ type: 'set_composition', patch: { workArea: [0, api.project.get().dur] } }, { label: 'Reset work area', origin: 'timeline' });
@@ -2858,6 +3806,8 @@ function onDbl(e: any) {
   if (x < T.gut && y > T.ruler) {
     const hr = hitRow(y);
     if (hr?.row.kind === 'prop' && x >= T.propertyValueX - 4) { editPropertyValue(hr.row, hr.i); return; }
+    /* AE: double-clicking a precomp layer opens its source composition. */
+    if (hr && hr.row.kind === 'layer' && hr.row.L.type === 'precomp' && hr.row.L.d?.comp) { api.commands.run('openComposition', hr.row.L.d.comp); return; }
     if (hr && hr.row.kind === 'layer' && x > 90) renameLayer(hr.row.L, hr.i);
   }
 }
@@ -2867,8 +3817,8 @@ function renameLayer(L: any, rowIdx: any) {
     value: L.name,
     style: {
       position: 'absolute', left: '94px', top: (rowY(rowIdx) + 5) + 'px', width: (T.gut - 110) + 'px',
-      height: '20px', background: '#000', border: '1px solid var(--accent)', borderRadius: '4px',
-      color: 'var(--tx)', fontSize: '11.5px', padding: '0 5px', zIndex: 9,
+      height: '20px', background: 'var(--bg-row)', border: '1px solid var(--accent)', borderRadius: '4px',
+      color: 'var(--tx)', fontFamily: 'inherit', fontSize: '11.5px', padding: '0 5px', zIndex: 9,
     },
   });
   if (!wrap) return;
@@ -2883,18 +3833,79 @@ function renameLayer(L: any, rowIdx: any) {
   inp.onkeydown = (ev: any) => { ev.stopPropagation(); if (ev.key === 'Enter') done(true); if (ev.key === 'Escape') done(false); };
 }
 
+/* Menu and dialog entries reach us with only { key, prop }; recover the owning
+   layer so a time edit can be measured against that layer's span. */
+function layerForProperty(prop: any) {
+  return api.project.get().layers.find((L: any) => api.anim.allProps(L).some((entry: any) => entry.prop === prop)) ?? null;
+}
+
+/* AE's "Edit Value…". Dragging a key in the graph is the fast path; this is
+   the exact one. Time is a single key's to change — a group would have to move
+   rigidly, which is what dragging already does. */
+function editKeyframeValues(clickedEntries: any[]) {
+  const entries = clickedEntries
+    .map((entry: any) => ({ ...entry, L: entry.L ?? layerForProperty(entry.prop) }))
+    .filter((entry: any) => typeof entry.key.v === 'number' && entry.L && !entry.L.lock);
+  if (!entries.length) { api.ui.toast('Select a numeric keyframe first'); return; }
+  const single = entries.length === 1;
+  const fps = api.project.get().fps;
+  const body = document.createElement('div');
+  const field = (label: string, value: number | null) => {
+    const row = document.createElement('label'), input = document.createElement('input');
+    row.textContent = label;
+    input.type = 'number'; input.step = 'any'; input.setAttribute('aria-label', label);
+    if (value == null) { input.placeholder = 'mixed'; } else { input.value = String(api.util.round(value, 4)); }
+    row.style.cssText = 'display:grid;grid-template-columns:1fr 120px;gap:12px;margin:10px 0';
+    row.append(input); body.append(row);
+    return input;
+  };
+  const values = entries.map((entry: any) => entry.key.v);
+  const time = single ? field('Time (s)', entries[0].L.from + entries[0].key.t) : null;
+  const value = field('Value', values.every((v: number) => v === values[0]) ? values[0] : null);
+  const message = document.createElement('div'); message.setAttribute('role', 'status'); body.append(message);
+  api.ui.modal({
+    title: single ? 'Edit keyframe' : `Edit ${entries.length} keyframes`,
+    body,
+    actions: [{ label: 'Cancel' }, { label: 'Apply', pri: true, run: () => {
+      const nextValue = value.value.trim() === '' ? null : value.valueAsNumber;
+      if (nextValue != null && !Number.isFinite(nextValue)) { message.textContent = 'Enter a finite value.'; return false; }
+      let nextTime: number | null = null;
+      if (single && time && time.value.trim() !== '') {
+        const entry = entries[0];
+        if (!Number.isFinite(time.valueAsNumber)) { message.textContent = 'Enter a finite time.'; return false; }
+        nextTime = api.util.snapF(time.valueAsNumber - entry.L.from, fps);
+        if (nextTime < 0 || nextTime > entry.L.dur) { message.textContent = 'That time falls outside the layer.'; return false; }
+        if (entry.prop.kf.some((key: any) => key !== entry.key && Math.abs(key.t - nextTime!) < .5 / fps)) {
+          message.textContent = 'Another keyframe already sits on that frame.'; return false;
+        }
+      }
+      if (nextValue == null && nextTime == null) return;
+      api.history.do(single ? 'Edit keyframe' : 'Edit keyframes', () => {
+        if (nextValue != null) entries.forEach((entry: any) => { entry.key.v = nextValue; });
+        if (nextTime != null) {
+          entries[0].key.t = nextTime;
+          entries[0].prop.kf.sort((a: any, b: any) => a.t - b.t);
+        }
+        api.anim.touch();
+      });
+      api.transport.invalidate();
+    } }],
+  });
+}
+
 function pushKeyframeMenu(items: any[], clickedEntries: any[]) {
   const entries = keyframeContextEntries(clickedEntries, api.selection.keys(), selectedKeyEntries());
   entries.forEach((entry:any)=>temporalKeys(entry.prop.kf));
   const keys = entries.map((entry: any) => entry.key);
   const multiple = keys.length > 1;
   items.push({ header: multiple ? `${keys.length} keyframes` : 'Keyframe' });
-  items.push({label:'Keyframe Velocity…',run:()=>velocityDialog(api,entries)}, {label:'Scale keyframes…',run:()=>scaleGraphDialog(api,selectedKeyEntries())});
+  items.push({label:'Edit Value…',run:()=>editKeyframeValues(entries)},
+    {label:'Keyframe Velocity…',run:()=>velocityDialog(api,entries)}, {label:'Scale keyframes…',run:()=>scaleGraphDialog(api,entries)});
   const labels: Record<string, string> = {
-    linear: 'Linear', power: 'Power', easeOut: 'Ease out', easeInOut: 'Ease in / out',
+    linear: 'Linear', swish: 'Swish', power: 'Power', easeIn: 'Ease in', easeOut: 'Ease out', easeInOut: 'Easy ease',
     expoOut: 'Exponential out', backOut: 'Overshoot', snap: 'Snap', glide: 'Glide',
   };
-  ['linear', 'power', 'easeOut', 'easeInOut', 'expoOut', 'backOut', 'snap', 'glide'].forEach((name: any) =>
+  ['linear', 'easeIn', 'easeOut', 'easeInOut', 'swish', 'power', 'expoOut', 'backOut', 'snap', 'glide'].forEach((name: any) =>
     items.push({
       label: labels[name], curve: api.ease.PRESETS[name],
       on: keys.every((target: any) => !target.hold && api.ease.nameOf(target.eo, target.ei) === name),
@@ -2909,6 +3920,12 @@ function pushKeyframeMenu(items: any[], clickedEntries: any[]) {
     }),
   });
   items.push('-', {
+    label: multiple ? `Copy ${keys.length} keyframes` : 'Copy keyframe',
+    run: () => {
+      api.selection.set({ keys: expandScaleKeyIds(api, keys) });
+      api.commands.run('copyKeyframes');
+    },
+  }, {
     label: multiple ? `Delete ${keys.length} keyframes` : 'Delete keyframe',
     run: () => api.history.do(multiple ? 'Delete keyframes' : 'Delete keyframe', () => {
       const values = new Map<any, any>();
@@ -2932,14 +3949,14 @@ function onCtx(e: any) {
   const x = e.offsetX, y = e.offsetY;
   const hr = hitRow(y);
   const items: any[] = [];
-  const graphPoint = T.graph && x > T.gut
+  const graphPoint = inGraph(x, y)
     ? [...(T._graph?.points || [])]
       .map((point: any) => ({ ...point, distance: Math.hypot(x - point.x, y - point.y) }))
       .sort((a: any, b: any) => a.distance - b.distance)[0]
     : null;
   if (graphPoint?.distance < 8) {
-    pushKeyframeMenu(items, [{ key: graphPoint.key, prop: graphPoint.axis.prop }]);
-  } else if (!T.graph && hr && hr.row.kind === 'prop') {
+    pushKeyframeMenu(items, [{ key: graphPoint.key, prop: graphPoint.axis.prop, L: graphPoint.axis.L }]);
+  } else if (!inGraph(x, y) && hr && hr.row.kind === 'prop') {
     const r = hr.row;
     const key = r.prop.kf.find((k: any) => Math.abs(t2x(r.L.from + k.t) - x) < 7);
     if (key) {
@@ -2950,12 +3967,13 @@ function onCtx(e: any) {
         const values = trackChannels(r).map(axis => ({ ...axis, value: api.anim.evP(r.L, axis.prop, x2t(x), axis.key) }));
         values.forEach(axis => api.anim.setKeyOn(axis.prop, x2t(x) - r.L.from, axis.value, 'linear', api.project.get().fps));
       }) });
+      items.push({ label: 'Paste keyframes here', run: () => api.commands.run('pasteKeyframes', { layer: r.L.id, path: r.key, time: x2t(x) }) });
       items.push({ label: 'Clear all keyframes', icon: 'x', disabled: !r.prop.kf.length, run: () => api.history.do('Clear keys', () => { trackChannels(r).forEach(axis => { axis.prop.v = api.anim.evP(r.L, axis.prop, api.transport.time(), axis.key); axis.prop.kf = []; }); api.anim.touch(); }) });
     }
-  } else if (!T.graph && hr && hr.row.kind === 'layer') {
+  } else if (!inGraph(x, y) && hr && hr.row.kind === 'layer') {
     api.ui.showLayerMenu(hr.row.L, e, 'timeline');
     return;
-  } else if (!T.graph || y < T.ruler) {
+  } else if (!inGraph(x, y)) {
     items.push({ label: 'Set work area start', icon: 'frame', run: () => api.edit.apply({ type: 'set_composition', patch: { workArea: [Math.min(api.transport.time(), api.project.get().work[1] - 1 / api.project.get().fps), api.project.get().work[1]] } }, { label: 'Work area', origin: 'timeline' }) },
       { label: 'Set work area end', icon: 'frame', run: () => api.edit.apply({ type: 'set_composition', patch: { workArea: [api.project.get().work[0], Math.max(api.transport.time(), api.project.get().work[0] + 1 / api.project.get().fps)] } }, { label: 'Work area', origin: 'timeline' }) },
       { label: 'Reset work area', icon: 'undo', run: () => api.edit.apply({ type: 'set_composition', patch: { workArea: [0, api.project.get().dur] } }, { label: 'Work area', origin: 'timeline' }) });
@@ -2963,16 +3981,15 @@ function onCtx(e: any) {
   /* Extension contributions land at the end, so the positions a user has
      learned for the built-in rows never move. `layer:context` only fires over a
      layer row; `timeline:context` fires for every row kind. */
-  const rowKind = graphPoint?.distance < 8 ? 'keyframe' : T.graph ? 'graph' : hr ? hr.row.kind : 'empty';
+  const rowKind = graphPoint?.distance < 8 ? 'keyframe' : inGraph(x, y) ? 'graph' : hr ? hr.row.kind : 'empty';
   const layerId = graphPoint?.distance < 8
     ? T._graph?.target?.L?.id ?? null
     : hr && hr.row.kind === 'layer' ? hr.row.L.id : null;
-  const contributed = [
-    ...(layerId ? api.menus.collect('layer:context', { layerId }) : []),
-    ...api.menus.collect('timeline:context', { kind: rowKind, layerId, time: x2t(x) }),
-  ];
-  if (contributed.length) items.push('-' as any, ...contributed);
-  if (items.length) api.ui.menu({ x: e.clientX, y: e.clientY }, items);
+  const contributed = Promise.all([
+    layerId ? api.menus.gather('layer:context', { layerId }) : [],
+    api.menus.gather('timeline:context', { kind: rowKind, layerId, time: x2t(x) }),
+  ]).then(lists => lists.flat());
+  api.ui.menu({ x: e.clientX, y: e.clientY }, contributed.then(extra => extra.length ? [...items, '-' as any, ...extra] : items));
 }
 
 /* ── edge navigation ───────────────────────────────────── */

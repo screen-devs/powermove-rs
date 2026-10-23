@@ -1,6 +1,22 @@
 import type { PMRegistry } from '../registry';
 import { splitTextLayers, type TextSplitMode } from '../core/split-text';
 import { evaluatedValue } from '../core/content-properties';
+import { validMatteSource } from '../core/matte';
+
+/** Apply the lower of two stack-selected layers as an alpha track matte for the upper layer. */
+export function applySelectedLayerMatte(PM: PMRegistry, selected: any[], origin = 'timeline'): boolean {
+  if (selected.length !== 2) return false;
+  const layers = selected.slice().sort((a, b) => PM.proj.layers.indexOf(a) - PM.proj.layers.indexOf(b));
+  const top = layers[0];
+  const bottom = layers[1];
+  if (!top || !bottom || top === bottom || ['audio', 'null', 'adjustment', 'group'].includes(bottom.type)) return false;
+  if (top.lock || bottom.lock || (PM.groupAncestors?.(top) || []).some((group: any) => group.lock)
+    || (PM.groupAncestors?.(bottom) || []).some((group: any) => group.lock)) return false;
+  if (!validMatteSource(PM.proj.layers, top, bottom.id)) return false;
+  PM.Edit.apply({ type: 'set_layer', target: top.id, patch: { matteSource: bottom.id } },
+    { label: 'Use bottom layer as mask', origin });
+  return true;
+}
 
 export function parentMenuItems(PM: PMRegistry, ids: string[], origin = 'timeline'): any[] {
   const selected = ids.map(id => PM.L(id)).filter((layer: any) => layer && PM.TYPE_META[layer.type]?.transform !== false);
@@ -22,13 +38,22 @@ export function installLayerMenu(PM: PMRegistry): void {
     const editOrigin = origin === 'viewer' ? 'canvas' : origin;
     const apply = (commands: any, label: string) => PM.Edit.apply(commands, { label, origin: editOrigin });
     const patch = (value: any, label: string) => apply(selected.map((item: any) => ({ type: 'set_layer', target: item.id, patch: value })), label);
-    const open = (items: any[]) => PM.menu(document.body, items, { x: event.clientX, y: event.clientY });
+    const open = (items: any[] | Promise<any[]>) => PM.menu(document.body, items, { x: event.clientX, y: event.clientY });
     const more = (title: string, items: any[]) => open([{ label: '‹ Back', run: () => PM.showLayerMenu(layer, event, origin) }, { header: title }, ...items]);
     const items: any[] = [
       { header: selected.length > 1 ? `${selected.length} layers` : layer.name },
       { label: 'Duplicate', icon: 'copy', kb: '⌘D', disabled: !editable, run: () => PM.cmd('duplicate') },
       { label: 'Group layers', icon: 'stack', kb: '⌘G', disabled: !editable, run: () => PM.cmd('groupLayers') },
+      { label: 'Pre-compose…', icon: 'layers', kb: '⇧⌘C', disabled: !editable, run: () => PM.cmd('precompose') },
     ];
+    if (selected.length === 2) {
+      const matteLayers = selected.slice().sort((a: any, b: any) => PM.proj.layers.indexOf(a) - PM.proj.layers.indexOf(b));
+      const canMatte = matteLayers[0] && matteLayers[1]
+        && !['audio', 'null', 'adjustment', 'group'].includes(matteLayers[1].type)
+        && validMatteSource(PM.proj.layers, matteLayers[0], matteLayers[1].id);
+      items.push({ label: 'Use bottom layer as mask', icon: 'mask', disabled: !editable || !canMatte,
+        run: () => applySelectedLayerMatte(PM, selected, editOrigin) });
+    }
     if (selected.every((item: any) => item.type === 'text')) items.push({ label: 'Split text into layers…', icon: 'type', disabled: !editable, run: () => more('Split text into layers',
       ([['By word', 'words'], ['By character', 'characters'], ['By line', 'lines']] as const).map(([label, mode]) => ({ label, run: () => splitTextLayers(PM, selected.map((item: any) => item.id), mode as TextSplitMode) }))) });
     if (selected.every((item: any) => item.type !== 'audio' && item.type !== 'adjustment')) items.push({ label: '3D layer', icon: 'cube', on: selected.every((item: any) => item.threeD), disabled: !editable, run: () => patch({threeD: !selected.every((item: any) => item.threeD)}, '3D layer') });
@@ -51,15 +76,24 @@ export function installLayerMenu(PM: PMRegistry): void {
         { label: 'Fit to composition', run: () => patch({ from: 0, duration: PM.proj.dur }, 'Fit duration') },
       ]) });
     }
-    if (selected.length === 1 && layer.type === 'video' && layer.d?.embeddedAudio === true) items.push({ label: 'Separate audio', icon: 'speaker', disabled: !editable, run: () => PM.cmd('separateAudio', layer.id) });
+    if (selected.length === 1 && layer.type === 'video' && layer.d?.embeddedAudio === true) {
+      const muted = layer.d.audioMuted === true;
+      items.push({ label: muted ? 'Unmute audio' : 'Mute audio', icon: 'speaker', disabled: !editable, run: () => apply({ type: 'set_content', target: layer.id, patch: { audioMuted: !muted } }, muted ? 'Unmute audio' : 'Mute audio') });
+      items.push({ label: 'Separate audio', icon: 'speaker', disabled: !editable, run: () => PM.cmd('separateAudio', layer.id) });
+    }
     items.push('-',
       { label: evaluatedValue(PM, layer, layer.on, PM.time, 'l.on') ? 'Hide' : 'Show', icon: evaluatedValue(PM, layer, layer.on, PM.time, 'l.on') ? 'eyeoff' : 'eye', disabled: !editable, run: () => patch({ visible: !evaluatedValue(PM, layer, layer.on, PM.time, 'l.on') }, 'Visibility') },
       { label: layer.solo ? 'Unsolo' : 'Solo', icon: 'headphones', disabled: !editable, run: () => patch({ solo: !layer.solo }, 'Solo layers') },
       { label: lockedGroup ? 'Unlock group' : layer.lock ? 'Unlock' : 'Lock', icon: 'lock', run: () => lockedGroup ? apply({type:'set_layer',target:lockedGroup.id,patch:{locked:false}}, 'Unlock group') : patch({ locked: !layer.lock }, 'Lock layers') },
       '-', { label: 'Delete', icon: 'trash', kb: '⌫', disabled: !editable, run: () => PM.cmd('delete') });
-    const contributed = [...(PM.Kernel?.collectMenu?.('layer:context', { layerId: layer.id }) || []),
-      ...(PM.Kernel?.collectMenu?.(`${origin}:context`, { kind: 'layer', layerId: layer.id, time: PM.time }) || [])];
-    if (contributed.length) items.push('-', ...contributed);
-    open(items);
+    /* Each open asks its contributors afresh, with this layer. Sandboxed ones
+       answer over a port, within the kernel's deadline. */
+    const contributions = [PM.Kernel?.gatherMenu?.('layer:context', { layerId: layer.id }) || [],
+      PM.Kernel?.gatherMenu?.(`${origin}:context`, { kind: 'layer', layerId: layer.id, time: PM.time }) || []];
+    const withContributions = (lists: any[][]) => {
+      const contributed = lists.flat();
+      return contributed.length ? [...items, '-', ...contributed] : items;
+    };
+    open(contributions.every(Array.isArray) ? withContributions(contributions) : Promise.all(contributions).then(withContributions));
   };
 }

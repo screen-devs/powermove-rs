@@ -2,8 +2,10 @@
 import { flushSync, mount, tick, unmount } from 'svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { doc } from '../state/document.svelte';
+import { transport, updateControlTime } from '../state/transport.svelte';
 import ColorField from './ColorField.svelte';
 import FillField from './FillField.svelte';
+import { BLINK_MS } from './menu-blink';
 import FontField from './FontField.svelte';
 import NumField from './NumField.svelte';
 import RowNumFieldHarness from './__fixtures__/RowNumFieldHarness.svelte';
@@ -17,6 +19,7 @@ const mounted: object[] = [];
 afterEach(async () => {
   for (const component of mounted.splice(0)) await unmount(component);
   document.body.replaceChildren();
+  transport.playing = false;
   delete (window as Window & { EyeDropper?: unknown }).EyeDropper;
 });
 
@@ -36,7 +39,7 @@ function fakeAPI() {
   };
   const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
   const normalizeFill = vi.fn((value: any, fallback = '#000000') => {
-    const color = (candidate: any) => typeof candidate === 'string' && /^#[0-9a-f]{6}$/i.test(candidate) ? candidate.toUpperCase() : fallback;
+    const color = (candidate: any) => typeof candidate === 'string' && /^#[0-9a-f]{6}(?:[0-9a-f]{2})?$/i.test(candidate) ? candidate.toUpperCase() : fallback;
     const raw = value && typeof value === 'object' ? value : {};
     const type = ['solid', 'linear', 'radial', 'none'].includes(raw.type) ? raw.type : 'solid';
     let stops = (Array.isArray(raw.stops) ? raw.stops : []).slice(0, 8).map((stop: any, index: number) => ({
@@ -89,6 +92,40 @@ function render(component: any, props: Record<string, unknown>): HTMLElement {
 const pointer = (type: string, init: PointerEventInit = {}) => new PointerEvent(type, { bubbles: true, button: 0, ...init });
 
 describe('NumField', () => {
+  it('refreshes playback readouts at 15 Hz while edits and paused scrubs use live values', () => {
+    const { api, Edit, drag } = fakeAPI();
+    let time = 0;
+    transport.playing = true;
+    updateControlTime(time, true, 0, true);
+    const get = vi.fn(() => time * 100);
+    const target = render(NumField, { api, get, edit: commandEdit(), step: 1 });
+    const input = target.querySelector<HTMLInputElement>('input')!;
+    get.mockClear();
+    for (let frame = 1; frame <= 120; frame++) {
+      time = frame / 120;
+      transport.time = time;
+      updateControlTime(time, true, frame * 1000 / 120);
+      flushSync();
+    }
+    expect(get.mock.calls.length).toBeGreaterThanOrEqual(12);
+    expect(get.mock.calls.length).toBeLessThanOrEqual(16);
+    // Editing starts from the actual value even between readout refreshes.
+    time = 1.123;
+    input.dispatchEvent(pointer('pointerdown'));
+    drag().move(4, 0, pointer('pointermove'));
+    expect(Edit.dispatch).toHaveBeenLastCalledWith(expect.objectContaining({ value: 114.3 }));
+    drag().up();
+    transport.time = .375;
+    time = .375;
+    transport.playing = false;
+    flushSync();
+    expect(input.value).toBe('38');
+    time = .125;
+    transport.time = time;
+    flushSync();
+    expect(input.value).toBe('13');
+  });
+
   it('adjusts from horizontal trackpad movement and commits one gesture', () => {
     vi.useFakeTimers();
     const { api, Edit } = fakeAPI();
@@ -103,6 +140,69 @@ describe('NumField', () => {
     vi.advanceTimersByTime(350);
     expect(Edit.commit).toHaveBeenCalledTimes(1);
     vi.useRealTimers();
+  });
+
+  it('keeps a negative value when the editor is opened and left, and treats a bare minus as a number', async () => {
+    const { api, Edit, drag } = fakeAPI();
+    let current = -2;
+    Edit.dispatch.mockImplementation((command: any) => { current = command.value; });
+    Edit.apply.mockImplementation((command: any) => { current = command.value; return { ok: true }; });
+    const target = render(NumField, { api, get: () => current, edit: commandEdit('Tracking'), step: 1, label: 'Tracking' });
+    const input = target.querySelector<HTMLInputElement>('input.num')!;
+    input.dispatchEvent(pointer('pointerdown'));
+    drag().up();
+    await tick();
+    expect(input.readOnly).toBe(false);
+    input.dispatchEvent(new FocusEvent('blur'));
+    expect(Edit.apply).not.toHaveBeenCalled();
+    expect(current).toBe(-2);
+
+    input.dispatchEvent(pointer('pointerdown'));
+    drag().up();
+    await tick();
+    input.value = '-7';
+    input.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    expect(Edit.apply).toHaveBeenLastCalledWith(expect.objectContaining({ value: -7 }), expect.anything());
+
+    input.dispatchEvent(pointer('pointerdown'));
+    drag().up();
+    await tick();
+    input.value = '-=3';
+    input.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    expect(Edit.apply).toHaveBeenLastCalledWith(expect.objectContaining({ value: -10 }), expect.anything());
+  });
+
+  it('aborts a scrub cleanly when another edit transaction is already live', () => {
+    const { api, Edit, drag } = fakeAPI();
+    Edit.begin.mockImplementationOnce(() => { throw new Error('A source edit is already active'); });
+    const target = render(NumField, { api, get: () => 10, edit: commandEdit('Size'), label: 'Size' });
+    const input = target.querySelector<HTMLInputElement>('input.num')!;
+    expect(() => input.dispatchEvent(pointer('pointerdown'))).not.toThrow();
+    expect(api.ui.drag).not.toHaveBeenCalled();
+    expect(Edit.cancel).not.toHaveBeenCalled();
+    // The next gesture works normally.
+    input.dispatchEvent(pointer('pointerdown'));
+    expect(api.ui.drag).toHaveBeenCalledTimes(1);
+    drag().up();
+  });
+
+  it('scrubs on both axes: right or up raises, left or down lowers', () => {
+    const { api, Edit, drag } = fakeAPI();
+    let current = 10;
+    Edit.dispatch.mockImplementation((command: any) => { current = command.value; });
+    const target = render(NumField, { api, get: () => current, edit: commandEdit('Size'), step: 1, speed: 1, label: 'Size' });
+    const input = target.querySelector<HTMLInputElement>('input.num')!;
+    input.dispatchEvent(pointer('pointerdown'));
+    drag().move(0, -2, pointer('pointermove'));
+    expect(Edit.dispatch).not.toHaveBeenCalled();
+    drag().move(0, -8, pointer('pointermove'));
+    expect(Edit.dispatch).toHaveBeenLastCalledWith(expect.objectContaining({ value: 18 }));
+    drag().move(-4, 6, pointer('pointermove'));
+    expect(Edit.dispatch).toHaveBeenLastCalledWith(expect.objectContaining({ value: 0 }));
+    drag().up();
+    expect(Edit.commit).toHaveBeenCalledWith('Size');
   });
 
   it('scrubs through begin → writes → commit and opens editing after a click/cancel', async () => {
@@ -206,10 +306,42 @@ describe('NumField', () => {
 });
 
 describe('one-shot fields', () => {
+  it('ToggleField uses the live animated value between playback readout ticks', () => {
+    const { api, Edit } = fakeAPI();
+    transport.playing = true;
+    updateControlTime(0, true, 0, true);
+    let current = false;
+    const target = render(ToggleField, { api, get: () => current, edit: commandEdit('Enabled') });
+    current = true;
+    target.querySelectorAll<HTMLButtonElement>('button')[0]!.click();
+    expect(Edit.apply).toHaveBeenLastCalledWith(expect.objectContaining({ value: false }), expect.anything());
+    Edit.apply.mockClear();
+    target.querySelector('.onoff')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    expect(Edit.apply).toHaveBeenLastCalledWith(expect.objectContaining({ value: false }), expect.anything());
+  });
+
+  it('FontField applies a choice matching the stale readout when the live font has changed', async () => {
+    const { api, Edit } = fakeAPI();
+    transport.playing = true;
+    updateControlTime(0, true, 0, true);
+    let current = 'Inter';
+    const target = render(FontField, { api, get: () => current, edit: commandEdit('Font') });
+    current = 'Avenir Next';
+    target.querySelector<HTMLButtonElement>('button')!.click();
+    await tick();
+    document.body.querySelectorAll<HTMLButtonElement>('.font-menu-row')[0]!.click();
+    await new Promise((resolve) => setTimeout(resolve, BLINK_MS * 2 + 10));
+    expect(Edit.apply).toHaveBeenCalledWith(expect.objectContaining({ value: 'Inter' }), expect.anything());
+  });
+
   it('ToggleField applies the inverted getter value once', () => {
     const { api, Edit, invalidate } = fakeAPI();
     const target = render(ToggleField, { api, get: () => false, edit: commandEdit('Enabled'), label: 'Enabled' });
-    target.querySelector<HTMLButtonElement>('button.toggle')!.click();
+    const [off, on] = target.querySelectorAll<HTMLButtonElement>('.onoff button');
+    expect(off!.getAttribute('aria-checked')).toBe('true');
+    off!.click();
+    expect(Edit.apply).not.toHaveBeenCalled();
+    on!.click();
     expect(Edit.apply).toHaveBeenCalledWith(expect.objectContaining({ value: true }), { label: 'Enabled', origin: 'inspector' });
     expect(invalidate).toHaveBeenCalledWith();
   });
@@ -247,13 +379,16 @@ describe('one-shot fields', () => {
     const trigger = target.querySelector<HTMLButtonElement>('button.font-select')!;
     trigger.click();
     await tick();
-    expect(target.querySelector('.font-drop')).not.toBeNull();
+    expect(target.querySelector('.font-menu')).not.toBeNull();
     trigger.click();
     await tick();
-    expect(target.querySelector('.font-drop')).toBeNull();
+    // The sheet stays mounted while its close animation plays.
+    expect(target.querySelector<HTMLElement>('.font-menu')?.dataset.state ?? 'closed').toBe('closed');
+    await new Promise((resolve) => setTimeout(resolve, 230));
+    expect(target.querySelector('.font-menu')).toBeNull();
     trigger.click();
     await tick();
-    expect(target.querySelector('.font-drop')).not.toBeNull();
+    expect(target.querySelector('.font-menu')).not.toBeNull();
   });
 
   it('FontField uses the font list, invalidates all views, and exposes a dialog/listbox', async () => {
@@ -263,7 +398,8 @@ describe('one-shot fields', () => {
     await tick();
     expect(closeMenus).toHaveBeenCalledTimes(1);
     expect(target.querySelector('[role="dialog"] [role="listbox"]')).not.toBeNull();
-    target.querySelectorAll<HTMLButtonElement>('.font-item')[1]!.click();
+    target.querySelectorAll<HTMLElement>('.font-menu-row')[1]!.click();
+    await new Promise((resolve) => setTimeout(resolve, BLINK_MS * 2 + 10));
     expect(Edit.apply).toHaveBeenCalledWith(expect.objectContaining({ value: 'Avenir Next' }), { label: 'Font', origin: 'inspector' });
     expect(invalidate).toHaveBeenCalledWith();
     expect(fonts.ensure).toHaveBeenCalledWith('Avenir Next', 400);
@@ -271,6 +407,19 @@ describe('one-shot fields', () => {
 });
 
 describe('TextField', () => {
+  it('starts typing from the live value between playback readout ticks', () => {
+    const { api } = fakeAPI();
+    transport.playing = true;
+    updateControlTime(0, true, 0, true);
+    let current = 'Old';
+    const target = render(TextField, { api, get: () => current, edit: commandEdit('Text') });
+    current = 'Current';
+    const input = target.querySelector<HTMLInputElement>('input')!;
+    input.focus();
+    flushSync();
+    expect(input.value).toBe('Current');
+  });
+
   it('uses begin/write/commit and cancels an Escape edit', () => {
     const { api, Edit } = fakeAPI();
     const target = render(TextField, { api, get: () => 'Hello', edit: commandEdit('Text'), label: 'Text' });
@@ -290,13 +439,27 @@ describe('TextField', () => {
 });
 
 describe('picker drafts', () => {
+  it.each([ColorField, FillField])('opens the picker from its live value between playback readout ticks', async (component) => {
+    const { api } = fakeAPI();
+    transport.playing = true;
+    updateControlTime(0, true, 0, true);
+    let current = '#FF0000';
+    const target = render(component, { api, get: () => component === ColorField ? current : { type: 'solid', stops: [{ id: 'stop', color: current, position: 0 }] }, edit: commandEdit('Color') });
+    current = '#00FF00';
+    target.querySelector<HTMLButtonElement>('button.color-field')!.click();
+    await tick();
+    expect(document.body.querySelector<HTMLInputElement>('.cp-value')!.value).toContain('00FF00');
+  });
+
   it('ColorField previews saturation and brightness continuously, then cancels the preview', async () => {
-    const { api, Edit, drag, invalidate } = fakeAPI();
+    const { api, Edit, invalidate } = fakeAPI();
     const target = render(ColorField, { api, get: () => '#FF0000', edit: commandEdit('Color'), label: 'Color' });
     target.querySelector<HTMLButtonElement>('button.color-field')!.click();
     await tick();
 
-    const sv = document.body.querySelector<HTMLElement>('.color-sv')!;
+    document.body.querySelector<HTMLButtonElement>('[role="tab"]')!.click();
+    flushSync();
+    const sv = document.body.querySelector<HTMLElement>('.cp-plane')!;
     vi.spyOn(sv, 'getBoundingClientRect').mockReturnValue({
       x: 0, y: 0, left: 0, top: 0, right: 100, bottom: 100, width: 100, height: 100,
       toJSON: () => ({})
@@ -306,13 +469,28 @@ describe('picker drafts', () => {
     expect(Edit.begin).toHaveBeenCalledWith('Color', { origin: 'inspector' });
     expect(Edit.dispatch).toHaveBeenLastCalledWith(expect.objectContaining({ value: '#BF6060' }));
 
-    drag().move(25, 25, pointer('pointermove', { pointerId: 1, clientX: 75, clientY: 50 }));
+    window.dispatchEvent(pointer('pointermove', { pointerId: 1, clientX: 75, clientY: 50 }));
     expect(Edit.dispatch).toHaveBeenLastCalledWith(expect.objectContaining({ value: '#802020' }));
     expect(invalidate).toHaveBeenLastCalledWith('render');
+    // An unrelated pointer must not move or end this drag.
+    const writes = Edit.dispatch.mock.calls.length;
+    window.dispatchEvent(pointer('pointermove', { pointerId: 2, clientX: 0, clientY: 0 }));
+    window.dispatchEvent(pointer('pointerup', { pointerId: 2, clientX: 0, clientY: 0 }));
+    expect(Edit.dispatch).toHaveBeenCalledTimes(writes);
+    window.dispatchEvent(pointer('pointerup', { pointerId: 1, clientX: 100, clientY: 0 }));
+    expect(Edit.dispatch).toHaveBeenLastCalledWith(expect.objectContaining({ value: '#FF0000' }));
+    const releasedWrites = Edit.dispatch.mock.calls.length;
+    window.dispatchEvent(pointer('pointermove', { pointerId: 1, clientX: 0, clientY: 0 }));
+    expect(Edit.dispatch).toHaveBeenCalledTimes(releasedWrites);
 
+    // Closing mid-drag removes the listeners too.
+    sv.dispatchEvent(pointer('pointerdown', { pointerId: 1, clientX: 75, clientY: 50 }));
     document.body.querySelector<HTMLElement>('.color-picker')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     expect(Edit.cancel).toHaveBeenCalledOnce();
     expect(Edit.commit).not.toHaveBeenCalled();
+    const cancelledWrites = Edit.dispatch.mock.calls.length;
+    window.dispatchEvent(pointer('pointermove', { pointerId: 1, clientX: 0, clientY: 0 }));
+    expect(Edit.dispatch).toHaveBeenCalledTimes(cancelledWrites);
   });
 
   it('ColorField removes confirmation buttons and commits the normalized choice when clicking outside', async () => {
@@ -321,13 +499,15 @@ describe('picker drafts', () => {
     target.querySelector<HTMLButtonElement>('button.color-field')!.click();
     await tick();
     expect(document.body.querySelector<HTMLElement>('.color-picker')!.style.top).not.toBe('0px');
-    const hex = document.body.querySelector<HTMLInputElement>('.color-hex')!;
+    const hex = document.body.querySelector<HTMLInputElement>('.cp-value')!;
     hex.value = '#34c759';
     hex.dispatchEvent(new InputEvent('input', { bubbles: true }));
     flushSync();
     expect(document.body.querySelector('.color-picker footer')).toBeNull();
-    document.body.querySelector<HTMLElement>('.fill-picker-layer')!.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+    document.body.querySelector<HTMLElement>('.color-picker-layer')!.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
     flushSync();
+    // The popover plays the menu's exit before it unmounts.
+    await new Promise((resolve) => setTimeout(resolve, 250));
     expect(Edit.begin).toHaveBeenCalledWith('Color', { origin: 'inspector' });
     expect(Edit.dispatch).toHaveBeenLastCalledWith(expect.objectContaining({ value: '#34C759' }));
     expect(Edit.commit).toHaveBeenCalledWith('Color');
@@ -347,7 +527,7 @@ describe('picker drafts', () => {
     document.body.querySelector<HTMLButtonElement>('[aria-label="Sample screen color"]')!.click();
     await vi.waitFor(() => expect(Edit.dispatch).toHaveBeenLastCalledWith(expect.objectContaining({ value: '#0A84FF' })));
     expect(open).toHaveBeenCalledOnce();
-    expect(document.body.querySelector<HTMLInputElement>('.color-hex')!.value).toBe('#0A84FF');
+    expect(document.body.querySelector<HTMLInputElement>('.cp-value')!.value).toBe('#0A84FF / 100%');
   });
 
   it('mounts color and fill picker overlays above clipped panel contents', async () => {
@@ -355,10 +535,11 @@ describe('picker drafts', () => {
     const colorTarget = render(ColorField, { api, get: () => '#ff6b1a', edit: commandEdit('Color'), label: 'Color' });
     colorTarget.querySelector<HTMLButtonElement>('button.color-field')!.click();
     await tick();
-    expect(document.body.querySelector('.fill-picker-layer')?.parentElement).toBe(document.body);
+    expect(document.body.querySelector('.color-picker-layer')?.parentElement).toBe(document.body);
 
-    document.body.querySelector<HTMLButtonElement>('.color-picker [aria-label="Close color picker"]')!.click();
-    await tick();
+    document.body.querySelector<HTMLElement>('.color-picker')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(document.body.querySelector('.color-picker')).toBeNull();
 
     const fillTarget = render(FillField, {
       api,
@@ -371,8 +552,36 @@ describe('picker drafts', () => {
     expect(document.body.querySelector('.fill-picker-layer')?.parentElement).toBe(document.body);
   });
 
+  // Picker preferences are shared across pickers, so this runs after the other ColorField tests.
+  it('ColorField picks in Display P3 and writes the clipped sRGB hex', async () => {
+    const { api, Edit } = fakeAPI();
+    const target = render(ColorField, { api, get: () => '#808080', edit: commandEdit('Color'), label: 'Color' });
+    target.querySelector<HTMLButtonElement>('button.color-field')!.click();
+    await tick();
+    document.body.querySelector<HTMLButtonElement>('[role="tab"]:nth-child(2)')!.click();
+    flushSync();
+
+    const plane = document.body.querySelector<HTMLElement>('.cp-plane')!;
+    vi.spyOn(plane, 'getBoundingClientRect').mockReturnValue({
+      x: 0, y: 0, left: 0, top: 0, right: 100, bottom: 100, width: 100, height: 100,
+      toJSON: () => ({})
+    });
+    const hue = document.body.querySelector<HTMLElement>('.cp-hue')!;
+    vi.spyOn(hue, 'getBoundingClientRect').mockReturnValue({
+      x: 0, y: 0, left: 0, top: 0, right: 14, bottom: 100, width: 14, height: 100,
+      toJSON: () => ({})
+    });
+    hue.dispatchEvent(pointer('pointerdown', { pointerId: 1, clientX: 7, clientY: 0 }));
+    plane.dispatchEvent(pointer('pointerdown', { pointerId: 1, clientX: 100, clientY: 0 }));
+    flushSync();
+
+    expect(Edit.dispatch).toHaveBeenLastCalledWith(expect.objectContaining({ value: '#FF0000' }));
+    expect(document.body.querySelector('.cp-clipped')?.textContent).toBe('Clipped');
+    expect(document.body.querySelector<HTMLInputElement>('.cp-value')!.getAttribute('aria-label')).toBe('Color OKLCH value');
+  });
+
   it('FillField previews color continuously across pointer moves', async () => {
-    const { api, Edit, drag, invalidate } = fakeAPI();
+    const { api, Edit, invalidate } = fakeAPI();
     const target = render(FillField, {
       api,
       get: () => ({ type: 'solid', angle: 0, stops: [{ id: 'red', color: '#FF0000', position: 0 }] }),
@@ -382,13 +591,19 @@ describe('picker drafts', () => {
     target.querySelector<HTMLButtonElement>('button.color-field')!.click();
     await tick();
 
-    const sv = document.body.querySelector<HTMLElement>('.fill-sv')!;
+    // Fill types own the tabs; the (shared) color space is a header menu here.
+    expect([...document.body.querySelectorAll('.fill-picker [role="tab"]')].map((tab) => tab.textContent)).toEqual(['Solid', 'Linear', 'Radial', 'None']);
+    document.body.querySelector<HTMLButtonElement>('.cp-space')!.click();
+    [...document.body.querySelectorAll<HTMLElement>('.pm-menu-item')].find((item) => item.textContent === 'sRGB')!.click();
+    await new Promise((resolve) => setTimeout(resolve, BLINK_MS * 2 + 10));
+    flushSync();
+    const sv = document.body.querySelector<HTMLElement>('.cp-plane')!;
     vi.spyOn(sv, 'getBoundingClientRect').mockReturnValue({
       x: 0, y: 0, left: 0, top: 0, right: 100, bottom: 100, width: 100, height: 100,
       toJSON: () => ({})
     });
     sv.dispatchEvent(pointer('pointerdown', { pointerId: 1, clientX: 50, clientY: 25 }));
-    drag().move(25, 25, pointer('pointermove', { pointerId: 1, clientX: 75, clientY: 50 }));
+    window.dispatchEvent(pointer('pointermove', { pointerId: 1, clientX: 75, clientY: 50 }));
 
     expect(Edit.begin).toHaveBeenCalledWith('Fill', { origin: 'inspector' });
     expect(Edit.dispatch).toHaveBeenLastCalledWith(expect.objectContaining({
@@ -396,9 +611,33 @@ describe('picker drafts', () => {
     }));
     expect(invalidate).toHaveBeenLastCalledWith('render');
 
-    document.body.querySelector<HTMLButtonElement>('.fill-picker footer .pri')!.click();
+    // Clicking away keeps the fill; there is no Apply button.
+    expect(document.body.querySelector('.fill-picker footer')).toBeNull();
+    document.body.querySelector<HTMLElement>('.fill-picker-layer')!.dispatchEvent(pointer('pointerdown', { pointerId: 2 }));
     expect(Edit.commit).toHaveBeenCalledWith('Fill');
+    flushSync();
+    expect(document.body.querySelector('.fill-picker')).toBeNull();
     expect(Edit.apply).not.toHaveBeenCalled();
+  });
+
+  it('FillField shares the redesigned editor, preserves opacity, and cancels its transaction', async () => {
+    const { api, Edit } = fakeAPI();
+    const target = render(FillField, { api, get: () => ({ type: 'solid', stops: [{ id: 'red', color: '#FF0000', position: 0 }] }), edit: commandEdit('Fill') });
+    target.querySelector<HTMLButtonElement>('button.color-field')!.click();
+    await tick();
+    expect(document.body.querySelector('.fill-sv')).toBeNull();
+    expect(document.body.querySelector('.cp-embedded')).not.toBeNull();
+    const input = document.body.querySelector<HTMLInputElement>('.cp-value')!;
+    input.value = '#FF6600 / 50%';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    flushSync();
+    expect(Edit.dispatch).toHaveBeenLastCalledWith(expect.objectContaining({ value: expect.objectContaining({ stops: [expect.objectContaining({ color: '#FF660080' })] }) }));
+    document.body.querySelector<HTMLElement>('.cp-embedded')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await tick();
+    expect(Edit.cancel).toHaveBeenCalledOnce();
+    expect(Edit.commit).not.toHaveBeenCalled();
+    expect(document.body.querySelector('.fill-picker')).toBeNull();
   });
 
   it('FillField applies a normalized fill rather than its mutable draft', async () => {
@@ -413,7 +652,7 @@ describe('picker drafts', () => {
     target.querySelector<HTMLButtonElement>('button.color-field')!.click();
     await tick();
     expect(document.body.querySelector<HTMLElement>('.fill-picker')!.style.top).not.toBe('0px');
-    document.body.querySelector<HTMLButtonElement>('.fill-picker footer .pri')!.click();
+    document.body.querySelector<HTMLButtonElement>('.fill-picker [aria-label="Close"]')!.click();
     expect(normalizeFill).toHaveBeenCalled();
     const command = Edit.apply.mock.calls[0]![0] as any;
     expect(command.value).toMatchObject({ type: 'linear', angle: 180 });
@@ -439,8 +678,11 @@ describe('picker drafts', () => {
     const stop = document.body.querySelector<HTMLInputElement>('.fill-stop-color')!;
     stop.value = '#12';
     stop.dispatchEvent(new InputEvent('input', { bubbles: true }));
-    document.body.querySelector<HTMLButtonElement>('.fill-picker footer .pri')!.click();
-    const command = Edit.apply.mock.calls[0]![0] as any;
-    expect(command.value.stops[0].color).toBe('#FF0000');
+    document.body.querySelector<HTMLElement>('.fill-picker-layer')!.dispatchEvent(pointer('pointerdown', { pointerId: 1 }));
+    // Nothing valid changed, so closing records no edit.
+    expect(Edit.apply).not.toHaveBeenCalled();
+    expect(Edit.dispatch).not.toHaveBeenCalled();
+    flushSync();
+    expect(document.body.querySelector('.fill-picker')).toBeNull();
   });
 });

@@ -2,10 +2,12 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import { makePM } from '../__tests__/make-pm';
 import {
+  copyKeyframes,
   editSelectedLayerTiming,
   goToSelectedLayerBoundary,
   goToTimelineEvent,
   nudgeKeyframes,
+  pasteKeyframes,
   selectAdjacentLayer,
   setLayerLocks,
   timelineEventTimes,
@@ -120,5 +122,115 @@ describe('After Effects shortcut fundamentals', () => {
     expect(setLayerLocks(PM, false, true)).toMatchObject({ ok: true });
     expect([first.lock, second.lock, third.lock]).toEqual([false, false, false]);
     expect(PM.hist.list()).toEqual(['Lock layers', 'Unlock layers']);
+  });
+});
+
+describe('keyframe clipboard', () => {
+  let PM: any;
+
+  beforeEach(() => { PM = runtime(); });
+
+  const keys = (layer: any, path = 'opacity') => layer.p[path].kf.map((key: any) => [key.t, key.v]);
+
+  it('pastes copied keyframes at the playhead with relative timing onto the selected layer', () => {
+    const source = add(PM, 'source', 1, 8);
+    const target = add(PM, 'target', 2, 8);
+    const first = PM.setKey(source, 'opacity', 2, 10);
+    const second = PM.setKey(source, 'opacity', 2.5, 90);
+    first.hold = true;
+    PM.sel.keys = [first.i, second.i];
+    const clipboard = copyKeyframes(PM);
+    expect(clipboard).toMatchObject({ start: 2 });
+
+    PM.selectLayers([target.id]);
+    PM.time = 4;
+    PM.hist.clear();
+    const pasted: any = pasteKeyframes(PM, clipboard);
+
+    expect(keys(target)).toEqual([[2, 10], [2.5, 90]]);
+    expect(target.p.opacity.kf[0].hold).toBe(true);
+    expect(pasted.map((key: any) => key.i)).not.toContain(first.i);
+    expect(PM.sel.keys).toEqual(pasted.map((key: any) => key.i));
+    expect(keys(source)).toEqual([[1, 10], [1.5, 90]]);
+    expect(PM.hist.list()).toEqual(['Paste keyframes']);
+    expect(PM.hist.undo()).toBe(true);
+    expect(PM.L(target.id).p.opacity.kf).toEqual([]);
+  });
+
+  it('adds the source effect to the destination layer when pasting effect keyframes', () => {
+    PM.mkEffect = (type: string) => ({ id: PM.uid('f'), type, on: true, p: { amount: PM.P(0), size: PM.P(1) } });
+    const source = add(PM, 'source', 0, 10);
+    const target = add(PM, 'target', 0, 10);
+    const effect = PM.mkEffect('blur');
+    source.fx = [effect];
+    const a = PM.setKeyOn(effect.p.amount, 1, 5, 'linear', 10);
+    const b = PM.setKeyOn(effect.p.size, 1, 9, 'linear', 10);
+    PM.sel.keys = [a.i, b.i];
+    const clipboard = copyKeyframes(PM);
+
+    PM.selectLayers([target.id]);
+    PM.time = 2;
+    PM.hist.clear();
+    expect(pasteKeyframes(PM, clipboard)).toBeTruthy();
+
+    expect(target.fx).toHaveLength(1);
+    expect(target.fx[0].type).toBe('blur');
+    expect(target.fx[0].p.amount.kf.map((key: any) => [key.t, key.v])).toEqual([[2, 5]]);
+    expect(target.fx[0].p.size.kf.map((key: any) => [key.t, key.v])).toEqual([[2, 9]]);
+
+    PM.time = 5;
+    pasteKeyframes(PM, clipboard);
+    expect(target.fx).toHaveLength(1);
+    expect(target.fx[0].p.amount.kf).toHaveLength(2);
+
+    PM.hist.undo();
+    PM.hist.undo();
+    expect(PM.L(target.id).fx).toHaveLength(0);
+  });
+
+  it('replaces keys on the same frame and drops keys past the composition end', () => {
+    const layer = add(PM, 'animated', 0, 10);
+    const a = PM.setKey(layer, 'opacity', 1, 10);
+    const b = PM.setKey(layer, 'opacity', 3, 30);
+    PM.setKey(layer, 'opacity', 9.5, 50);
+    PM.sel.keys = [a.i, b.i];
+    const clipboard = copyKeyframes(PM);
+
+    PM.time = 9.5;
+    pasteKeyframes(PM, clipboard);
+
+    expect(keys(layer)).toEqual([[1, 10], [3, 30], [9.5, 10]]);
+  });
+
+  it('retargets a single property to a newly selected channel of the same kind', () => {
+    const layer = add(PM, 'animated', 0, 10);
+    const key = PM.setKey(layer, 'rotation', 1, 45);
+    PM.sel.keys = [key.i];
+    PM.sel.chan = 'rotation';
+    const clipboard = copyKeyframes(PM);
+
+    PM.sel.chan = 'position.x';
+    PM.time = 2;
+    pasteKeyframes(PM, clipboard);
+    expect(keys(layer, 'position.x')).toEqual([[2, 45]]);
+
+    expect(pasteKeyframes(PM, clipboard, { layer: layer.id, path: 'scale', time: 3 })).toBe(false);
+    expect(keys(layer, 'rotation')).toEqual([[1, 45]]);
+  });
+
+  it('routes the global copy, cut, and paste shortcuts to selected keyframes', () => {
+    const layer = add(PM, 'animated', 0, 10);
+    const key = PM.setKey(layer, 'opacity', 1, 25);
+    PM.selectLayers([layer.id]);
+    PM.sel.keys = [key.i];
+
+    PM.cmd('cutLayers');
+    expect(layer.p.opacity.kf).toEqual([]);
+    expect(PM.proj.layers).toHaveLength(1);
+
+    PM.time = 4;
+    PM.cmd('pasteLayers');
+    expect(keys(PM.L(layer.id))).toEqual([[4, 25]]);
+    expect(PM.proj.layers).toHaveLength(1);
   });
 });

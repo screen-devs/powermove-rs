@@ -1,3 +1,5 @@
+import type { CodexQuestion } from '../../../../shared/ipc';
+import type { NoticeKind } from '../../errors/presentation';
 import type { AgentModResult } from './mod-result';
 import type { UIPlacement } from './ui-placement';
 
@@ -12,14 +14,21 @@ export interface AgentOption {
 export interface AgentMessage {
   role: 'user' | 'assistant' | 'trace';
   text?: string;
-  /** A user follow-up sent while the current run was still active. */
+  /** A user follow-up or trace checkpoint captured while a run was steered. */
   steering?: boolean;
-  /** role 'trace': the sealed activity steps of a completed run. */
+  /** role 'trace': sealed activity steps from a run or steering checkpoint. */
   steps?: TraceStep[];
+  /** Elapsed wall time captured when the run's activity is archived. */
+  durationMs?: number;
   attachments?: Array<Record<string, any> | string>;
   entering?: boolean;
   /** Run failures render with the error treatment. */
   error?: boolean;
+  /** How much apparatus the failure earns: the editor's own error keeps the
+      diagnostics, the agent's account of what it could not do is an alert, and
+      a turn where nothing broke reads as an ordinary reply. Absent means
+      'error', so older messages keep their treatment. */
+  notice?: NoticeKind;
   /** Editor mode could not author the requested extension. */
   requiresProject?: boolean;
   fixExtensionId?: string;
@@ -49,15 +58,32 @@ export type TraceStep =
       output?: string;
       startedAt?: number;
       endedAt?: number;
+    }
+  | {
+      kind: 'question';
+      id: string;
+      questions: CodexQuestion[];
+      /** 'reply' holds the run's request open; 'message' is answered by a follow-up message. */
+      transport: 'reply' | 'message';
+      blocking: boolean;
+      /** The run that holds a 'reply' question open. */
+      requestId?: string;
+      status: 'open' | 'answered' | 'closed';
+      /** What the person answered, by question id; secret answers are masked. */
+      answers?: Record<string, string>;
     };
 
 export interface AgentSnapshot {
   threadId?: string;
-  threads?: Array<{ id: string; title: string; updatedAt?: number }>;
+  threads?: Array<{ id: string; title: string; updatedAt?: number; busy?: boolean }>;
   threadSwitchBlocked?: boolean;
+  /** Runs still working in threads other than the one on screen. */
+  backgroundRuns?: number;
   threadSaveError?: boolean;
   legacyPhase: string;
   requestToken: number;
+  /** When the visible thread's run actually began, across thread switches. */
+  runStartedAt?: number | null;
   conversation: AgentMessage[];
   activity: string;
   uiPlacement?: UIPlacement | null;
@@ -69,6 +95,9 @@ export interface AgentSnapshot {
   steps: AgentStep[];
   stepsExpanded: boolean;
   scope: string;
+  /** The thread's execution context, independent of the screen currently visible. */
+  context?: 'app' | 'project';
+  projectName?: string;
   autoApplyPanels: boolean;
   provider: string;
   model: string;
@@ -100,9 +129,11 @@ const EMPTY_SNAPSHOT: AgentSnapshot = {
   threadId: '',
   threads: [],
   threadSwitchBlocked: false,
+  backgroundRuns: 0,
   threadSaveError: false,
   legacyPhase: 'idle',
   requestToken: 0,
+  runStartedAt: null,
   conversation: [],
   activity: '',
   uiPlacement: null,
@@ -114,6 +145,8 @@ const EMPTY_SNAPSHOT: AgentSnapshot = {
   steps: [],
   stepsExpanded: false,
   scope: 'workspace',
+  context: 'app',
+  projectName: '',
   autoApplyPanels: true,
   provider: 'chatgpt',
   model: 'gpt-5.6-sol',
@@ -147,6 +180,19 @@ function viewPhase(snapshot: AgentSnapshot): AgentPhase {
 
 function jsonEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+/** Attachment bodies can be megabytes; compare immutable fields without encoding them. */
+function attachmentsEqual(left: Array<Record<string, any> | string> | undefined, right: Array<Record<string, any> | string> | undefined): boolean {
+  if (left === right) return true;
+  if (!left || !right || left.length !== right.length) return false;
+  return left.every((item, index) => {
+    const other = right[index];
+    if (item === other) return true;
+    if (typeof item !== 'object' || !item || typeof other !== 'object' || !other) return false;
+    const keys = Object.keys(item);
+    return keys.length === Object.keys(other).length && keys.every(key => item[key] === other[key]);
+  });
 }
 
 function assignChangedFields(
@@ -214,7 +260,7 @@ function reconcileConversation(next: AgentMessage[]): void {
       continue;
     }
     assignChangedFields(currentMessage, nextMessage, [
-      'text', 'steering', 'entering', 'error', 'fixExtensionId', 'requiresProject'
+      'text', 'steering', 'entering', 'error', 'notice', 'fixExtensionId', 'requiresProject', 'durationMs'
     ]);
     if (!jsonEqual(currentMessage.modResult, nextMessage.modResult)) {
       currentMessage.modResult = nextMessage.modResult ? { ...nextMessage.modResult } : undefined;
@@ -222,7 +268,7 @@ function reconcileConversation(next: AgentMessage[]): void {
     if (!jsonEqual(currentMessage.steps, nextMessage.steps)) {
       currentMessage.steps = nextMessage.steps?.map((step) => ({ ...step }));
     }
-    if (!jsonEqual(currentMessage.attachments, nextMessage.attachments)) {
+    if (!attachmentsEqual(currentMessage.attachments, nextMessage.attachments)) {
       currentMessage.attachments = nextMessage.attachments?.map((attachment) =>
         typeof attachment === 'string' ? attachment : { ...attachment }
       );
@@ -239,7 +285,7 @@ export function setAgentSnapshot(snapshot: AgentSnapshot, options: AgentUpdateOp
   const tokenChanged = snapshot.requestToken !== agentState.requestToken;
   const enteringRun = phase === 'running' && agentState.phase !== 'running';
   const threadChanged = (snapshot.threadId || '') !== agentState.threadId;
-  let progressLines = tokenChanged || enteringRun ? [] : [...agentState.progressLines];
+  let progressLines = tokenChanged || enteringRun || threadChanged ? [] : [...agentState.progressLines];
   if (phase === 'running' && snapshot.activity && progressLines.at(-1) !== snapshot.activity) {
     progressLines = [...progressLines, snapshot.activity].slice(-20);
   }
@@ -256,6 +302,7 @@ export function setAgentSnapshot(snapshot: AgentSnapshot, options: AgentUpdateOp
     threads = [],
     threadId,
     threadSwitchBlocked,
+    backgroundRuns,
     threadSaveError,
     attachments,
     uiPlacement,
@@ -273,17 +320,19 @@ export function setAgentSnapshot(snapshot: AgentSnapshot, options: AgentUpdateOp
   if (!jsonEqual(agentState.reasoningEfforts, reasoningEfforts)) agentState.reasoningEfforts = [...reasoningEfforts];
   if (!jsonEqual(agentState.accessModes, accessModes)) agentState.accessModes = accessModes.map((mode) => ({ ...mode }));
   if (!jsonEqual(agentState.threads, threads)) agentState.threads = threads.map((thread) => ({ ...thread }));
-  if (!jsonEqual(agentState.attachments, attachments)) {
+  if (!attachmentsEqual(agentState.attachments, attachments)) {
     agentState.attachments = attachments.map((attachment) => ({ ...attachment }));
   }
 
   Object.assign(agentState, scalarSnapshot, {
     threadId: threadId || '',
     threadSwitchBlocked: threadSwitchBlocked || false,
+    backgroundRuns: backgroundRuns || 0,
     threadSaveError: threadSaveError || false,
     phase,
     workingStartedAt: phase === 'running'
-      ? (enteringRun || tokenChanged || threadChanged ? Date.now() : agentState.workingStartedAt)
+      ? (enteringRun || tokenChanged || threadChanged
+        ? (snapshot.runStartedAt ?? Date.now()) : agentState.workingStartedAt)
       : null,
     workingConversationIndex: phase === 'running'
       ? (enteringRun || tokenChanged || threadChanged

@@ -8,16 +8,18 @@
   import EffectsSection from './EffectsSection.svelte';
   import ExtensionLayerParams from './ExtensionLayerParams.svelte';
   import InspectorHeader from './InspectorHeader.svelte';
+  import AlignmentStrip from './AlignmentStrip.svelte';
   import LayerOptions from './LayerOptions.svelte';
   import MasksSection from './MasksSection.svelte';
   import ShaderUniforms from './ShaderUniforms.svelte';
   import StructuredSection from './StructuredSection.svelte';
   import RetimingSection from './RetimingSection.svelte';
   import TransformSection from './TransformSection.svelte';
+  import ContributedSections from './ContributedSections.svelte';
   import { inspectorRefresh } from './refresh.svelte.js';
 
   let { panelId, api }: PanelProps & { api: PowermoveAPI } = $props();
-  const { doc, sel } = provideInspectorContext(untrack(() => api));
+  const { doc, sel, syncTime } = provideInspectorContext(untrack(() => api));
   let fontsVersion = $state(0);
 
   const selectedLayers = $derived<any[]>(
@@ -32,8 +34,10 @@
   });
 </script>
 
-<div class="insp" data-svelte-panel={panelId} data-inspector-refresh={inspectorRefresh.version}>
+<div class="insp" data-svelte-panel={panelId} data-inspector-refresh={inspectorRefresh.version}
+  onpointerdowncapture={syncTime} onkeydowncapture={syncTime} onwheelcapture={syncTime}>
   {#if firstLayer}<InspectorHeader layer={firstLayer} />{/if}
+  {#if firstLayer && selectedLayers.every((layer: any) => layer.type !== 'audio')}<AlignmentStrip layers={selectedLayers} />{/if}
 
   {#if selectedLayers.length === 0}
     <CompositionSection />
@@ -52,12 +56,15 @@
       {:else}
         <ContentSection layer={firstLayer} {fontsVersion} />
       {/if}
+      <ContributedSections {api} after="content" layerIds={selectedLayers.map(layer => layer.id)} />
       {#if firstLayer.type !== 'audio'}<TransformSection layer={firstLayer} />{/if}
+      <ContributedSections {api} after="transform" layerIds={selectedLayers.map(layer => layer.id)} />
       <StructuredSection layer={firstLayer} />
       {#if firstLayer.type !== 'audio'}
         {#if firstLayer.type === 'shader'}<ShaderUniforms layer={firstLayer} />{/if}
         {#if firstLayer.type === 'extension'}<ExtensionLayerParams layer={firstLayer} />{/if}
         <EffectsSection layer={firstLayer} />
+        <ContributedSections {api} after="effects" layerIds={selectedLayers.map(layer => layer.id)} />
         <MasksSection layer={firstLayer} />
       {/if}
       {#if firstLayer.type === 'video' || firstLayer.type === 'precomp'}<RetimingSection layer={firstLayer} />{/if}
@@ -106,7 +113,16 @@
     line-height: 1.2;
   }
   .insp :global(.row.split) { gap: 6px; }
+  /* Tall rows (the text field) keep their label and stopwatch on the same
+     28px band as every single-line row, so the diamond and the title stay
+     centered on each other while the field grows below. */
   .insp :global(.row.split:has(textarea)) { height: auto; min-height: 54px; align-items: start; }
+  .insp :global(.row.split:has(textarea) > .k) { height: 28px; }
+  .insp :global(.row.split:has(textarea) > .stopwatch) { margin-top: 5px; }
+  /* Rows without a keyframe diamond keep their label at the same x, but the
+     control column starts where it does on animated rows (18px diamond + 8px
+     gap), so every well in a section shares one left edge. */
+  .insp :global(.row.split:not(:has(> .stopwatch)) > .k) { width: 114px; }
   .insp :global(.property-stopwatch) { width: 18px; height: 24px; }
 
   /* Panel actions use the same flat material as property fields. */

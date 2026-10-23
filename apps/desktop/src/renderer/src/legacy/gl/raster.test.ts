@@ -1,3 +1,4 @@
+import { installBridgeForTests, resetBridgeForTests } from '../../kernel/bridge';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { PMRegistry } from '../registry';
@@ -38,9 +39,36 @@ function rasterRegistry(extra: Partial<PMRegistry> = {}): PMRegistry {
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  resetBridgeForTests();
 });
 
 describe('legacy raster install', () => {
+  it('releases obsolete GPU assets when a project closes', () => {
+    const dropTextures = vi.fn(), dropMesh = vi.fn();
+    const PM = rasterRegistry({ GL: { dropTextures, dropMesh } });
+    PM.assets.map.set('mesh', { id: 'mesh', kind: 'model' });
+    PM.assets.clear();
+    expect(dropTextures).toHaveBeenCalledWith('a:');
+    expect(dropTextures).toHaveBeenCalledWith('video:');
+    expect(dropMesh).toHaveBeenCalledWith('mesh');
+  });
+  it('unloads disposed source and preview video decoders exactly once', () => {
+    const PM = rasterRegistry();
+    const source = { pause: vi.fn(), removeAttribute: vi.fn(), load: vi.fn() };
+    const preview = { pause: vi.fn(), removeAttribute: vi.fn(), load: vi.fn() };
+    const revokeObjectURL = vi.fn();
+    (window as any).URL = { revokeObjectURL };
+    PM.assets.map.set('video', { id: 'video', kind: 'video', url: 'blob:source', el: source,
+      preview: { el: preview, url: 'blob:preview' } });
+    PM.assets.clear();
+    expect(source.removeAttribute).toHaveBeenCalledWith('src');
+    expect(source.load).toHaveBeenCalledTimes(1);
+    expect(preview.removeAttribute).toHaveBeenCalledWith('src');
+    expect(preview.load).toHaveBeenCalledTimes(1);
+    PM.assets.clear();
+    expect(source.load).toHaveBeenCalledTimes(1);
+    expect(revokeObjectURL).toHaveBeenCalledTimes(2);
+  });
   it('reuses identical capped text bitmaps at larger zoom levels without changing lower-density sources', () => {
     const PM = rasterRegistry();
     const layer = { type: 'text', d: { text: 'W'.repeat(128), font: 'sans-serif', size: 18, color: '#ffffff' } };
@@ -248,6 +276,112 @@ describe('legacy raster install', () => {
     expect(bounds.y1).toBeGreaterThan(lines.length * 40);
   });
 
+  it('reports caret layout lines with exact source offsets that match the painted wrapping', () => {
+    const PM = rasterRegistry();
+    const layer = {
+      type: 'text', d: {
+        text: 'one two  three\n\nfour', font: 'SF Pro Display', weight: 500, size: 40,
+        tracking: 0, leading: 1.2, color: '#fff', align: 'left',
+        boxWidth: 130, boxHeight: 0,
+      },
+    };
+    const caret = PM.textCaretLayout(layer);
+    const painted = PM.textLayout(layer).lines.map((line: any) => line.text);
+    expect(caret.lines.filter((line: any) => line.text.length).map((line: any) => line.text)).toEqual(painted);
+    // Every line starts where its text sits in the source string, including
+    // after the double space dropped at a wrap and across the empty paragraph.
+    for (const line of caret.lines) expect(layer.d.text.slice(line.start, line.start + line.text.length)).toBe(line.text);
+    expect(caret.lines.some((line: any) => line.text === '' && line.start === 15)).toBe(true);
+    const last = caret.lines.at(-1);
+    expect(last.start + last.text.length).toBe(layer.d.text.length);
+    expect(caret.lines.find((line: any) => line.start === 16)).toBeTruthy();
+    expect(caret.lineHeight).toBe(48);
+    expect(caret.length).toBe(layer.d.text.length);
+    const first = caret.lines[0];
+    expect(first.boundaries[0]).toEqual({ index: 0, x: 0 });
+    expect(first.boundaries.at(-1)).toMatchObject({ index: first.text.length });
+    expect(first.boundaries.at(-1).x).toBeCloseTo(first.width, 5);
+    for (let k = 1; k < first.boundaries.length; k++) expect(first.boundaries[k].x).toBeGreaterThan(first.boundaries[k - 1].x);
+
+    const centered = PM.textCaretLayout({ ...layer, d: { ...layer.d, boxWidth: 0, text: 'AB' } });
+    expect(centered.lines[0].x).toBe(0);
+    const right = PM.textCaretLayout({ ...layer, d: { ...layer.d, boxWidth: 0, text: 'AB', align: 'right' } });
+    expect(right.lines[0].x).toBeCloseTo(-right.lines[0].width, 5);
+  });
+
+  it('retries a text raster that painted nothing instead of caching the blank bitmap', () => {
+    let alpha = 0;
+    const context2d: any = {
+      font: '', letterSpacing: '', textBaseline: '', textAlign: '', fillStyle: '',
+      scale() {}, fillText() {}, drawImage() {},
+      getImageData: () => ({ data: new Uint8ClampedArray(24 * 24 * 4).fill(alpha) }),
+      measureText: (text: string) => ({ width: Math.max(1, text.length * 48), actualBoundingBoxLeft: 0, actualBoundingBoxRight: text.length * 48, actualBoundingBoxAscent: 78, actualBoundingBoxDescent: 18 }),
+    };
+    const timers: Array<() => void> = [];
+    vi.stubGlobal('window', {
+      document: { createElement: () => ({ width: 0, height: 0, getContext: () => context2d }), fonts: { ready: { then(fn: () => void) { timers.push(fn); } } } },
+      setTimeout: (fn: () => void) => { timers.push(fn); return 1; },
+    });
+    const invalidate = vi.fn();
+    const PM: PMRegistry = { clamp: (v: number, a: number, b: number) => Math.max(a, Math.min(b, v)), invalidate, time: 0 } as any;
+    install(PM);
+    const layer = { type: 'text', d: { text: 'Hello', font: 'Loading Face', weight: 500, size: 40, tracking: 0, leading: 1, color: '#fff', align: 'left' } };
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1000);
+    const first = PM.raster(layer);
+    expect(first.blank).toBe(true);
+    // The blank bitmap is reused until the retry moment, never as a GPU stub.
+    expect(PM.raster(layer, 1, 0, () => ({ ...first, blank: true }))).toBe(first);
+    timers.splice(0).forEach(fn => fn());
+    expect(invalidate).toHaveBeenCalled();
+    alpha = 255;
+    now.mockReturnValue(1300);
+    const second = PM.raster(layer);
+    expect(second).not.toBe(first);
+    expect(second.blank).toBe(false);
+    expect(PM.raster(layer)).toBe(second);
+    now.mockRestore();
+  });
+
+  it('does not read GPU pixels for loaded fonts on a healthy canvas', () => {
+    const PM = rasterRegistry();
+    const context = window.document.createElement('canvas').getContext('2d') as any;
+    context.isContextLost = () => false;
+    context.drawImage = vi.fn();
+    context.getImageData = vi.fn(() => { throw new Error('Unexpected synchronous readback'); });
+    const check = vi.fn(() => true);
+    (window.document as any).fonts = { check };
+    for (const text of ['Healthy font', '世界', 'New text at another density']) {
+      const layer = { type: 'text', d: { text, font: 'sans-serif', size: 18, color: '#fff' } };
+      for (const scale of [1, 2, 8]) expect(PM.raster(layer, scale).blank).toBe(false);
+      expect(check).toHaveBeenCalledWith(context.font, text);
+    }
+    expect(context.getImageData).not.toHaveBeenCalled();
+    expect(context.drawImage).not.toHaveBeenCalled();
+  });
+
+  it.each(['loading font', 'lost backing store'])('retains retry and GPU-stub rejection for a %s', failure => {
+    vi.useFakeTimers();
+    const invalidate = vi.fn(), PM = rasterRegistry({ invalidate });
+    const context = window.document.createElement('canvas').getContext('2d') as any;
+    let recovered = false;
+    context.isContextLost = () => failure === 'lost backing store' && !recovered;
+    context.drawImage = vi.fn();
+    context.getImageData = vi.fn(() => ({ data: new Uint8ClampedArray(24 * 24 * 4) }));
+    (window.document as any).fonts = { check: () => failure !== 'loading font' || recovered };
+    (window as any).setTimeout = setTimeout;
+    const layer = { type: 'text', d: { text: 'Recover me', font: 'sans-serif', size: 24, color: '#fff' } };
+    const first = PM.raster(layer);
+    expect(first.blank).toBe(true);
+    expect(context.getImageData).toHaveBeenCalledTimes(failure === 'loading font' ? 1 : 0);
+    vi.advanceTimersByTime(300);
+    expect(invalidate).toHaveBeenCalledWith('render');
+    recovered = true;
+    const next = PM.raster(layer, 1, 0, () => ({ ...first, blank: true }));
+    expect(next).not.toBe(first);
+    expect(next.blank).toBe(false);
+    expect(PM.raster(layer)).toBe(next);
+  });
+
   it('atomically replaces media in place and restores metadata plus runtime with one Undo and Redo', async () => {
     const disposed: any[] = [];
     const oldRuntime = { id: 'asset-1', name: 'old.wav', kind: 'audio', marker: 'old' };
@@ -259,6 +393,7 @@ describe('legacy raster install', () => {
       powermove: { media: { sourcePath: () => '/replacement/new.wav' } },
       setTimeout, clearTimeout,
     });
+  installBridgeForTests((window as any).powermove);
     const PM = makePM('core/history', 'gl/raster');
     const animatedLayer = {
       id: 'layer-1', type: 'audio', from: 4, dur: 8,
@@ -288,10 +423,23 @@ describe('legacy raster install', () => {
     PM.replaceProject = (project: any) => { PM.proj = project; };
 
     const file = { name: 'new.wav', type: 'audio/wav', size: 3 };
-    await PM.assets.replace('asset-1', file);
+    const stages: string[] = [];
+    await PM.assets.replace('asset-1', file, { onStage: (label: string) => stages.push(label) });
 
+    expect(stages).toEqual(['Reading file', 'Preparing media', 'Saving media']);
     expect(PM.proj.assets['asset-1']).toMatchObject({ id: 'asset-1', name: 'new.wav', kind: 'audio', sourcePath: '/replacement/new.wav', persisted: true });
     expect(PM.assets.get('asset-1')).toBe(newRuntime);
+
+    PM.MediaStore.put.mockResolvedValueOnce(false);
+    const failedRuntime = { id: 'asset-1', name: 'failed.wav', kind: 'audio' };
+    PM.Audio.prepareAsset.mockResolvedValueOnce(failedRuntime);
+    const metadataBeforeFailure = JSON.stringify(PM.proj.assets);
+    await expect(PM.assets.replace('asset-1', { name: 'failed.wav', type: 'audio/wav', size: 3 }))
+      .rejects.toThrow('Could not store the replacement media');
+    expect(JSON.stringify(PM.proj.assets)).toBe(metadataBeforeFailure);
+    expect(PM.assets.get('asset-1')).toBe(newRuntime);
+    expect(disposed).toContain(failedRuntime);
+    disposed.length = 0;
     expect(JSON.stringify(PM.proj.layers[0])).toBe(layerBefore);
     expect(PM.hist.list()).toEqual(['Replace old.wav']);
     PM.hist.do('Move existing layer', () => { PM.proj.layers[0].from = 7; });
@@ -332,6 +480,7 @@ describe('legacy raster install', () => {
       powermove: { media: { sourcePath: () => '' } },
       setTimeout, clearTimeout,
     });
+  installBridgeForTests((window as any).powermove);
     const PM = makePM('core/history', 'gl/raster');
     const oldRuntime = { id: 'asset-1', name: 'old.wav', kind: 'audio' };
     const projectA: any = {
@@ -355,7 +504,8 @@ describe('legacy raster install', () => {
     expect(PM.hist.list()).toEqual([]);
 
     const replacing = PM.assets.replace('asset-1', { name: 'new.wav', type: 'audio/wav', size: 4 });
-    await Promise.resolve();
+    // The discarded work only exists once decoding has started.
+    await vi.waitFor(() => expect(PM.Audio.prepareAsset).toHaveBeenCalled());
     const projectB = { id: 'B', assets: {}, layers: [], comps: {} };
     PM.proj = projectB;
     PM.assets.clear();
@@ -368,4 +518,19 @@ describe('legacy raster install', () => {
     expect(PM.hist.list()).toEqual([]);
     expect(disposed).toContain(prepared);
   });
+});
+
+
+it('restores OBJ assets beyond 64 MB without marking their geometry missing', async () => {
+  const text = '#' + ' '.repeat(64 * 1024 * 1024) + '\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n';
+  const blob = new Blob([text], { type: 'model/obj' });
+  const project = { assets: { model: { id: 'model', name: 'large.obj', kind: 'model' } } };
+  const PM = rasterRegistry({
+    proj: project,
+    MediaStore: { get: async () => blob },
+    MediaImport: { mapBounded: async (items: any[], _concurrency: number, fn: (item: any) => Promise<any>) => Promise.all(items.map(fn)) },
+  } as any);
+  await PM.assets.restoreProject(project);
+  expect(PM.assets.get('model')?.mesh.triangleCount).toBe(1);
+  expect(PM.assets.get('model')?.size).toBe(blob.size);
 });
