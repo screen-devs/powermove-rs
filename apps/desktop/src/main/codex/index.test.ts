@@ -1,0 +1,461 @@
+import { EventEmitter } from 'node:events';
+
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { IPC, type ChatGPTAccountStatus, type CodexRunRequest } from '../../shared/ipc';
+
+const mocks = vi.hoisted(() => {
+  const cancel = vi.fn(async () => true);
+  const cancelAll = vi.fn(async () => undefined);
+  const appCancel = vi.fn(async () => true);
+  const appShutdown = vi.fn(async () => undefined);
+  const appSteer = vi.fn(async () => true);
+  const accountStatus = vi.fn(async () => ({
+    state: 'connected' as const,
+    email: 'editor@example.com',
+    planType: 'plus',
+    detail: null
+  }));
+  const accountConnect = vi.fn(async () => ({
+    state: 'connecting' as const,
+    email: null,
+    planType: null,
+    detail: 'Finish signing in in your browser.'
+  }));
+  const accountDisconnect = vi.fn(async () => ({
+    state: 'disconnected' as const,
+    email: null,
+    planType: null,
+    detail: null
+  }));
+  const accountShutdown = vi.fn(async () => undefined);
+  let accountChanged: ((status: ChatGPTAccountStatus) => void) | null = null;
+  let resolveRun: ((value: unknown) => void) | null = null;
+  const run = vi.fn(async (_req: unknown, options: {
+    onProgress?: (text: string) => void;
+    onTrace?: (step: unknown) => void;
+  }) => {
+    options.onProgress?.('Working…');
+    options.onTrace?.({ kind: 'thought', text: 'Inspecting source' });
+    return await new Promise((resolve) => { resolveRun = resolve; });
+  });
+  const toolFinish = vi.fn(async () => ({ changed: true, revision: 2, historyId: 'native-history-1' }));
+  const toolSession = {
+    changed: true,
+    mcpConfig: { command: '/test/electron', args: ['/test/mcp-server.mjs'], env: { RUN: '1' } },
+    finish: toolFinish
+  };
+  const toolOpenSession = vi.fn(async () => toolSession);
+  const toolShutdown = vi.fn(async () => undefined);
+  const readForkRebaseInfo = vi.fn(async ({ forkId }: { forkId: string }) => ({
+    forkId, forkedFrom: 'timeline', base: '1.0.0', current: '2.0.0'
+  }));
+  const stageForkRebase = vi.fn();
+  return {
+    appOnce: vi.fn(),
+    cancel,
+    cancelAll,
+    appCancel,
+    appShutdown,
+    appSteer,
+    accountStatus,
+    accountConnect,
+    accountDisconnect,
+    accountShutdown,
+    account: {
+      status: accountStatus,
+      connect: accountConnect,
+      disconnect: accountDisconnect,
+      shutdown: accountShutdown,
+      onChanged(listener: (status: ChatGPTAccountStatus) => void) {
+        accountChanged = listener;
+        return () => { accountChanged = null; };
+      }
+    },
+    emitAccount(status: ChatGPTAccountStatus) { accountChanged?.(status); },
+    run,
+    toolFinish,
+    toolSession,
+    toolOpenSession,
+    toolShutdown,
+    readForkRebaseInfo,
+    stageForkRebase,
+    appRunner: {
+      run,
+      cancel: appCancel,
+      steer: appSteer,
+      shutdown: appShutdown
+    },
+    resolve(value: unknown) {
+      resolveRun?.(value);
+      resolveRun = null;
+    }
+  };
+});
+
+const apiPackFiles = async () => [{ name: 'EXTENSIONS.md', text: '# Extensions' }];
+
+vi.mock('electron', () => ({ app: { once: mocks.appOnce } }));
+vi.mock('./runner', () => ({
+  CodexRunner: class {
+    run = mocks.run;
+    cancel = mocks.cancel;
+    cancelAll = mocks.cancelAll;
+  },
+  isCodexRunRequest: () => true
+}));
+vi.mock('../agent-tools/bridge', () => ({
+  PowermoveAgentToolBridge: class {
+    openSession = mocks.toolOpenSession;
+    shutdown = mocks.toolShutdown;
+  }
+}));
+vi.mock('../extensions/rebase', () => ({
+  readForkRebaseInfo: mocks.readForkRebaseInfo,
+  stageForkRebase: mocks.stageForkRebase
+}));
+
+import { registerCodexIpc } from './index';
+
+class Sender extends EventEmitter {
+  readonly send = vi.fn();
+  private destroyed = false;
+
+  isDestroyed(): boolean { return this.destroyed; }
+  destroy(): void {
+    this.destroyed = true;
+    this.emit('destroyed');
+  }
+}
+
+function runRequest(): CodexRunRequest {
+  return {
+    id: 'ipc-run-1234',
+    mode: 'editor',
+    prompt: 'Polish it',
+    schema: null,
+    images: [],
+    model: null,
+    reasoningEffort: null,
+    access: 'editor',
+    projectId: 'ipc-project',
+    projectName: 'IPC Project',
+    projectJSON: null,
+    attachments: [],
+    consentToken: null
+  };
+}
+
+describe('registerCodexIpc', () => {
+  const handlers = new Map<string, (event: { sender: Sender }, request: unknown) => Promise<unknown>>();
+  const ipcMain = {
+    handle: vi.fn((channel: string, handler: (event: { sender: Sender }, request: unknown) => Promise<unknown>) => {
+      handlers.set(channel, handler);
+    })
+  };
+
+  beforeEach(() => {
+    handlers.clear();
+    vi.clearAllMocks();
+    mocks.toolSession.changed = true;
+    mocks.toolFinish.mockResolvedValue({ changed: true, revision: 2, historyId: 'native-history-1' });
+    registerCodexIpc(ipcMain as never, {
+      getWindow: () => null,
+      userData: '/tmp/powermove-index-test',
+      extensionsDir: '/tmp/powermove-user-extensions',
+      builtinExtensionsDir: '/tmp/powermove-builtin-extensions',
+      apiPackFiles,
+      isTrustedSender: () => true,
+      codexBinaryPref: () => null,
+      openExternal: async () => undefined
+    }, mocks.account, mocks.account, mocks.appRunner as never);
+  });
+
+  it('registers every frozen Codex, consent, and artifact channel', () => {
+    expect([...handlers.keys()]).toEqual([
+      IPC.chatgptStatus,
+      IPC.chatgptConnect,
+      IPC.chatgptDisconnect,
+      IPC.claudeStatus,
+      IPC.claudeConnect,
+      IPC.claudeDisconnect,
+      IPC.compatibleStatus,
+      IPC.compatibleConfigure,
+      IPC.codexRun,
+      IPC.codexSteer,
+      IPC.codexCancel,
+      IPC.codexFixPrompt,
+      IPC.codexRebasePrompt,
+      IPC.codexRestoreChangeSet,
+      IPC.consentComputer,
+      IPC.artifactRead,
+      IPC.artifactReveal
+    ]);
+  });
+
+  it('keeps agent services alive through a cancelled quit and cleans up only on confirmed shutdown', async () => {
+    const owner = new Sender();
+    const pending = handlers.get(IPC.codexRun)!({ sender: owner }, runRequest());
+    const emit = (event: string) => {
+      for (const [name, callback] of mocks.appOnce.mock.calls) if (name === event) callback();
+    };
+    // A save prompt can cancel before-quit. No agent or tool session may be stopped yet.
+    emit('before-quit');
+    expect(mocks.cancelAll).not.toHaveBeenCalled();
+    expect(mocks.appShutdown).not.toHaveBeenCalled();
+    expect(mocks.accountShutdown).not.toHaveBeenCalled();
+    expect(mocks.toolShutdown).not.toHaveBeenCalled();
+    emit('before-quit');
+    expect(mocks.appShutdown).not.toHaveBeenCalled();
+    mocks.resolve({ ok: true, text: '{}', access: 'editor' });
+    await expect(pending).resolves.toEqual({ ok: true, text: '{}', access: 'editor' });
+    emit('will-quit');
+    expect(mocks.cancelAll).toHaveBeenCalledOnce();
+    expect(mocks.appShutdown).toHaveBeenCalledOnce();
+    expect(mocks.accountShutdown).toHaveBeenCalledTimes(2);
+  });
+
+  it('reports, connects, and disconnects ChatGPT through trusted IPC', async () => {
+    const sender = new Sender();
+    await expect(handlers.get(IPC.chatgptStatus)!({ sender }, undefined)).resolves.toMatchObject({
+      state: 'connected',
+      planType: 'plus'
+    });
+    await expect(handlers.get(IPC.chatgptConnect)!({ sender }, undefined)).resolves.toMatchObject({
+      state: 'connecting'
+    });
+    await expect(handlers.get(IPC.chatgptDisconnect)!({ sender }, undefined)).resolves.toMatchObject({
+      state: 'disconnected'
+    });
+    expect(mocks.accountStatus).toHaveBeenCalledOnce();
+    expect(mocks.accountConnect).toHaveBeenCalledOnce();
+    expect(mocks.accountDisconnect).toHaveBeenCalledOnce();
+  });
+
+  it('streams progress and only allows the owning WebContents to cancel', async () => {
+    const owner = new Sender();
+    const stranger = new Sender();
+    const pending = handlers.get(IPC.codexRun)!({ sender: owner }, runRequest());
+
+    expect(mocks.run).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'ipc-run-1234' }),
+      expect.objectContaining({
+        userData: '/tmp/powermove-index-test'
+      })
+    );
+
+    await handlers.get(IPC.codexCancel)!({ sender: stranger }, { id: 'ipc-run-1234' });
+    expect(mocks.cancel).not.toHaveBeenCalled();
+    await handlers.get(IPC.codexCancel)!({ sender: owner }, { id: 'ipc-run-1234' });
+    expect(mocks.cancel).toHaveBeenCalledWith('ipc-run-1234');
+    expect(owner.send).toHaveBeenCalledWith(IPC.codexEvent, {
+      id: 'ipc-run-1234',
+      kind: 'progress',
+      text: 'Working…'
+    });
+    expect(owner.send).toHaveBeenCalledWith(IPC.codexEvent, {
+      id: 'ipc-run-1234',
+      kind: 'trace',
+      step: { kind: 'thought', text: 'Inspecting source' }
+    });
+
+    mocks.resolve({ ok: true, text: '{}', access: 'editor' });
+    await expect(pending).resolves.toEqual({ ok: true, text: '{}', access: 'editor' });
+  });
+
+  it('gives editor App Server runs a live inspection tool session', async () => {
+    registerCodexIpc(ipcMain as never, {
+      getWindow: () => null,
+      userData: '/tmp/powermove-index-test',
+      extensionsDir: '/tmp/powermove-user-extensions',
+      apiPackFiles,
+      isTrustedSender: () => true,
+      codexBinaryPref: () => null,
+      openExternal: async () => undefined,
+      agentToolServerPath: '/test/mcp-server.mjs',
+      agentToolCommand: '/test/electron'
+    }, mocks.account, mocks.account, mocks.appRunner as never);
+    mocks.toolSession.changed = false;
+    mocks.toolFinish.mockResolvedValueOnce({ changed: false, revision: 2, historyId: 'native-history-1' });
+    const owner = new Sender();
+    const pending = handlers.get(IPC.codexRun)!({ sender: owner }, runRequest());
+
+    expect(mocks.toolOpenSession).toHaveBeenCalledWith({
+      runId: 'ipc-run-1234', owner, baseRevision: 0
+    });
+    await vi.waitFor(() => expect(mocks.run).toHaveBeenCalledWith(
+      expect.objectContaining({ mode: 'editor' }),
+      expect.objectContaining({ nativeTools: mocks.toolSession.mcpConfig })
+    ));
+    mocks.resolve({ ok: true, text: '{"kind":"panels"}', access: 'editor' });
+
+    await expect(pending).resolves.toEqual({
+      ok: true, text: '{"kind":"panels"}', access: 'editor'
+    });
+    expect(mocks.toolFinish).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
+  it('gives autonomous native providers live tools and does not apply duplicate final commands', async () => {
+    registerCodexIpc(ipcMain as never, {
+      getWindow: () => null,
+      userData: '/tmp/powermove-index-test',
+      extensionsDir: '/tmp/powermove-user-extensions',
+      apiPackFiles,
+      isTrustedSender: () => true,
+      codexBinaryPref: () => null,
+      openExternal: async () => undefined,
+      agentToolServerPath: '/test/mcp-server.mjs',
+      agentToolCommand: '/test/electron'
+    }, mocks.account, mocks.account, mocks.appRunner as never);
+    const owner = new Sender();
+    const request = {
+      ...runRequest(),
+      mode: 'autonomous' as const,
+      access: 'project' as const,
+      projectJSON: JSON.stringify({ revision: 1 })
+    };
+    const pending = handlers.get(IPC.codexRun)!({ sender: owner }, request);
+
+    await vi.waitFor(() => expect(mocks.toolOpenSession).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'ipc-run-1234', owner, baseRevision: 1,
+      resolveStagingDirectory: expect.any(Function)
+    })));
+    await vi.waitFor(() => expect(mocks.run).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ nativeTools: mocks.toolSession.mcpConfig })
+    ));
+    mocks.resolve({
+      ok: true,
+      access: 'project',
+      text: JSON.stringify({
+        summary: 'Done',
+        commands: ['{"type":"add_layer"}'],
+        artifacts: [], externalActions: [], notes: [], extensions: []
+      })
+    });
+
+    const result = await pending as any;
+    expect(mocks.toolFinish).toHaveBeenCalledExactlyOnceWith(true);
+    expect(result.liveEditsApplied).toBe(true);
+    expect(result.liveEditHistoryId).toBe('native-history-1');
+    const decoded = JSON.parse(result.text);
+    expect(decoded.commands).toEqual([]);
+    expect(decoded.notes.join(' ')).toContain('duplicated edits');
+  });
+
+  it('steers only an active run owned by the requesting renderer', async () => {
+    const owner = new Sender();
+    const stranger = new Sender();
+    const pending = handlers.get(IPC.codexRun)!({ sender: owner }, runRequest());
+    const steering = { id: 'ipc-run-1234', prompt: 'Focus on the blur edge', images: [] };
+
+    await expect(handlers.get(IPC.codexSteer)!({ sender: stranger }, steering))
+      .resolves.toEqual({ accepted: false });
+    expect(mocks.appSteer).not.toHaveBeenCalled();
+    await expect(handlers.get(IPC.codexSteer)!({ sender: owner }, steering))
+      .resolves.toEqual({ accepted: true });
+    expect(mocks.appSteer).toHaveBeenCalledExactlyOnceWith(steering);
+
+    mocks.resolve({ ok: true, text: '{}', access: 'editor' });
+    await pending;
+  });
+
+  it('cancels a run when its renderer is destroyed', async () => {
+    const owner = new Sender();
+    const pending = handlers.get(IPC.codexRun)!({ sender: owner }, runRequest());
+    owner.destroy();
+    expect(mocks.cancel).toHaveBeenCalledWith('ipc-run-1234');
+    mocks.resolve({ ok: false, error: 'cancelled', cancelled: true });
+    await pending;
+  });
+
+  it('builds a fix prompt from a validated extension failure', async () => {
+    await expect(handlers.get(IPC.codexFixPrompt)!({ sender: new Sender() }, {
+      id: 'broken-extension',
+      error: 'index.ts:1: failed',
+      files: [{ path: 'index.ts', text: 'throw new Error();' }]
+    })).resolves.toContain('The extension `broken-extension` fails: index.ts:1: failed. Files:');
+  });
+
+  it('builds a rebase prompt from the validated live fork and shipped built-in', async () => {
+    const prompt = await handlers.get(IPC.codexRebasePrompt)!({ sender: new Sender() }, { id: 'my-fork' });
+    expect(prompt).toContain('`timeline@1.0.0`');
+    expect(prompt).toContain('`timeline@2.0.0`');
+    expect(mocks.readForkRebaseInfo).toHaveBeenCalledWith({
+      forkId: 'my-fork',
+      userExtensionsDir: '/tmp/powermove-user-extensions',
+      builtinExtensionsDir: '/tmp/powermove-builtin-extensions'
+    });
+  });
+
+  it('rejects an invalid rebase-prompt extension id', async () => {
+    await expect(handlers.get(IPC.codexRebasePrompt)!({ sender: new Sender() }, { id: '../escape' }))
+      .rejects.toThrow(IPC.codexRebasePrompt);
+  });
+
+  it('refreshes promoted extension records before returning the run result', async () => {
+    const refreshExtensions = vi.fn(async () => undefined);
+    registerCodexIpc(ipcMain as never, {
+      getWindow: () => null,
+      userData: '/tmp/powermove-index-test',
+      extensionsDir: '/tmp/powermove-user-extensions',
+      builtinExtensionsDir: '/tmp/powermove-builtin-extensions',
+      apiPackFiles,
+      isTrustedSender: () => true,
+      codexBinaryPref: () => null,
+      refreshExtensions,
+      openExternal: async () => undefined
+    }, mocks.account, mocks.account, mocks.appRunner as never);
+    const pending = handlers.get(IPC.codexRun)!({ sender: new Sender() }, runRequest());
+    mocks.resolve({
+      ok: true, text: '{}', access: 'editor',
+      extensions: [{ id: 'my-fork', action: 'updated' }]
+    });
+
+    await expect(pending).resolves.toMatchObject({ ok: true });
+    expect(refreshExtensions).toHaveBeenCalledExactlyOnceWith(['my-fork']);
+  });
+
+  it.each([
+    ['invalid id', { id: '../escape', error: 'failed', files: [] }],
+    ['oversized error', { id: 'broken-extension', error: 'x'.repeat(4_001), files: [] }],
+  ])('rejects fix-prompt requests with %s', async (_label, request) => {
+    await expect(
+      handlers.get(IPC.codexFixPrompt)!({ sender: new Sender() }, request)
+    ).rejects.toThrow(IPC.codexFixPrompt);
+  });
+
+  it('degrades oversized fix-prompt requests instead of rejecting them', async () => {
+    const many = await handlers.get(IPC.codexFixPrompt)!({ sender: new Sender() }, {
+      id: 'broken-extension',
+      error: 'failed',
+      files: Array.from({ length: 41 }, (_, index) => ({ path: `${index}.ts`, text: '' }))
+    });
+    expect(many).toContain('path="39.ts"');
+    expect(many).not.toContain('path="40.ts"');
+
+    const big = await handlers.get(IPC.codexFixPrompt)!({ sender: new Sender() }, {
+      id: 'broken-extension',
+      error: 'failed',
+      files: [{ path: 'index.ts', text: 'é'.repeat(32_769) }]
+    });
+    expect(big).toContain('truncated');
+    expect(String(big).length).toBeLessThan(200_000);
+  });
+
+  it('rejects an untrusted sender before handling payloads', async () => {
+    handlers.clear();
+    registerCodexIpc(ipcMain as never, {
+      getWindow: () => null,
+      userData: '/tmp/powermove-index-test',
+      extensionsDir: '/tmp/powermove-user-extensions',
+      apiPackFiles,
+      isTrustedSender: () => false,
+      codexBinaryPref: () => null,
+      openExternal: async () => undefined
+    }, mocks.account);
+    await expect(
+      handlers.get(IPC.codexCancel)!({ sender: new Sender() }, { id: 'ipc-run-1234' })
+    ).rejects.toThrow('Unauthorized IPC sender');
+  });
+});

@@ -1,0 +1,228 @@
+.pm-control-input:focus-visible,
+.num:focus-visible,
+.sel:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 72%, transparent);
+  outline-offset: 2px;
+}
+
+input.num:not([type=range]):not([type=color]):not([type=file]) {
+  width: auto;
+  min-width: 0;
+  flex: 1 1 0;
+  field-sizing: content;
+  cursor: ew-resize;
+}
+
+input.num.editing:not([type=range]):not([type=color]):not([type=file]) {
+  cursor: text;
+}
+
+select.sel {
+  appearance: none;
+  border: 0;
+  font: inherit;
+  font-family: var(--f-mono);
+  color: inherit;
+}
+
+/* Shared by controls and every panel family; panel entry points import this
+   stylesheet explicitly instead of depending on simple-panel registration. */
+.panel-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.color-picker {
+  width: 352px;
+}
+
+/* Match inspector field density while keeping the color surface dominant. */
+.color-workbench {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 12px 92px;
+  gap: 8px;
+  height: 176px;
+}
+
+.color-sv,
+.color-hue {
+  height: 100%;
+}
+
+.color-side {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.color-compare {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  width: 48px;
+  height: var(--ctl-h);
+  flex: none;
+  border-radius: var(--r-sm);
+  overflow: hidden;
+  box-shadow: inset 0 0 0 var(--hairline) rgb(var(--ink-rgb) / .18);
+}
+
+.color-compare-swatch {
+  display: block;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: var(--sw-color);
+}
+
+.color-compare-swatch.is-before {
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.color-channels {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  min-height: 0;
+}
+
+.color-channels hr {
+  height: var(--hairline);
+  margin: 2px 0;
+  border: 0;
+  background: var(--line);
+}
+
+.color-channel {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) 10px;
+  align-items: center;
+  gap: 6px;
+  height: var(--ctl-h);
+  color: var(--tx-3);
+  font-size: var(--fs-xs);
+}
+
+.color-channel em {
+  font-style: normal;
+  color: var(--tx-3);
+  font-size: var(--fs-xs);
+}
+
+.color-channel input {
+  width: 100%;
+  min-width: 0;
+  height: var(--ctl-h);
+  padding: 0 5px;
+  border: 0;
+  border-radius: var(--r-xs);
+  background: var(--bg-field);
+  box-shadow: var(--ctl-edge-inset);
+  color: var(--tx);
+  font: var(--fs-sm) var(--f-mono);
+  text-align: right;
+}
+
+.pm-control-font-drop {
+  position: fixed;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toggle,
+  .toggle i,
+  .fill-spectrum-color {
+    transition: none;
+  }
+}
+
+.color-dialog .color-grid {
+  gap: 6px;
+}
+
+.color-dialog .color-choice {
+  aspect-ratio: auto;
+  height: 22px;
+  border-radius: var(--r-xs);
+  /* White and near-black swatches need an edge to read against either theme. */
+  box-shadow: inset 0 0 0 var(--hairline) rgb(var(--ink-rgb) / .18);
+}
+
+.color-dialog .color-choice.on {
+  box-shadow: inset 0 0 0 var(--hairline) rgb(var(--ink-rgb) / .18), 0 0 0 2px var(--accent);
+}
+
+.color-dialog .color-hex {
+  height: var(--ctl-h);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+}
+
+.color-dialog .color-eyedropper {
+  width: var(--ctl-h);
+  height: var(--ctl-h);
+  flex: none;
+  border-radius: var(--r-sm);
+  background: var(--bg-field);
+  box-shadow: var(--ctl-edge-inset);
+  color: var(--tx-2);
+}
+
+.color-dialog .color-eyedropper:hover {
+  color: var(--tx);
+  background: var(--bg-row-hi);
+}
+
+.color-dialog .color-eyedropper:disabled {
+  opacity: var(--disabled);
+}
+
+/* Scoped overlay chrome: shared theme, density and focus treatment. */
+.fill-picker.color-picker > header {
+  height: var(--hdr-h);
+  flex: none;
+  padding-inline: var(--pad);
+}
+.fill-picker.color-picker > header b { font-weight: var(--fw-medium); }
+.color-picker .color-dialog { padding: var(--pad); gap: 8px; }
+.color-picker .color-workbench { height: calc(6 * var(--ctl-h)); }
+.color-picker .color-channels { gap: 0; }
+.color-picker .color-channel { gap: 4px; }
+.color-picker .color-channel input { height: calc(var(--ctl-h) - 2px); border-radius: var(--r-sm); }
+.color-picker .color-sv { border-radius: var(--r-sm); }
+.color-picker .color-hue { border-radius: var(--r-pill); }
+.color-picker .color-hex { min-width: 0; color: var(--tx); font-size: var(--fs-sm); }
+.color-picker .color-dialog-value { gap: 8px; }
+.color-picker :is(button,input,[role="slider"]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Flat fields and swatches follow the inspector's borderless controls. */
+.color-picker :is(.color-channel input, .color-hex, .color-eyedropper,
+  .color-compare, .color-compare-swatch.is-before, .color-choice, .color-choice.on) {
+  box-shadow: none;
+  border: 0;
+}
+.color-picker .color-choice { position: relative; }
+.color-picker .color-choice.on::after {
+  content: '';
+  position: absolute;
+  width: 4px;
+  height: 4px;
+  left: calc(50% - 2px);
+  bottom: 3px;
+  border-radius: 50%;
+  background: white;
+  mix-blend-mode: difference;
+}

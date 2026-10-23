@@ -1,0 +1,53 @@
+# Powermove
+
+Powermove is an AI-native motion and video editor for macOS. It combines a GPU-backed editing engine with a dockable Svelte interface and native Codex or Claude Code agents that can inspect, render, and transactionally edit the live project through Powermove's typed, undoable tool layer.
+
+This repository is a bun workspace monorepo containing the desktop editor, the marketing website, and the packages they share.
+
+## Repository layout
+
+```text
+apps/
+  desktop/            @powermove/desktop   Electron editor (Svelte 5, electron-vite, Vitest, Playwright)
+  www/                @powermove/www       SvelteKit marketing site (adapter-static)
+packages/
+  tokens/             @powermove/tokens    tokens.css, the design tokens shared by desktop and website
+  player/             @powermove/player    browser bundle of the web player and SVG player, built from the desktop sources
+  macos-haptics/      @powermove/macos-haptics   native macOS alignment-haptics addon
+assets/
+  brand/              powermove-light.svg, powermove-dark.svg, powermove-light.png
+docs/
+  design.md           Powermove design language
+```
+
+Each workspace has its own `package.json`; the root `package.json` only holds workspace scripts and the bun toolchain pin.
+
+## Requirements
+
+- macOS on Apple Silicon.
+- [bun](https://bun.sh) 1.3 or newer (the repo pins `bun@1.3.14`). bun is the only package manager; `bun.lock` is the only lockfile.
+- Xcode command line tools, for building the `@powermove/macos-haptics` native addon during install.
+- For agent features in the desktop app: the Codex CLI or Claude Code, installed and signed in.
+
+## Quickstart
+
+```sh
+bun install            # installs every workspace and builds the native addon
+bun run dev            # desktop editor: Electron + renderer hot reload
+bun run dev:www        # website dev server
+bun run build          # build every workspace
+bun run test           # run every workspace's test script
+bun run typecheck      # run every workspace's typecheck script
+bun run test:e2e       # desktop Playwright Electron coverage
+bun run dist:mac       # ad-hoc signed arm64 DMG, ZIP, and app in apps/desktop/dist/
+bun run dist:release   # guarded Developer ID, notarized release lane
+```
+
+To run a script in one workspace, use `bun run --cwd apps/desktop <script>` (or `cd` into the workspace). Run the desktop gates with `bun run test`, not `bunx vitest`: the latter runs Vitest under bun's runtime and skews a calibrated performance test.
+
+## Further reading
+
+- [Desktop editor](apps/desktop/README.md): architecture, kernel and extensions, project files, development, and release notes.
+- [Website](apps/www/README.md): the SvelteKit marketing site.
+- [Design language](docs/design.md): the implementation guide for every Powermove interface.
+- [macOS release process](apps/desktop/docs/release.md): signing, notarization, and the beta workflow.
